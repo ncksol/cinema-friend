@@ -152,6 +152,166 @@ async def test_transaction_rolls_back_on_exception(
     assert (await cursor.fetchone())[0] == 1
 
 
+async def test_transaction_starts_after_an_unwrapped_write(
+    database: Database, conn: aiosqlite.Connection
+) -> None:
+    """A write made outside ``transaction()`` must not leave a transaction open."""
+    await database.migrate(conn)
+    await conn.execute(
+        "INSERT INTO host_circuits (host, state, step, updated_at) VALUES (?, ?, ?, ?)",
+        ("unwrapped.test", "closed", 0, "2026-01-01T00:00:00.000000+00:00"),
+    )
+
+    async with database.transaction(conn):
+        await conn.execute(
+            "INSERT INTO host_circuits (host, state, step, updated_at) VALUES (?, ?, ?, ?)",
+            ("wrapped.test", "closed", 0, "2026-01-01T00:00:00.000000+00:00"),
+        )
+
+    cursor = await conn.execute("SELECT host FROM host_circuits ORDER BY host")
+    assert [row["host"] for row in await cursor.fetchall()] == ["unwrapped.test", "wrapped.test"]
+
+
+async def test_unwrapped_write_survives_connection_close(database: Database) -> None:
+    """Writes outside ``transaction()`` autocommit; closing must not discard them."""
+    first = await database.connect()
+    try:
+        await database.migrate(first)
+        await first.execute(
+            "INSERT INTO host_circuits (host, state, step, updated_at) VALUES (?, ?, ?, ?)",
+            ("example.test", "closed", 0, "2026-01-01T00:00:00.000000+00:00"),
+        )
+    finally:
+        await first.close()
+
+    second = await database.connect()
+    try:
+        cursor = await second.execute("SELECT COUNT(*) FROM host_circuits")
+        assert (await cursor.fetchone())[0] == 1
+    finally:
+        await second.close()
+
+
+async def test_a_second_connection_can_be_opened_while_the_first_is_alive(
+    database: Database, conn: aiosqlite.Connection
+) -> None:
+    """Connection setup must not leave an open cursor holding a read lock on the file."""
+    second = await database.connect()
+    try:
+        cursor = await second.execute("SELECT 1")
+        assert (await cursor.fetchone())[0] == 1
+    finally:
+        await second.close()
+
+
+async def test_committed_write_is_visible_to_a_second_connection(database: Database) -> None:
+    writer = await database.connect()
+    reader = await database.connect()
+    try:
+        await database.migrate(writer)
+        async with database.transaction(writer):
+            await writer.execute(
+                "INSERT INTO host_circuits (host, state, step, updated_at) VALUES (?, ?, ?, ?)",
+                ("example.test", "closed", 0, "2026-01-01T00:00:00.000000+00:00"),
+            )
+
+        cursor = await reader.execute("SELECT host FROM host_circuits")
+        row = await cursor.fetchone()
+        assert row is not None
+        assert row["host"] == "example.test"
+    finally:
+        await reader.close()
+        await writer.close()
+
+
+async def test_nested_transaction_commits_with_the_outer_transaction(
+    database: Database, conn: aiosqlite.Connection
+) -> None:
+    await database.migrate(conn)
+
+    async with database.transaction(conn):
+        await conn.execute(
+            "INSERT INTO host_circuits (host, state, step, updated_at) VALUES (?, ?, ?, ?)",
+            ("outer.test", "closed", 0, "2026-01-01T00:00:00.000000+00:00"),
+        )
+        async with database.transaction(conn):
+            await conn.execute(
+                "INSERT INTO host_circuits (host, state, step, updated_at) VALUES (?, ?, ?, ?)",
+                ("inner.test", "closed", 0, "2026-01-01T00:00:00.000000+00:00"),
+            )
+
+    cursor = await conn.execute("SELECT host FROM host_circuits ORDER BY host")
+    assert [row["host"] for row in await cursor.fetchall()] == ["inner.test", "outer.test"]
+
+
+async def test_nested_transaction_rollback_keeps_outer_work(
+    database: Database, conn: aiosqlite.Connection
+) -> None:
+    """A failed inner block unwinds only its own statements."""
+    await database.migrate(conn)
+
+    class _Boom(Exception):
+        pass
+
+    async with database.transaction(conn):
+        await conn.execute(
+            "INSERT INTO host_circuits (host, state, step, updated_at) VALUES (?, ?, ?, ?)",
+            ("outer.test", "closed", 0, "2026-01-01T00:00:00.000000+00:00"),
+        )
+        with pytest.raises(_Boom):
+            async with database.transaction(conn):
+                await conn.execute(
+                    "INSERT INTO host_circuits (host, state, step, updated_at) VALUES (?, ?, ?, ?)",
+                    ("inner.test", "closed", 0, "2026-01-01T00:00:00.000000+00:00"),
+                )
+                raise _Boom("simulated inner failure")
+        await conn.execute(
+            "INSERT INTO host_circuits (host, state, step, updated_at) VALUES (?, ?, ?, ?)",
+            ("after.test", "closed", 0, "2026-01-01T00:00:00.000000+00:00"),
+        )
+
+    cursor = await conn.execute("SELECT host FROM host_circuits ORDER BY host")
+    assert [row["host"] for row in await cursor.fetchall()] == ["after.test", "outer.test"]
+
+
+async def test_outer_rollback_discards_committed_nested_work(
+    database: Database, conn: aiosqlite.Connection
+) -> None:
+    """A nested block that succeeded is still undone when the outer block fails."""
+    await database.migrate(conn)
+
+    class _Boom(Exception):
+        pass
+
+    with pytest.raises(_Boom):
+        async with database.transaction(conn):
+            async with database.transaction(conn):
+                await conn.execute(
+                    "INSERT INTO host_circuits (host, state, step, updated_at) VALUES (?, ?, ?, ?)",
+                    ("inner.test", "closed", 0, "2026-01-01T00:00:00.000000+00:00"),
+                )
+            raise _Boom("simulated outer failure")
+
+    cursor = await conn.execute("SELECT COUNT(*) FROM host_circuits")
+    assert (await cursor.fetchone())[0] == 0
+
+
+async def test_sequential_transactions_reuse_one_connection(
+    database: Database, conn: aiosqlite.Connection
+) -> None:
+    """Committing one transaction must leave the connection ready for the next."""
+    await database.migrate(conn)
+    for host in ("first.test", "second.test"):
+        async with database.transaction(conn):
+            await conn.execute(
+                "INSERT INTO host_circuits (host, state, step, updated_at) VALUES (?, ?, ?, ?)",
+                (host, "closed", 0, "2026-01-01T00:00:00.000000+00:00"),
+            )
+
+    cursor = await conn.execute("SELECT COUNT(*) FROM host_circuits")
+    assert (await cursor.fetchone())[0] == 2
+
+
 async def test_cascade_deletes_dependent_check_run(
     database: Database, conn: aiosqlite.Connection
 ) -> None:

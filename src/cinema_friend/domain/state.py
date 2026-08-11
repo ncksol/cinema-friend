@@ -13,8 +13,10 @@ class WatchMode(Enum):
 class WatchStatus(Enum):
     ACTIVE = "active"
     PAUSED = "paused"
+    BACKOFF = "backoff"
     COMPLETED = "completed"
-    CANCELLED = "cancelled"
+    EXPIRED = "expired"
+    FAILED = "failed"
 
 
 class CheckTrigger(Enum):

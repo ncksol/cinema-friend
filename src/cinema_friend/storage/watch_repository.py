@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 from datetime import date, datetime, time, timedelta
 from urllib.parse import urlsplit
+from uuid import UUID
 
 import aiosqlite
 
@@ -71,14 +72,17 @@ def _decode_criteria(data: str) -> WatchCriteria:
 
 def _row_to_watch(row: aiosqlite.Row) -> Watch:
     next_run_at = row["next_run_at"]
+    last_check_at = row["last_check_at"]
     return Watch(
-        watch_id=int(row["id"]),
+        watch_id=UUID(row["id"]),
         user_id=row["owner_user_id"],
         criteria=_decode_criteria(row["criteria_json"]),
         status=WatchStatus(row["status"]),
         created_at=decode_datetime(row["created_at"]),
         updated_at=decode_datetime(row["updated_at"]),
         next_check_at=decode_datetime(next_run_at) if next_run_at is not None else None,
+        title=row["title"],
+        last_check_at=decode_datetime(last_check_at) if last_check_at is not None else None,
     )
 
 
@@ -99,7 +103,7 @@ class WatchRepository:
                 watch.user_id,
                 criteria.source_url,
                 criteria.slug,
-                None,
+                watch.title,
                 _encode_criteria(criteria),
                 criteria.mode.value,
                 (
@@ -109,13 +113,13 @@ class WatchRepository:
                 ),
                 watch.status.value,
                 encode_datetime(watch.next_check_at) if watch.next_check_at is not None else None,
-                None,
+                encode_datetime(watch.last_check_at) if watch.last_check_at is not None else None,
                 encode_datetime(watch.created_at),
                 encode_datetime(watch.updated_at),
             ),
         )
 
-    async def get(self, conn: aiosqlite.Connection, watch_id: int) -> Watch | None:
+    async def get(self, conn: aiosqlite.Connection, watch_id: UUID) -> Watch | None:
         cursor = await conn.execute("SELECT * FROM watches WHERE id = ?", (str(watch_id),))
         row = await cursor.fetchone()
         return _row_to_watch(row) if row is not None else None
@@ -144,46 +148,44 @@ class WatchRepository:
         return tuple(_row_to_watch(row) for row in rows)
 
     async def list_active_owner_ids(self, conn: aiosqlite.Connection, host: str) -> frozenset[int]:
-        """Return distinct owners of active watches targeting ``host``.
+        """Return distinct owners of live watches targeting ``host``.
 
-        Used to send one host-outage/recovery alert per affected user rather than one per
+        Live means ``ACTIVE`` or ``BACKOFF``: a watch waiting out host backoff is still
+        one its owner expects to hear about, so it must receive the host degradation and
+        recovery alerts. Used to send one alert per affected user rather than one per
         watch. ``watches`` has no dedicated host column, so the host is parsed from each
         row's ``source_url`` the same way the transport layer keys its circuit breaker.
         """
         cursor = await conn.execute(
-            "SELECT DISTINCT owner_user_id, source_url FROM watches WHERE status = ?",
-            (WatchStatus.ACTIVE.value,),
+            "SELECT DISTINCT owner_user_id, source_url FROM watches WHERE status IN (?, ?)",
+            (WatchStatus.ACTIVE.value, WatchStatus.BACKOFF.value),
         )
         rows = await cursor.fetchall()
         return frozenset(
             row["owner_user_id"] for row in rows if urlsplit(row["source_url"]).hostname == host
         )
 
-    async def update(
-        self,
-        conn: aiosqlite.Connection,
-        watch: Watch,
-        *,
-        last_check_at: datetime | None = None,
-    ) -> None:
+    async def update(self, conn: aiosqlite.Connection, watch: Watch) -> None:
         """Persist ``watch``'s mutable fields; ``created_at`` and ``id`` never change.
 
-        ``last_check_at`` has no equivalent field on the frozen ``Watch`` dataclass, so it
-        is a separate keyword: omitting it (``None``) leaves the stored value untouched via
-        ``COALESCE`` instead of erasing it.
+        Every mutable column, including ``title`` and ``last_check_at``, is written from
+        the passed ``Watch``, so the domain object is the single source of truth: callers
+        read, replace what changed, and write back rather than passing side-channel
+        keywords that could disagree with the object they also persist.
         """
         criteria = watch.criteria
         await conn.execute(
             """
             UPDATE watches
-            SET source_url = ?, slug = ?, criteria_json = ?, mode = ?, interval_seconds = ?,
-                status = ?, next_run_at = ?, last_check_at = COALESCE(?, last_check_at),
+            SET source_url = ?, slug = ?, title = ?, criteria_json = ?, mode = ?,
+                interval_seconds = ?, status = ?, next_run_at = ?, last_check_at = ?,
                 updated_at = ?
             WHERE id = ?
             """,
             (
                 criteria.source_url,
                 criteria.slug,
+                watch.title,
                 _encode_criteria(criteria),
                 criteria.mode.value,
                 (
@@ -193,12 +195,12 @@ class WatchRepository:
                 ),
                 watch.status.value,
                 encode_datetime(watch.next_check_at) if watch.next_check_at is not None else None,
-                encode_datetime(last_check_at) if last_check_at is not None else None,
+                encode_datetime(watch.last_check_at) if watch.last_check_at is not None else None,
                 encode_datetime(watch.updated_at),
                 str(watch.watch_id),
             ),
         )
 
-    async def delete(self, conn: aiosqlite.Connection, watch_id: int) -> None:
+    async def delete(self, conn: aiosqlite.Connection, watch_id: UUID) -> None:
         """Delete a watch; ``ON DELETE CASCADE`` removes its dependent rows."""
         await conn.execute("DELETE FROM watches WHERE id = ?", (str(watch_id),))

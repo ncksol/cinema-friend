@@ -6,6 +6,7 @@ import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
+from itertools import count
 from pathlib import Path
 from typing import Final
 
@@ -13,6 +14,7 @@ import aiosqlite
 
 _MIGRATIONS_DIR: Final = Path(__file__).parent / "migrations"
 _MIGRATION_NAME_RE: Final = re.compile(r"^(\d+)_.*\.sql$")
+_SAVEPOINT_NAMES: Final = count()
 
 
 def encode_datetime(value: datetime) -> str:
@@ -43,6 +45,17 @@ def _split_statements(script: str) -> list[str]:
     return [statement.strip() for statement in script.split(";") if statement.strip()]
 
 
+async def _run_pragma(conn: aiosqlite.Connection, statement: str) -> None:
+    """Execute a ``PRAGMA`` and fully consume its cursor.
+
+    ``PRAGMA`` statements return rows. Leaving that cursor un-stepped keeps a read lock
+    open on the connection, which blocks every later connection to the same file.
+    """
+    cursor = await conn.execute(statement)
+    await cursor.fetchall()
+    await cursor.close()
+
+
 def _discover_migrations() -> list[tuple[int, Path]]:
     migrations: list[tuple[int, Path]] = []
     for path in _MIGRATIONS_DIR.glob("*.sql"):
@@ -61,20 +74,52 @@ class Database:
         self._path = path
 
     async def connect(self) -> aiosqlite.Connection:
-        """Open a fresh connection with row access by name, FKs, and WAL enabled."""
-        conn = await aiosqlite.connect(self._path)
+        """Open a fresh connection with row access by name, FKs, and WAL enabled.
+
+        ``isolation_level=None`` turns off the driver's legacy implicit transactions, so
+        this module owns every ``BEGIN``. Two things follow: a write issued outside
+        :meth:`transaction` autocommits immediately instead of sitting in an implicit
+        transaction that ``close()`` would discard, and :meth:`transaction` can always
+        issue ``BEGIN IMMEDIATE`` without hitting "cannot start a transaction within a
+        transaction".
+
+        Each ``PRAGMA`` cursor is drained and closed. A row-returning statement left
+        un-stepped keeps a read lock on the database, which makes the *next* connection
+        to the same file fail with "database is locked".
+        """
+        conn = await aiosqlite.connect(self._path, isolation_level=None)
         conn.row_factory = aiosqlite.Row
-        await conn.execute("PRAGMA foreign_keys = ON")
-        await conn.execute("PRAGMA journal_mode = WAL")
+        await _run_pragma(conn, "PRAGMA foreign_keys = ON")
+        await _run_pragma(conn, "PRAGMA journal_mode = WAL")
         return conn
 
     @asynccontextmanager
     async def transaction(self, conn: aiosqlite.Connection) -> AsyncIterator[aiosqlite.Connection]:
-        """Run a block as one ``BEGIN IMMEDIATE`` transaction on ``conn``.
+        """Run a block atomically on ``conn``, nesting inside an enclosing transaction.
 
-        Commits when the block completes normally; rolls back and re-raises on any
-        exception, including ``BaseException`` subclasses such as cancellation.
+        The outermost block runs as ``BEGIN IMMEDIATE`` and commits on success or rolls
+        back on any exception, including ``BaseException`` subclasses such as
+        cancellation. A block entered while ``conn`` already has a transaction open runs
+        as a ``SAVEPOINT`` instead: failing it unwinds only its own statements, and a
+        later failure of the enclosing block still discards everything. That makes a
+        service free to wrap repository calls that wrap their own writes.
+
+        Interleaving transactions from concurrent tasks on one connection is not
+        supported by SQLite; callers take one connection per unit of work.
         """
+        if conn.in_transaction:
+            name = f"cf_sp_{next(_SAVEPOINT_NAMES)}"
+            await conn.execute(f"SAVEPOINT {name}")
+            try:
+                yield conn
+            except BaseException:
+                await conn.execute(f"ROLLBACK TO {name}")
+                await conn.execute(f"RELEASE {name}")
+                raise
+            else:
+                await conn.execute(f"RELEASE {name}")
+            return
+
         await conn.execute("BEGIN IMMEDIATE")
         try:
             yield conn
@@ -90,7 +135,6 @@ class Database:
             "CREATE TABLE IF NOT EXISTS schema_migrations ("
             "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
         )
-        await conn.commit()
         cursor = await conn.execute("SELECT version FROM schema_migrations")
         applied = {row["version"] for row in await cursor.fetchall()}
         for version, path in _discover_migrations():

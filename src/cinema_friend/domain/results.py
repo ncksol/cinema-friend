@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
+from uuid import UUID
 
 from cinema_friend.domain.bfi import Performance
 from cinema_friend.domain.state import CheckOutcome, CheckTrigger
@@ -55,7 +56,7 @@ class RankedOption:
 @dataclass(frozen=True, slots=True)
 class ResultSnapshot:
     snapshot_id: int
-    watch_id: int
+    watch_id: UUID
     checked_at: datetime
     options: tuple[RankedOption, ...]
 
@@ -63,7 +64,7 @@ class ResultSnapshot:
 @dataclass(frozen=True, slots=True)
 class CheckResult:
     check_run_id: int
-    watch_id: int
+    watch_id: UUID
     trigger: CheckTrigger
     outcome: CheckOutcome
     snapshot_id: int | None
@@ -87,7 +88,7 @@ class SnapshotPage:
 class NotificationPayload:
     kind: str
     recipient_user_id: int
-    watch_id: int | None
+    watch_id: UUID | None
     snapshot_id: int | None
     new_option_count: int
     host: str | None

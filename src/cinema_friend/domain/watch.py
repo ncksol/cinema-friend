@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
+from uuid import UUID
 
 from cinema_friend.domain.errors import InputError
 from cinema_friend.domain.state import WatchMode, WatchStatus
@@ -52,10 +53,20 @@ class WatchCriteria:
 
 @dataclass(frozen=True, slots=True)
 class Watch:
-    watch_id: int
+    """One user's saved search.
+
+    ``watch_id`` is a client-generated UUID: services need a stable identity before the
+    row exists, callback payloads carry it as text, and the ``watches`` primary key is
+    ``TEXT``. ``title`` stays ``None`` until a successful BFI parse names the film, and
+    ``last_check_at`` stays ``None`` until the first check completes.
+    """
+
+    watch_id: UUID
     user_id: int
     criteria: WatchCriteria
     status: WatchStatus
     created_at: datetime
     updated_at: datetime
     next_check_at: datetime | None = None
+    title: str | None = None
+    last_check_at: datetime | None = None
