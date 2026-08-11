@@ -7,6 +7,7 @@ from cinema_friend.domain.bfi import Performance, PriceZone, Seat, SeatStatus
 from cinema_friend.domain.results import RankedOption, RankVector, ResultSnapshot
 
 _WATCH_ID = UUID("00000000-0000-4000-8000-000000000042")
+_SNAPSHOT_ID = UUID("00000000-0000-4000-8000-000000000007")
 
 
 def test_rank_vector_uses_ascending_sort_key_for_better_option():
@@ -63,7 +64,7 @@ def test_seat_carries_svg_coordinates():
 
 def test_result_snapshot_is_defined():
     snap = ResultSnapshot(
-        snapshot_id=1,
+        snapshot_id=_SNAPSHOT_ID,
         watch_id=_WATCH_ID,
         checked_at=datetime(2026, 8, 26, 18, 0, tzinfo=UTC),
         options=(
@@ -83,6 +84,6 @@ def test_result_snapshot_is_defined():
             ),
         ),
     )
-    assert snap.snapshot_id == 1
+    assert snap.snapshot_id == _SNAPSHOT_ID
     assert snap.watch_id == _WATCH_ID
     assert len(snap.options) == 1

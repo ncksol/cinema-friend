@@ -26,6 +26,9 @@ class CheckTrigger(Enum):
 
 
 class CheckOutcome(Enum):
+    # A check run is recorded when it starts, before its outcome is known, so that a
+    # process that dies mid-check still leaves evidence the attempt happened.
+    RUNNING = "running"
     SUCCESS = "success"
     NO_CHANGE = "no_change"
     NEW_OPTIONS = "new_options"

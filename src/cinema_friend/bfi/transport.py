@@ -62,6 +62,12 @@ _MAX_REDIRECT_HOPS = 5
 # before the next scheduled probe would occur anyway.
 _PROBE_LEASE_SECONDS = 120.0
 
+# How many times a non-probing challenge writer re-reads and re-decides after losing a
+# compare-and-swap. Each loss means a concurrent writer got there first, and re-reading
+# usually resolves to "this incident is already recorded"; a small bound keeps a busy
+# host from spinning here instead of returning the challenge to its caller.
+_CAS_ATTEMPTS = 3
+
 
 class DocumentKind(Enum):
     """What kind of BFI document a request is fetching."""
@@ -100,11 +106,36 @@ class AsyncHttpSession(Protocol):
 
 
 class HostCircuitStore(Protocol):
-    """Persists one :class:`HostCircuit` per host."""
+    """Persists one :class:`HostCircuit` per host.
+
+    ``save`` is unconditional and is for seeding or administrative writes. Every
+    contested transition goes through ``compare_and_swap``, which lands only while the
+    stored row still carries the revision the caller observed; that is what keeps two
+    processes from both claiming a probe or replaying a resolved incident over a newer
+    one, since neither one's locks are visible to the other.
+    """
 
     async def load(self, host: str) -> HostCircuit: ...
 
     async def save(self, circuit: HostCircuit) -> None: ...
+
+    async def compare_and_swap(self, circuit: HostCircuit) -> HostCircuit | None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class _CircuitTicket:
+    """What one request learned about the circuit before it went out.
+
+    ``probing`` marks the caller as the single permitted prober. ``observed_generation``
+    is the incident number it saw, used to recognise a challenge that belongs to an
+    incident a sibling request already recorded. ``revision`` is the fencing token the
+    caller's own write must still match: for a prober it is the revision its probe claim
+    produced, so a claim that has since been superseded can no longer resolve the circuit.
+    """
+
+    probing: bool
+    observed_generation: int
+    revision: int
 
 
 def _hostname(url: str) -> str:
@@ -176,6 +207,13 @@ class BfiTransport:
       ``OPEN`` transition instead of the second one mistaking the first's
       own transition for a later, separate incident and double-advancing
       the backoff step.
+
+    Both locks only order callers *inside* one transport instance. Two
+    processes -- or two transports sharing a database -- see none of each
+    other's locks, so every circuit transition is additionally written
+    through ``HostCircuitStore.compare_and_swap`` against the revision the
+    caller observed. A writer whose view has been superseded loses the swap
+    and drops its write rather than overwriting the newer state.
     """
 
     def __init__(
@@ -207,41 +245,37 @@ class BfiTransport:
 
     async def get(self, url: str, kind: DocumentKind) -> FetchedDocument:
         host = _hostname(url)
-        probing, observed_generation = await self._begin_circuit_check(host)
+        ticket = await self._begin_circuit_check(host)
         try:
             document = await self._fetch_following_redirects(url, kind)
         except BfiChallengeError:
-            await self._advance_circuit_after_challenge(
-                host, probing=probing, observed_generation=observed_generation
-            )
+            await self._advance_circuit_after_challenge(host, ticket)
             raise
         except BaseException:
-            if probing:
-                await self._advance_circuit_after_challenge(
-                    host, probing=probing, observed_generation=observed_generation
-                )
+            if ticket.probing:
+                await self._advance_circuit_after_challenge(host, ticket)
             raise
         else:
-            if probing:
-                await self._close_circuit(host)
+            if ticket.probing:
+                await self._close_circuit(host, ticket)
             return document
 
     # -- circuit breaker -----------------------------------------------
 
-    async def _begin_circuit_check(self, host: str) -> tuple[bool, int]:
-        """Enforce the persisted circuit.
+    async def _begin_circuit_check(self, host: str) -> _CircuitTicket:
+        """Enforce the persisted circuit and describe what this caller may do.
 
-        Returns ``(claimed_probe, observed_generation)``: ``claimed_probe``
-        is True if this call claimed the (possibly reclaimed) probe slot;
-        ``observed_generation`` is the circuit generation this call saw
-        while making that decision, threaded through to
-        :meth:`_advance_circuit_after_challenge` so it can recognise a
-        challenge as part of the same incident another concurrent caller
-        already recorded.
+        Returns the :class:`_CircuitTicket` that the caller threads into whichever
+        transition its outcome triggers, or raises :class:`CircuitOpenError` when no
+        request is permitted at all.
         """
         circuit = await self.circuit_store.load(host)
         if circuit.state is CircuitState.CLOSED:
-            return False, circuit.generation
+            return _CircuitTicket(
+                probing=False,
+                observed_generation=circuit.generation,
+                revision=circuit.revision,
+            )
         now = self._clock.now()
         if circuit.state is CircuitState.HALF_OPEN:
             if (now - circuit.updated_at).total_seconds() < _PROBE_LEASE_SECONDS:
@@ -255,7 +289,7 @@ class BfiTransport:
             raise CircuitOpenError(f"circuit for {host} is open until {circuit.next_probe}")
         return await self._claim_probe(host, now)
 
-    async def _claim_probe(self, host: str, now: datetime) -> tuple[bool, int]:
+    async def _claim_probe(self, host: str, now: datetime) -> _CircuitTicket:
         async with self._probe_lock:
             # Re-read after acquiring the lock: another caller may have
             # already claimed the probe (or the window may have moved) while
@@ -272,7 +306,7 @@ class BfiTransport:
             )
             if not (elapsed_open or stale_half_open):
                 raise CircuitOpenError(f"circuit for {host} is open")
-            await self.circuit_store.save(
+            claimed = await self.circuit_store.compare_and_swap(
                 HostCircuit(
                     host=host,
                     state=CircuitState.HALF_OPEN,
@@ -280,43 +314,65 @@ class BfiTransport:
                     generation=circuit.generation,
                     next_probe=circuit.next_probe,
                     updated_at=now,
+                    revision=circuit.revision,
                 )
             )
-            return True, circuit.generation
+            if claimed is None:
+                # Another process claimed the same probe slot between our read
+                # and our write. Exactly one prober is permitted, so this caller
+                # is refused rather than issuing a second probe request.
+                raise CircuitOpenError(f"circuit for {host} is already being probed")
+            return _CircuitTicket(
+                probing=True,
+                observed_generation=circuit.generation,
+                revision=claimed.revision,
+            )
 
-    async def _advance_circuit_after_challenge(
-        self, host: str, *, probing: bool, observed_generation: int
-    ) -> None:
+    async def _advance_circuit_after_challenge(self, host: str, ticket: _CircuitTicket) -> None:
+        """Record a challenge against the circuit, opening or advancing its backoff.
+
+        A prober gets exactly one fenced attempt against the revision its claim produced:
+        losing that swap means its lease was already superseded, and replaying a resolved
+        probe over the newer incident would corrupt the backoff ladder. A non-probing
+        caller instead re-reads and re-decides, because a lost swap there only means a
+        sibling wrote first -- and the incident comparison then recognises that write as
+        the same trip and stops.
+        """
         async with self._advance_lock:
-            circuit = await self.circuit_store.load(host)
-            now = self._clock.now()
-            if not probing and circuit.state is CircuitState.CLOSED:
-                # Fresh trip: the first challenge to observe CLOSED wins.
-                backoff_step = 0
-                generation = circuit.generation + 1
-            elif not probing and circuit.generation == observed_generation + 1:
-                # A concurrent sibling request observed the same CLOSED
-                # generation we did and has already recorded the fresh
-                # OPEN transition for this incident. Don't double-advance
-                # the backoff step for a second signal from the same trip.
-                return
-            else:
-                backoff_step = min(circuit.backoff_step + 1, len(_CIRCUIT_DELAYS) - 1)
-                generation = circuit.generation
-            await self.circuit_store.save(
-                HostCircuit(
-                    host=host,
-                    state=CircuitState.OPEN,
-                    backoff_step=backoff_step,
-                    generation=generation,
-                    next_probe=now + _CIRCUIT_DELAYS[backoff_step],
-                    updated_at=now,
+            for _ in range(1 if ticket.probing else _CAS_ATTEMPTS):
+                circuit = await self.circuit_store.load(host)
+                now = self._clock.now()
+                if not ticket.probing and circuit.state is CircuitState.CLOSED:
+                    # Fresh trip: the first challenge to observe CLOSED wins.
+                    backoff_step = 0
+                    generation = circuit.generation + 1
+                elif not ticket.probing and circuit.generation == ticket.observed_generation + 1:
+                    # A concurrent sibling request observed the same CLOSED
+                    # generation we did and has already recorded the fresh
+                    # OPEN transition for this incident. Don't double-advance
+                    # the backoff step for a second signal from the same trip.
+                    return
+                else:
+                    backoff_step = min(circuit.backoff_step + 1, len(_CIRCUIT_DELAYS) - 1)
+                    generation = circuit.generation
+                written = await self.circuit_store.compare_and_swap(
+                    HostCircuit(
+                        host=host,
+                        state=CircuitState.OPEN,
+                        backoff_step=backoff_step,
+                        generation=generation,
+                        next_probe=now + _CIRCUIT_DELAYS[backoff_step],
+                        updated_at=now,
+                        revision=ticket.revision if ticket.probing else circuit.revision,
+                    )
                 )
-            )
+                if written is not None:
+                    return
 
-    async def _close_circuit(self, host: str) -> None:
+    async def _close_circuit(self, host: str, ticket: _CircuitTicket) -> None:
+        """Close the circuit after a successful probe, unless the claim was superseded."""
         circuit = await self.circuit_store.load(host)
-        await self.circuit_store.save(
+        await self.circuit_store.compare_and_swap(
             HostCircuit(
                 host=host,
                 state=CircuitState.CLOSED,
@@ -324,6 +380,7 @@ class BfiTransport:
                 generation=circuit.generation,
                 next_probe=None,
                 updated_at=self._clock.now(),
+                revision=ticket.revision,
             )
         )
 

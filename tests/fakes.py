@@ -103,29 +103,57 @@ class FakeSession:
 
 
 class MemoryCircuitStore:
-    """In-memory :class:`HostCircuitStore`, persisting one circuit per host."""
+    """In-memory :class:`HostCircuitStore`, persisting one circuit per host.
+
+    Mirrors the SQLite store's revision semantics so transport behaviour proven here
+    holds against the real store: an absent circuit reads as revision 0, and every
+    persisted write advances the revision by one.
+    """
 
     def __init__(self, initial: HostCircuit | None = None) -> None:
         self._circuits: dict[str, HostCircuit] = {}
         if initial is not None:
-            self._circuits[initial.host] = initial
+            self._circuits[initial.host] = _with_revision(initial, 1)
 
     async def load(self, host: str) -> HostCircuit:
         circuit = self._circuits.get(host)
         if circuit is None:
-            circuit = HostCircuit(
+            return HostCircuit(
                 host=host,
                 state=CircuitState.CLOSED,
                 backoff_step=0,
                 generation=0,
                 next_probe=None,
                 updated_at=_EPOCH,
+                revision=0,
             )
-            self._circuits[host] = circuit
         return circuit
 
     async def save(self, circuit: HostCircuit) -> None:
-        self._circuits[circuit.host] = circuit
+        existing = self._circuits.get(circuit.host)
+        revision = 1 if existing is None else existing.revision + 1
+        self._circuits[circuit.host] = _with_revision(circuit, revision)
+
+    async def compare_and_swap(self, circuit: HostCircuit) -> HostCircuit | None:
+        existing = self._circuits.get(circuit.host)
+        stored_revision = 0 if existing is None else existing.revision
+        if stored_revision != circuit.revision:
+            return None
+        written = _with_revision(circuit, circuit.revision + 1)
+        self._circuits[circuit.host] = written
+        return written
+
+
+def _with_revision(circuit: HostCircuit, revision: int) -> HostCircuit:
+    return HostCircuit(
+        host=circuit.host,
+        state=circuit.state,
+        backoff_step=circuit.backoff_step,
+        generation=circuit.generation,
+        next_probe=circuit.next_probe,
+        updated_at=circuit.updated_at,
+        revision=revision,
+    )
 
 
 def fetched_document(text: str, *, url: str = "", status_code: int = 200) -> FetchedDocument:

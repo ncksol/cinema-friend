@@ -9,7 +9,11 @@ from pathlib import Path
 import aiosqlite
 import pytest
 
-from cinema_friend.storage.database import Database
+from cinema_friend.storage.database import Database, _discover_migrations
+
+# Derived rather than hard-coded so adding a migration doesn't need these tests edited;
+# what they assert is that every discovered migration is applied exactly once.
+_ALL_VERSIONS = [version for version, _ in _discover_migrations()]
 
 _ALL_TABLES = {
     "schema_migrations",
@@ -83,7 +87,7 @@ async def test_migrate_records_applied_version(
     await database.migrate(conn)
     cursor = await conn.execute("SELECT version FROM schema_migrations")
     rows = await cursor.fetchall()
-    assert [row["version"] for row in rows] == [1]
+    assert [row["version"] for row in rows] == _ALL_VERSIONS
 
 
 async def test_migrate_is_idempotent(database: Database, conn: aiosqlite.Connection) -> None:
@@ -91,7 +95,7 @@ async def test_migrate_is_idempotent(database: Database, conn: aiosqlite.Connect
     await database.migrate(conn)
     cursor = await conn.execute("SELECT version FROM schema_migrations")
     rows = await cursor.fetchall()
-    assert [row["version"] for row in rows] == [1]
+    assert [row["version"] for row in rows] == _ALL_VERSIONS
 
 
 async def test_migrate_is_idempotent_across_connections(
@@ -108,7 +112,7 @@ async def test_migrate_is_idempotent_across_connections(
         await database.migrate(second)
         cursor = await second.execute("SELECT version FROM schema_migrations")
         rows = await cursor.fetchall()
-        assert [row["version"] for row in rows] == [1]
+        assert [row["version"] for row in rows] == _ALL_VERSIONS
     finally:
         await second.close()
 

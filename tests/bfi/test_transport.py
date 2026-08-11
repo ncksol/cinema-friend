@@ -381,6 +381,137 @@ async def test_two_concurrent_challenges_from_closed_produce_one_fresh_open_tran
 
 
 # ---------------------------------------------------------------------------
+# Cross-process fencing (compare-and-swap on the persisted circuit)
+# ---------------------------------------------------------------------------
+
+
+async def test_circuit_store_reports_an_absent_circuit_as_revision_zero():
+    store = MemoryCircuitStore()
+    absent = await store.load(BFI_HOST)
+    assert absent.revision == 0
+    assert absent.state is CircuitState.CLOSED
+
+
+async def test_compare_and_swap_rejects_a_writer_whose_revision_moved_on():
+    store = MemoryCircuitStore(open_circuit(datetime(2026, 1, 1, tzinfo=UTC), host=BFI_HOST))
+    observed = await store.load(BFI_HOST)
+
+    winner = await store.compare_and_swap(
+        HostCircuit(
+            host=BFI_HOST,
+            state=CircuitState.HALF_OPEN,
+            backoff_step=observed.backoff_step,
+            generation=observed.generation,
+            next_probe=observed.next_probe,
+            updated_at=observed.updated_at,
+            revision=observed.revision,
+        )
+    )
+    assert winner is not None
+    assert winner.revision == observed.revision + 1
+
+    loser = await store.compare_and_swap(
+        HostCircuit(
+            host=BFI_HOST,
+            state=CircuitState.CLOSED,
+            backoff_step=0,
+            generation=observed.generation,
+            next_probe=None,
+            updated_at=observed.updated_at,
+            revision=observed.revision,
+        )
+    )
+    assert loser is None
+    assert (await store.load(BFI_HOST)).state is CircuitState.HALF_OPEN
+
+
+async def test_a_superseded_prober_does_not_close_a_reopened_circuit():
+    """Two transports share a circuit but not their locks, as two processes would.
+
+    The first transport claims the probe and then stalls. The second sees the lease
+    expire, reclaims it, and records a fresh failure. When the original prober finally
+    succeeds, its close must be refused -- otherwise a resolved probe from an older
+    incident would erase a live one and let traffic straight back onto a hostile host.
+    """
+    clock = FakeClock(datetime(2026, 1, 1, tzinfo=UTC))
+    store = MemoryCircuitStore(
+        open_circuit(clock.now() - timedelta(seconds=1), host=BFI_HOST, backoff_step=0, generation=1)
+    )
+    stalled = make_transport(circuit_store=store, clock=clock)
+    reclaimer = make_transport(circuit_store=store, clock=clock)
+
+    claim = await stalled._begin_circuit_check(BFI_HOST)
+    assert claim.probing
+
+    clock.current += timedelta(seconds=_PROBE_LEASE_SECONDS + 1)
+    reclaimed = await reclaimer._begin_circuit_check(BFI_HOST)
+    assert reclaimed.probing
+    await reclaimer._advance_circuit_after_challenge(BFI_HOST, reclaimed)
+
+    await stalled._close_circuit(BFI_HOST, claim)
+
+    circuit = await store.load(BFI_HOST)
+    assert circuit.state is CircuitState.OPEN
+    assert circuit.backoff_step == 1
+
+
+async def test_a_superseded_prober_does_not_advance_a_reclaimed_circuit():
+    """The mirror case: a stale probe failure must not skip a backoff rung."""
+    clock = FakeClock(datetime(2026, 1, 1, tzinfo=UTC))
+    store = MemoryCircuitStore(
+        open_circuit(clock.now() - timedelta(seconds=1), host=BFI_HOST, backoff_step=0, generation=1)
+    )
+    stalled = make_transport(circuit_store=store, clock=clock)
+    reclaimer = make_transport(circuit_store=store, clock=clock)
+
+    claim = await stalled._begin_circuit_check(BFI_HOST)
+    clock.current += timedelta(seconds=_PROBE_LEASE_SECONDS + 1)
+    reclaimed = await reclaimer._begin_circuit_check(BFI_HOST)
+    await reclaimer._advance_circuit_after_challenge(BFI_HOST, reclaimed)
+
+    await stalled._advance_circuit_after_challenge(BFI_HOST, claim)
+
+    circuit = await store.load(BFI_HOST)
+    assert circuit.backoff_step == 1
+    assert circuit.next_probe == clock.now() + timedelta(minutes=30)
+
+
+async def test_a_lost_probe_claim_is_refused_rather_than_probing_twice():
+    """When the compare-and-swap is lost, the caller must not become a second prober.
+
+    A losing claim means another process already owns the probe. The transport has no
+    way to see that process, so the only correct response to the refused write is to
+    fail closed rather than send a second request at an already-hostile host.
+    """
+
+    class LosingStore(MemoryCircuitStore):
+        """Rejects the first compare-and-swap, standing in for a rival that wrote first."""
+
+        def __init__(self, initial: HostCircuit) -> None:
+            super().__init__(initial)
+            self.rejected = False
+
+        async def compare_and_swap(self, circuit: HostCircuit) -> HostCircuit | None:
+            if not self.rejected:
+                self.rejected = True
+                return None
+            return await super().compare_and_swap(circuit)
+
+    clock = FakeClock(datetime(2026, 1, 1, tzinfo=UTC))
+    store = LosingStore(
+        open_circuit(clock.now() - timedelta(seconds=1), host=BFI_HOST, backoff_step=0, generation=1)
+    )
+    session = FakeSession([response(200, ARTICLE)])
+    transport = make_transport(session=session, circuit_store=store, clock=clock)
+
+    with pytest.raises(CircuitOpenError):
+        await transport.get(FILM_URL, DocumentKind.ARTICLE)
+    assert store.rejected
+    assert session.calls == []
+    assert (await store.load(BFI_HOST)).state is CircuitState.OPEN
+
+
+# ---------------------------------------------------------------------------
 # Redirects
 # ---------------------------------------------------------------------------
 
