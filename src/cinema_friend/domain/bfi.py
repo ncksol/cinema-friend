@@ -5,6 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
+from zoneinfo import ZoneInfo
+
+_LONDON = ZoneInfo("Europe/London")
 
 
 class SeatStatus(Enum):
@@ -57,3 +60,14 @@ class Performance:
     availability_num: int
     reserved_seating: bool
     seat_map_url: str | None
+    options: tuple[str, ...] = ()
+
+    @property
+    def start(self) -> datetime:
+        """Return the performance start time in the Europe/London timezone."""
+        return self.start_utc.astimezone(_LONDON)
+
+    @property
+    def sales_status_base(self) -> str:
+        """Return sales status code with any trailing ``*`` stripped."""
+        return self.sales_status_code.rstrip("*")
