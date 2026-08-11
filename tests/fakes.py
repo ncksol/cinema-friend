@@ -7,6 +7,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
+from cinema_friend.bfi.transport import DocumentKind, FetchedDocument
 from cinema_friend.domain.results import CircuitState, HostCircuit
 
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
@@ -125,6 +126,51 @@ class MemoryCircuitStore:
 
     async def save(self, circuit: HostCircuit) -> None:
         self._circuits[circuit.host] = circuit
+
+
+def fetched_document(text: str, *, url: str = "", status_code: int = 200) -> FetchedDocument:
+    """Build a :class:`FetchedDocument` for queueing into :class:`FakeTransport`."""
+    return FetchedDocument(
+        url=url,
+        status_code=status_code,
+        headers={},
+        text=text,
+        byte_count=len(text.encode("utf-8")),
+    )
+
+
+QueuedDocument = FetchedDocument | BaseException
+
+
+class FakeTransport:
+    """Records requested URLs and returns queued documents/exceptions per URL.
+
+    Values passed to ``responses`` may be a single item (returned on every
+    call for that URL) or a ``list`` of items consumed in order, with the
+    last item repeating once the list is exhausted.
+    """
+
+    def __init__(
+        self, responses: Mapping[str, QueuedDocument | list[QueuedDocument]] | None = None
+    ) -> None:
+        self._queues: dict[str, list[QueuedDocument]] = {
+            url: list(value) if isinstance(value, list) else [value]
+            for url, value in (responses or {}).items()
+        }
+        self.calls: list[str] = []
+
+    async def get(self, url: str, kind: DocumentKind) -> FetchedDocument:
+        self.calls.append(url)
+        queue = self._queues.get(url)
+        if not queue:
+            raise AssertionError(f"FakeTransport has no queued response for {url}")
+        item = queue.pop(0) if len(queue) > 1 else queue[0]
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+    def call_count(self, url: str) -> int:
+        return self.calls.count(url)
 
 
 def open_circuit(

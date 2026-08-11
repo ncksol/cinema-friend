@@ -1,0 +1,223 @@
+"""BFI availability gateway: pagination, request coalescing, and seat-map reads.
+
+The transport (:mod:`cinema_friend.bfi.transport`) already owns retries, the
+challenge circuit, and request spacing/concurrency. This gateway sits above
+it and owns pagination assembly, per-URL single-flight + TTL document
+coalescing, deduplication of performance rows, and cross-source validation
+between the article listing and the seat-map page. It never caches a failed
+fetch: only a successfully retrieved document is stored.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import functools
+import logging
+from dataclasses import dataclass
+from typing import Protocol
+
+from cinema_friend.bfi.article_context import ArticlePage, parse_article_page, performance_from_row
+from cinema_friend.bfi.seat_map import parse_seat_map
+from cinema_friend.bfi.transport import DocumentKind, FetchedDocument
+from cinema_friend.bfi.urls import film_page_url, pagination_url
+from cinema_friend.clock import Clock
+from cinema_friend.domain.bfi import Performance, SeatMap, SeatStatus
+from cinema_friend.domain.errors import BfiContractError
+
+logger = logging.getLogger(__name__)
+
+_DEFAULT_CACHE_SECONDS = 60.0
+
+# Absolute drift between BFI's reported availability_num and the count of
+# seats this gateway parsed as AVAILABLE above which the mismatch is logged
+# (but not treated as fatal -- BFI's own counter can legitimately lag the
+# seat-map SVG by a few seats under concurrent bookings).
+_DRIFT_LOG_THRESHOLD = 5
+
+
+@dataclass(frozen=True, slots=True)
+class AvailabilityDrift:
+    """Difference between BFI's reported ``availability_num`` and parsed seats.
+
+    ``difference`` is ``reported - parsed``: positive when BFI reports more
+    availability than the seat map shows, negative when the seat map shows
+    more available seats than BFI's counter reports.
+    """
+
+    reported: int
+    parsed: int
+    difference: int
+
+
+class DocumentTransport(Protocol):
+    """The subset of :class:`~cinema_friend.bfi.transport.BfiTransport` the gateway needs."""
+
+    async def get(self, url: str, kind: DocumentKind) -> FetchedDocument: ...
+
+
+class BfiGateway:
+    """Assembles paginated performance listings and cross-checked seat maps.
+
+    Concurrency model:
+
+    - ``_lock`` protects both ``_inflight`` and ``_cache``. It is held only
+      for the read-check-write bookkeeping around a fetch, never for the
+      duration of the outbound request itself, so unrelated URLs and
+      concurrent readers of different documents never block on each other.
+    - A document fetch already under way for a URL is shared: a second
+      caller awaits the same :class:`asyncio.Task` instead of issuing a
+      second request (single-flight). A completed fetch is served from
+      ``_cache`` until ``cache_seconds`` elapses, measured via ``clock``.
+    - Only a *successful* fetch is cached; an exception (including a
+      challenge) propagates to every awaiter and leaves nothing behind for
+      a later caller to reuse. ``_inflight`` is always cleaned up, on
+      success or failure, so a subsequent request for the same URL is never
+      wedged waiting on a task that has already finished.
+    """
+
+    def __init__(
+        self,
+        transport: DocumentTransport,
+        clock: Clock,
+        cache_seconds: float = _DEFAULT_CACHE_SECONDS,
+    ) -> None:
+        self._transport = transport
+        self._clock = clock
+        self._cache_seconds = cache_seconds
+        self._lock = asyncio.Lock()
+        self._inflight: dict[str, asyncio.Task[FetchedDocument]] = {}
+        self._cache: dict[str, tuple[float, FetchedDocument]] = {}
+
+    async def list_performances(self, slug: str) -> tuple[Performance, ...]:
+        """Fetch and assemble every paginated performance row for *slug*.
+
+        Deduplicates rows by ``performance_id`` (an exact repeat, e.g. from
+        overlapping pages, is collapsed to one entry) and raises
+        :class:`BfiContractError` if two rows share an ID but disagree on
+        the parsed data, or if ``article_id``/``total_pages`` changes
+        between pages of the same listing.
+        """
+        url = film_page_url(slug)
+        document = await self._fetch_document(url, DocumentKind.ARTICLE)
+        first_page = parse_article_page(document.text)
+
+        performances: dict[str, Performance] = {}
+        self._collect_page(first_page, performances)
+
+        for page_number in range(2, first_page.total_pages + 1):
+            page_url = pagination_url(first_page.s_token, page_number, first_page.article_id)
+            next_document = await self._fetch_document(page_url, DocumentKind.ARTICLE)
+            page = parse_article_page(next_document.text)
+            _validate_pagination_identity(first_page, page, page_number)
+            self._collect_page(page, performances)
+
+        return tuple(performances.values())
+
+    async def load_seat_map(self, performance: Performance) -> SeatMap:
+        """Fetch the seat map for *performance* and cross-check availability.
+
+        Raises :class:`BfiContractError` if the seat map's embedded
+        performance identity does not match *performance* (checked by
+        :func:`~cinema_friend.bfi.seat_map.parse_seat_map`), or if BFI
+        reports positive availability while zero seats parse as available.
+        A larger, non-zero drift is logged but does not fail the read.
+        """
+        if performance.seat_map_url is None:
+            raise BfiContractError(
+                f"performance {performance.performance_id!r} has no seat_map_url"
+            )
+        document = await self._fetch_document(performance.seat_map_url, DocumentKind.SEAT_MAP)
+        seat_map = parse_seat_map(document.text, performance.performance_id)
+        drift = _availability_drift(performance, seat_map)
+
+        if drift.parsed == 0 and performance.availability_num > 0:
+            raise BfiContractError(
+                f"performance {performance.performance_id!r} reports "
+                f"availability_num={performance.availability_num} but zero available seats parsed"
+            )
+        if abs(drift.difference) > _DRIFT_LOG_THRESHOLD:
+            logger.warning(
+                "availability drift for performance %s: reported=%d parsed=%d difference=%d",
+                performance.performance_id,
+                drift.reported,
+                drift.parsed,
+                drift.difference,
+            )
+        return seat_map
+
+    @staticmethod
+    def _collect_page(page: ArticlePage, performances: dict[str, Performance]) -> None:
+        for row in page.rows:
+            if row.get("object_type") != "P":
+                continue
+            performance = performance_from_row(row)
+            existing = performances.get(performance.performance_id)
+            if existing is None:
+                performances[performance.performance_id] = performance
+            elif existing != performance:
+                raise BfiContractError(
+                    f"duplicate performance {performance.performance_id!r} "
+                    "reports conflicting data across pages"
+                )
+
+    async def _fetch_document(self, url: str, kind: DocumentKind) -> FetchedDocument:
+        async with self._lock:
+            cached = self._cache.get(url)
+            if cached is not None:
+                expires_at, document = cached
+                if self._clock.monotonic() < expires_at:
+                    return document
+                del self._cache[url]
+            task = self._inflight.get(url)
+            if task is None:
+                task = asyncio.ensure_future(self._transport.get(url, kind))
+                # Bookkeeping (inflight removal, TTL caching) lives in a
+                # done-callback tied to the shared task itself, never to any
+                # one awaiter's `finally`. `asyncio.Task.cancel()` cancels
+                # whatever future the task is currently blocked on -- which,
+                # for a plain `await task`, would be this very shared task --
+                # so a second, uncancelled caller's `await` on the same task
+                # would be corrupted by a first caller's unrelated
+                # cancellation. `asyncio.shield` below stops that
+                # propagation; the callback then makes cleanup independent
+                # of which (if any) awaiter is still around to observe it.
+                task.add_done_callback(functools.partial(self._on_fetch_done, url))
+                self._inflight[url] = task
+
+        return await asyncio.shield(task)
+
+    def _on_fetch_done(self, url: str, task: asyncio.Task[FetchedDocument]) -> None:
+        """Clean up `_inflight` and populate `_cache` once a shared fetch finishes.
+
+        Runs synchronously as an `asyncio` callback (never suspends), so it
+        always completes atomically between coroutine steps and cannot
+        interleave with another coroutine's `_lock`-held critical section --
+        no `async with self._lock` is needed here. Only a genuinely
+        successful fetch is cached; a cancelled or failed one is dropped so
+        the next caller retries from scratch.
+        """
+        if self._inflight.get(url) is task:
+            del self._inflight[url]
+        if task.cancelled() or task.exception() is not None:
+            return
+        document = task.result()
+        self._cache[url] = (self._clock.monotonic() + self._cache_seconds, document)
+
+
+def _validate_pagination_identity(first: ArticlePage, page: ArticlePage, page_number: int) -> None:
+    if page.article_id != first.article_id:
+        raise BfiContractError(
+            f"page {page_number} article_id changed: "
+            f"expected {first.article_id!r}, got {page.article_id!r}"
+        )
+    if page.total_pages != first.total_pages:
+        raise BfiContractError(
+            f"page {page_number} total_pages changed: "
+            f"expected {first.total_pages}, got {page.total_pages}"
+        )
+
+
+def _availability_drift(performance: Performance, seat_map: SeatMap) -> AvailabilityDrift:
+    parsed = sum(1 for seat in seat_map.seats if seat.status is SeatStatus.AVAILABLE)
+    reported = performance.availability_num
+    return AvailabilityDrift(reported=reported, parsed=parsed, difference=reported - parsed)
