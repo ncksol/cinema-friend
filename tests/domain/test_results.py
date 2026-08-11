@@ -45,6 +45,7 @@ _SEAT = Seat(
     status=SeatStatus.AVAILABLE,
     zone=PriceZone(zone_id="z1", label="Premium", price=None),
     note="",
+    section="BFI IMAX",
     row="L",
     column=17,
     x=120.0,

@@ -279,3 +279,37 @@ getPerformanceEcommerceObject({{"item_id":"{PERFORMANCE_ID}"}})
 </g></svg></html>"""
     with pytest.raises(BfiContractError, match="non-finite"):
         parse_seat_map(html, PERFORMANCE_ID)
+
+
+# ---------------------------------------------------------------------------
+# Fix round 1: data-seat-section is required seat identity, parsed fail-closed
+# ---------------------------------------------------------------------------
+
+
+def test_parses_seat_section_into_domain_seat():
+    seat_map = parse_seat_map(seat_map_html(), PERFORMANCE_ID)
+    assert all(s.section == "BFI IMAX" for s in seat_map.seats)
+
+
+def test_missing_seat_section_raises():
+    html = f"""<html><script>
+getPerformanceEcommerceObject({{"item_id":"{PERFORMANCE_ID}"}})
+</script>
+<svg><g id="{ZONE_ID}">
+  <circle id="bad-4" data-status="A"
+    data-seat-row="A" data-seat-seat="1" cx="10" cy="10"/>
+</g></svg></html>"""
+    with pytest.raises(BfiContractError, match="section"):
+        parse_seat_map(html, PERFORMANCE_ID)
+
+
+def test_empty_seat_section_raises():
+    html = f"""<html><script>
+getPerformanceEcommerceObject({{"item_id":"{PERFORMANCE_ID}"}})
+</script>
+<svg><g id="{ZONE_ID}">
+  <circle id="bad-5" data-status="A" data-seat-section=""
+    data-seat-row="A" data-seat-seat="1" cx="10" cy="10"/>
+</g></svg></html>"""
+    with pytest.raises(BfiContractError, match="section"):
+        parse_seat_map(html, PERFORMANCE_ID)

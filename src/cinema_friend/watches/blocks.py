@@ -85,14 +85,17 @@ def generate_blocks(seat_map: SeatMap, criteria: WatchCriteria) -> tuple[SeatBlo
     restricted, unknown-status, and explicitly excluded seats break a run of
     adjacent seats. Runs are also broken across an aisle, detected by an
     outsized gap in seat x-coordinates relative to the row's normal
-    (median) seat-to-seat gap.
+    (median) seat-to-seat gap, and across a section boundary: seats only
+    form a contiguous run when they share both section and row, so
+    consecutively numbered seats in different sections never adjoin even
+    when geometrically close.
     """
-    seats_by_row: dict[str, list[Seat]] = defaultdict(list)
+    seats_by_section_row: dict[tuple[str, str], list[Seat]] = defaultdict(list)
     for seat in seat_map.seats:
-        seats_by_row[seat.row].append(seat)
+        seats_by_section_row[(seat.section, seat.row)].append(seat)
 
     blocks: list[SeatBlock] = []
-    for row, row_seats in seats_by_row.items():
+    for (_section, row), row_seats in seats_by_section_row.items():
         if row in criteria.excluded_rows:
             continue
         blocks.extend(_generate_row_blocks(row, row_seats, criteria))

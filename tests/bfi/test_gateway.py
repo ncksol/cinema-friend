@@ -444,7 +444,8 @@ async def test_positive_reported_availability_with_zero_parsed_available_is_cont
         "<html><script>"
         f'getPerformanceEcommerceObject({{"item_id":"{PERF_1}"}})'
         "</script><svg>"
-        '<circle id="seat-1" data-status="S" data-seat-row="L" data-seat-seat="1" cx="1" cy="1"/>'
+        '<circle id="seat-1" data-status="S" data-seat-section="BFI IMAX" '
+        'data-seat-row="L" data-seat-seat="1" cx="1" cy="1"/>'
         "</svg></html>"
     )
     gateway, _, _ = make_gateway(

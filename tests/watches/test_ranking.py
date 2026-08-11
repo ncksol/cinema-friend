@@ -19,6 +19,7 @@ def seat(
     *,
     y: float = 100.0,
     status: SeatStatus = SeatStatus.AVAILABLE,
+    section: str = "BFI IMAX",
 ) -> Seat:
     return Seat(
         seat_id=f"{row}{column}",
@@ -26,6 +27,7 @@ def seat(
         status=status,
         zone=_ZONE,
         note="",
+        section=section,
         row=row,
         column=column,
         x=x,

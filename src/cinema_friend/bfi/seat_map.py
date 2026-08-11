@@ -44,7 +44,8 @@ def parse_seat_map(html: str, expected_performance_id: str) -> SeatMap:
     Raises :class:`BfiContractError` on any contract violation:
     - Performance ID absent or mismatched.
     - No seat circles found.
-    - Duplicate seat IDs that disagree on row or status.
+    - Missing or empty ``data-seat-section`` on any seat circle.
+    - Duplicate seat IDs that disagree on section, row, or status.
     - Missing or non-finite seat coordinates.
     """
     perf_match = _PERF_ID_RE.search(html)
@@ -88,9 +89,13 @@ def parse_seat_map(html: str, expected_performance_id: str) -> SeatMap:
     for circle in circles:
         raw_status: str = circle.get("data-status", "")
         seat_id: str = circle.get("id", "")
+        section: str = circle.get("data-seat-section", "")
         row: str = circle.get("data-seat-row", "")
         seat_num_str: str = circle.get("data-seat-seat", "")
         note: str = circle.get("data-note") or circle.get("title") or ""
+
+        if not section:
+            raise BfiContractError(f"seat {seat_id!r}: missing data-seat-section")
 
         try:
             column = int(seat_num_str)
@@ -132,6 +137,7 @@ def parse_seat_map(html: str, expected_performance_id: str) -> SeatMap:
             status=status,
             zone=zone,
             note=note,
+            section=section,
             row=row,
             column=column,
             x=x,
@@ -140,9 +146,13 @@ def parse_seat_map(html: str, expected_performance_id: str) -> SeatMap:
 
         if seat_id in seen:
             existing = seen[seat_id]
-            if existing.row != seat.row or existing.raw_status_code != seat.raw_status_code:
+            if (
+                existing.section != seat.section
+                or existing.row != seat.row
+                or existing.raw_status_code != seat.raw_status_code
+            ):
                 raise BfiContractError(
-                    f"duplicate seat {seat_id!r} disagrees on row/status"
+                    f"duplicate seat {seat_id!r} disagrees on section/row/status"
                 )
             continue
 

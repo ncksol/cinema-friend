@@ -35,6 +35,7 @@ class Seat:
     status: SeatStatus
     zone: PriceZone | None
     note: str
+    section: str
     row: str
     column: int
     x: float

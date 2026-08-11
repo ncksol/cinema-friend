@@ -39,6 +39,7 @@ def seat(
     *,
     status: SeatStatus = SeatStatus.AVAILABLE,
     y: float = 100.0,
+    section: str = "BFI IMAX",
 ) -> Seat:
     return Seat(
         seat_id=f"{row}{column}",
@@ -46,6 +47,7 @@ def seat(
         status=status,
         zone=_ZONE,
         note="",
+        section=section,
         row=row,
         column=column,
         x=x,
@@ -169,3 +171,33 @@ def test_quantity_larger_than_run_yields_no_blocks() -> None:
     seat_map = SeatMap(performance_id="p1", seats=tuple(seats))
     blocks = generate_blocks(seat_map, criteria_for(quantity=5))
     assert blocks == ()
+
+
+# ---------------------------------------------------------------------------
+# Fix round 1: section identity gates adjacency, independent of row/geometry
+# ---------------------------------------------------------------------------
+
+
+def test_different_sections_same_row_never_form_a_cross_section_block() -> None:
+    # Row "L" spans two sections. Seats L5 (section A) and L6 (section B) are
+    # consecutively numbered with a normal in-section gap (14) between them,
+    # so a row/geometry-only algorithm would treat them as adjacent. Section
+    # identity must prevent that: L5-L6 must never appear as a block, while
+    # each section still forms its own internal blocks.
+    section_a_xs = [100.0, 114.0, 128.0, 142.0, 156.0]
+    section_a = [seat("L", i + 1, x, section="Section A") for i, x in enumerate(section_a_xs)]
+    section_b_xs = [170.0, 184.0, 198.0, 212.0, 226.0]
+    section_b = [seat("L", i + 6, x, section="Section B") for i, x in enumerate(section_b_xs)]
+    seat_map = SeatMap(performance_id="p1", seats=tuple(section_a + section_b))
+    blocks = generate_blocks(seat_map, criteria_for(quantity=2))
+    labels = {tuple(s.seat_id for s in block.seats) for block in blocks}
+
+    assert ("L5", "L6") not in labels
+    assert all(
+        {s.section for s in block.seats} == {section}
+        for block in blocks
+        for section in [block.seats[0].section]
+    )
+    # Each section still independently forms its own adjacent-seat blocks.
+    assert ("L4", "L5") in labels
+    assert ("L6", "L7") in labels
