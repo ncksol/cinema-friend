@@ -7,9 +7,11 @@ to render, and every option key the notification policy compares against.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from pathlib import Path
+from typing import Any, cast
 from uuid import UUID
 
 import aiosqlite
@@ -23,13 +25,25 @@ from cinema_friend.storage.draft_repository import DraftRepository
 from cinema_friend.storage.notification_repository import NotificationRepository
 from cinema_friend.storage.result_repository import ResultRepository
 from cinema_friend.storage.retention import RetentionService
-from tests.storage.conftest import NOW, option, options
+from tests.storage.conftest import NOW, FailingConnection, option, options
 
 WatchFactory = Callable[..., Coroutine[Any, Any, Watch]]
 
 RECENT = NOW - timedelta(hours=1)
 OLD = NOW - timedelta(hours=25)
 ANCIENT = NOW - timedelta(days=31)
+
+
+class FailingDatabase(Database):
+    """Hands out connections that refuse the first statement containing ``marker``."""
+
+    def __init__(self, path: Path, marker: str) -> None:
+        super().__init__(path)
+        self._marker = marker
+
+    async def connect(self) -> aiosqlite.Connection:
+        connection = await super().connect()
+        return cast("aiosqlite.Connection", FailingConnection(connection, self._marker, 1))
 
 
 @pytest.fixture
@@ -107,7 +121,7 @@ async def test_old_snapshots_are_removed(
     old = await snapshot_at(results, conn, watch, OLD, seat_label="A1")
     latest = await snapshot_at(results, conn, watch, RECENT, seat_label="B2")
 
-    counts = await service.run(conn, NOW)
+    counts = await service.run(NOW)
 
     assert await snapshot_ids(conn) == {latest}
     assert counts.snapshots_deleted == 1
@@ -124,7 +138,7 @@ async def test_the_newest_snapshot_survives_however_old_it_is(
     watch = await make_watch()
     only = await snapshot_at(results, conn, watch, ANCIENT)
 
-    counts = await service.run(conn, NOW)
+    counts = await service.run(NOW)
 
     assert await snapshot_ids(conn) == {only}
     assert counts.snapshots_deleted == 0
@@ -140,7 +154,7 @@ async def test_recent_snapshots_are_kept(
     first = await snapshot_at(results, conn, watch, RECENT - timedelta(minutes=5), seat_label="A1")
     second = await snapshot_at(results, conn, watch, RECENT, seat_label="B2")
 
-    await service.run(conn, NOW)
+    await service.run(NOW)
 
     assert await snapshot_ids(conn) == {first, second}
 
@@ -156,7 +170,7 @@ async def test_each_watch_keeps_its_own_latest(
     first_latest = await snapshot_at(results, conn, first, ANCIENT)
     second_latest = await snapshot_at(results, conn, second, ANCIENT)
 
-    await service.run(conn, NOW)
+    await service.run(NOW)
 
     assert await snapshot_ids(conn) == {first_latest, second_latest}
 
@@ -174,7 +188,7 @@ async def test_a_snapshot_held_by_a_pending_delivery_is_retained(
     await snapshot_at(results, conn, watch, RECENT, seat_label="B2")
     await notifications.create_delivery(conn, "key-1", payload(watch, held), OLD)
 
-    counts = await service.run(conn, NOW)
+    counts = await service.run(NOW)
 
     assert held in await snapshot_ids(conn)
     assert counts.snapshots_deleted == 0
@@ -193,7 +207,7 @@ async def test_a_snapshot_is_released_once_its_delivery_is_sent(
     delivery = await notifications.create_delivery(conn, "key-1", payload(watch, held), OLD)
     await notifications.mark_delivered(conn, delivery.delivery_id, (option().key,), None, OLD)
 
-    await service.run(conn, NOW)
+    await service.run(NOW)
 
     assert await snapshot_ids(conn) == {latest}
 
@@ -212,7 +226,7 @@ async def test_a_snapshot_is_released_once_its_delivery_has_failed(
     delivery = await notifications.create_delivery(conn, "key-1", payload(watch, held), OLD)
     await notifications.mark_failed(conn, delivery.delivery_id, OLD)
 
-    await service.run(conn, NOW)
+    await service.run(NOW)
 
     assert await snapshot_ids(conn) == {latest}
 
@@ -227,7 +241,7 @@ async def test_deleting_a_snapshot_removes_its_options(
     old = await snapshot_at(results, conn, watch, OLD, seat_label="A1")
     await snapshot_at(results, conn, watch, RECENT, seat_label="B2")
 
-    await service.run(conn, NOW)
+    await service.run(NOW)
 
     cursor = await conn.execute(
         "SELECT COUNT(*) AS n FROM result_options WHERE snapshot_id = ?", (str(old),)
@@ -249,7 +263,7 @@ async def test_deleting_a_snapshot_leaves_its_delivery_row_intact(
     delivery = await notifications.create_delivery(conn, "key-1", payload(watch, old), OLD)
     await notifications.mark_delivered(conn, delivery.delivery_id, (option().key,), None, OLD)
 
-    await service.run(conn, NOW)
+    await service.run(NOW)
 
     reloaded = await notifications.delivery(conn, delivery.delivery_id)
     assert reloaded is not None
@@ -275,7 +289,7 @@ async def test_check_runs_older_than_thirty_days_are_removed(
         conn, watch_id=watch.watch_id, trigger=CheckTrigger.SCHEDULED, started_at=OLD
     )
 
-    counts = await service.run(conn, NOW)
+    counts = await service.run(NOW)
 
     assert await check_run_count(conn) == 1
     assert counts.check_runs_deleted == 1
@@ -291,7 +305,7 @@ async def test_deleting_a_check_run_does_not_delete_its_snapshot(
     watch = await make_watch()
     latest = await snapshot_at(results, conn, watch, ANCIENT)
 
-    await service.run(conn, NOW)
+    await service.run(NOW)
 
     assert await snapshot_ids(conn) == {latest}
     assert await check_run_count(conn) == 0
@@ -313,7 +327,7 @@ async def test_drafts_older_than_a_day_are_removed(
     await drafts.upsert(conn, 11, "awaiting_url", {"step": "url"}, OLD)
     await drafts.upsert(conn, 22, "awaiting_url", {"step": "url"}, RECENT)
 
-    counts = await service.run(conn, NOW)
+    counts = await service.run(NOW)
 
     assert await drafts.get(conn, 11) is None
     assert await drafts.get(conn, 22) is not None
@@ -340,7 +354,7 @@ async def test_notified_option_keys_survive_retention(
         conn, delivery.delivery_id, tuple(item.key for item in options(2)), None, ANCIENT
     )
 
-    await service.run(conn, NOW)
+    await service.run(NOW)
 
     assert await notifications.known_keys(conn, watch.watch_id) == {
         item.key for item in options(2)
@@ -351,7 +365,7 @@ async def test_watches_survive_retention(
     service: RetentionService, conn: aiosqlite.Connection, make_watch: WatchFactory
 ) -> None:
     watch = await make_watch()
-    await service.run(conn, NOW)
+    await service.run(NOW)
     cursor = await conn.execute("SELECT COUNT(*) AS n FROM watches WHERE id = ?", (str(watch.watch_id),))
     assert (await cursor.fetchone())["n"] == 1
 
@@ -366,7 +380,7 @@ async def test_sent_deliveries_survive_retention(
     delivery = await notifications.create_delivery(conn, "key-1", payload(watch, None), ANCIENT)
     await notifications.mark_delivered(conn, delivery.delivery_id, (), None, ANCIENT)
 
-    await service.run(conn, NOW)
+    await service.run(NOW)
 
     assert await notifications.delivery(conn, delivery.delivery_id) is not None
 
@@ -379,30 +393,66 @@ async def test_sent_deliveries_survive_retention(
 async def test_a_run_with_nothing_to_delete_reports_zeroes(
     service: RetentionService, conn: aiosqlite.Connection
 ) -> None:
-    counts = await service.run(conn, NOW)
+    counts = await service.run(NOW)
     assert counts.snapshots_deleted == 0
     assert counts.check_runs_deleted == 0
     assert counts.drafts_deleted == 0
 
 
-async def test_a_failing_caller_transaction_rolls_the_whole_run_back(
+async def test_a_failure_part_way_through_a_sweep_rolls_the_whole_sweep_back(
+    results: ResultRepository,
+    tmp_path: Path,
+    conn: aiosqlite.Connection,
+    make_watch: WatchFactory,
+) -> None:
+    """The sweep is one unit even though nothing outside it holds a transaction.
+
+    Retention opens its own connection, so the only way to interrupt it half-way is to
+    hand it one that refuses a statement. A sweep that failed after its snapshot delete
+    and kept it would prune results the run it belongs to still points at.
+    """
+    watch = await make_watch()
+    old = await snapshot_at(results, conn, watch, OLD, seat_label="A1")
+    latest = await snapshot_at(results, conn, watch, RECENT, seat_label="B2")
+    service = RetentionService(FailingDatabase(tmp_path / "cinema.db", "DELETE FROM check_runs"))
+
+    with pytest.raises(aiosqlite.OperationalError):
+        await service.run(NOW)
+
+    assert await snapshot_ids(conn) == {old, latest}
+
+
+async def test_a_sweep_survives_an_unrelated_caller_transaction_rollback(
     service: RetentionService,
     results: ResultRepository,
     database: Database,
     conn: aiosqlite.Connection,
     make_watch: WatchFactory,
 ) -> None:
-    """Retention is one unit: a partial sweep would leave a watch with results missing."""
+    """Retention owns its own transaction, so an unrelated failure cannot resurrect rows.
+
+    The sweep is started while the caller's ``BEGIN IMMEDIATE`` is still open, so it can
+    only be waiting on SQLite's single writer lock rather than nesting as a savepoint
+    inside the caller's transaction. When the caller then fails, its own write is
+    discarded and the sweep still commits.
+    """
     watch = await make_watch()
-    old = await snapshot_at(results, conn, watch, OLD, seat_label="A1")
+    await snapshot_at(results, conn, watch, OLD, seat_label="A1")
     latest = await snapshot_at(results, conn, watch, RECENT, seat_label="B2")
+    drafts = DraftRepository()
 
     with pytest.raises(RuntimeError):
         async with database.transaction(conn):
-            await service.run(conn, NOW)
+            await drafts.upsert(conn, 11, "awaiting_url", {"step": "url"}, NOW)
+            sweep = asyncio.create_task(service.run(NOW))
+            await asyncio.sleep(0.05)
+            assert not sweep.done(), "the sweep joined the caller's transaction"
             raise RuntimeError("caller failed")
+    counts = await asyncio.wait_for(sweep, timeout=5)
 
-    assert await snapshot_ids(conn) == {old, latest}
+    assert counts.snapshots_deleted == 1
+    assert await snapshot_ids(conn) == {latest}
+    assert await drafts.get(conn, 11) is None
 
 
 async def test_retention_uses_the_supplied_instant_not_the_wall_clock(
@@ -415,7 +465,7 @@ async def test_retention_uses_the_supplied_instant_not_the_wall_clock(
     first = await snapshot_at(results, conn, watch, RECENT - timedelta(minutes=5), seat_label="A1")
     latest = await snapshot_at(results, conn, watch, RECENT, seat_label="B2")
 
-    await service.run(conn, datetime(2026, 1, 3, 12, 0, tzinfo=UTC))
+    await service.run(datetime(2026, 1, 3, 12, 0, tzinfo=UTC))
 
     assert await snapshot_ids(conn) == {latest}
     assert first not in await snapshot_ids(conn)
@@ -425,7 +475,7 @@ async def test_retention_requires_an_aware_instant(
     service: RetentionService, conn: aiosqlite.Connection
 ) -> None:
     with pytest.raises(ValueError):
-        await service.run(conn, datetime(2026, 1, 1, 12, 0))  # noqa: DTZ001
+        await service.run(datetime(2026, 1, 1, 12, 0))  # noqa: DTZ001
 
 
 async def test_encode_datetime_bounds_are_used_for_comparison(
@@ -444,6 +494,6 @@ async def test_encode_datetime_bounds_are_used_for_comparison(
     )
     assert (await cursor.fetchone())["checked_at"] == encode_datetime(boundary)
 
-    await service.run(conn, NOW)
+    await service.run(NOW)
 
     assert await snapshot_ids(conn) == {on_boundary, latest}

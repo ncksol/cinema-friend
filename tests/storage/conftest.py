@@ -100,14 +100,17 @@ def options(count: int, *, performance_id: str = "p1") -> tuple[RankedOption, ..
 
 
 @pytest.fixture
-def database(tmp_path: Path) -> Database:
-    return Database(tmp_path / "cinema.db")
+async def database(tmp_path: Path) -> Database:
+    """A migrated database, for repositories that open their own connections."""
+    instance = Database(tmp_path / "cinema.db")
+    async with instance.connection() as connection:
+        await instance.migrate(connection)
+    return instance
 
 
 @pytest.fixture
 async def conn(database: Database) -> AsyncIterator[aiosqlite.Connection]:
     connection = await database.connect()
-    await database.migrate(connection)
     try:
         yield connection
     finally:

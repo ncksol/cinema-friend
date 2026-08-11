@@ -94,6 +94,21 @@ class Database:
         return conn
 
     @asynccontextmanager
+    async def connection(self) -> AsyncIterator[aiosqlite.Connection]:
+        """Open a connection for the duration of the block and always close it.
+
+        This is the entry point for a component that owns its own database access rather
+        than joining a caller's unit of work: it cannot be handed a connection that is
+        already inside somebody else's transaction, so its writes can never be rolled
+        back by a failure that has nothing to do with them.
+        """
+        conn = await self.connect()
+        try:
+            yield conn
+        finally:
+            await conn.close()
+
+    @asynccontextmanager
     async def transaction(self, conn: aiosqlite.Connection) -> AsyncIterator[aiosqlite.Connection]:
         """Run a block atomically on ``conn``, nesting inside an enclosing transaction.
 

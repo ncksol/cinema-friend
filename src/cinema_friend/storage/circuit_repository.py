@@ -1,9 +1,18 @@
 """Persists one host circuit per host, with compare-and-swap for contested transitions.
 
-This is the concrete :class:`~cinema_friend.bfi.transport.HostCircuitStore`. Unlike the
-other repositories it owns the connection it was given rather than accepting one per
-call, because the transport holds it for the process lifetime and its writes are single
-statements that never need to join a caller's transaction.
+This is the concrete :class:`~cinema_friend.bfi.transport.HostCircuitStore`. It is built
+from a :class:`Database` and opens a connection of its own for every operation, rather
+than accepting one from a caller. That is a correctness requirement, not a style choice:
+the circuit is the signal that says *stop hitting this host*, and the code that trips it
+is a check that is about to fail. Sharing the caller's connection would put the circuit
+write inside the caller's transaction, and the caller's rollback would erase the stop
+signal along with its own half-finished work -- so the very next check would go straight
+back at a host that is actively rate-limiting. Owning the connection makes that
+impossible structurally, so no caller can reintroduce it by passing the wrong one.
+
+Because the writes here are single statements on their own connection, each commits on
+its own. Under contention SQLite's single writer means a circuit write waits for whoever
+holds the write lock, which the connection's ``busy_timeout`` covers.
 
 Two write paths exist and they are not interchangeable:
 
@@ -23,7 +32,7 @@ from datetime import datetime
 import aiosqlite
 
 from cinema_friend.domain.results import CircuitState, HostCircuit
-from cinema_friend.storage.database import decode_datetime, encode_datetime
+from cinema_friend.storage.database import Database, decode_datetime, encode_datetime
 
 _EPOCH = datetime.fromisoformat("1970-01-01T00:00:00+00:00")
 
@@ -52,10 +61,10 @@ def _columns(circuit: HostCircuit) -> tuple[str, int, int, str | None, str]:
 
 
 class SqliteCircuitStore:
-    """SQLite-backed host circuit storage."""
+    """SQLite-backed host circuit storage on connections it opens itself."""
 
-    def __init__(self, conn: aiosqlite.Connection) -> None:
-        self._conn = conn
+    def __init__(self, database: Database) -> None:
+        self._database = database
 
     async def load(self, host: str) -> HostCircuit:
         """Return the stored circuit, or a closed step-zero generation-zero default.
@@ -63,10 +72,9 @@ class SqliteCircuitStore:
         The default carries ``revision = 0``, which is how a caller's later
         compare-and-swap declares "I expect no row to exist yet".
         """
-        cursor = await self._conn.execute(
-            "SELECT * FROM host_circuits WHERE host = ?", (host,)
-        )
-        row = await cursor.fetchone()
+        async with self._database.connection() as conn:
+            cursor = await conn.execute("SELECT * FROM host_circuits WHERE host = ?", (host,))
+            row = await cursor.fetchone()
         if row is None:
             return HostCircuit(
                 host=host,
@@ -87,21 +95,22 @@ class SqliteCircuitStore:
         the generation itself would double-count each incident and disagree with the
         in-memory store the transport tests run against.
         """
-        await self._conn.execute(
-            """
-            INSERT INTO host_circuits
-                (host, state, step, generation, next_probe_at, updated_at, revision)
-            VALUES (?, ?, ?, ?, ?, ?, 1)
-            ON CONFLICT(host) DO UPDATE SET
-                state = excluded.state,
-                step = excluded.step,
-                generation = excluded.generation,
-                next_probe_at = excluded.next_probe_at,
-                updated_at = excluded.updated_at,
-                revision = host_circuits.revision + 1
-            """,
-            (circuit.host, *_columns(circuit)),
-        )
+        async with self._database.connection() as conn:
+            await conn.execute(
+                """
+                INSERT INTO host_circuits
+                    (host, state, step, generation, next_probe_at, updated_at, revision)
+                VALUES (?, ?, ?, ?, ?, ?, 1)
+                ON CONFLICT(host) DO UPDATE SET
+                    state = excluded.state,
+                    step = excluded.step,
+                    generation = excluded.generation,
+                    next_probe_at = excluded.next_probe_at,
+                    updated_at = excluded.updated_at,
+                    revision = host_circuits.revision + 1
+                """,
+                (circuit.host, *_columns(circuit)),
+            )
 
     async def compare_and_swap(self, circuit: HostCircuit) -> HostCircuit | None:
         """Store ``circuit`` only while its ``revision`` is still the stored one.
@@ -110,29 +119,30 @@ class SqliteCircuitStore:
         writer moved the row first. Both branches are a single statement, so the check and
         the write cannot be interleaved by another connection.
         """
-        if circuit.revision == 0:
-            cursor = await self._conn.execute(
-                """
-                INSERT INTO host_circuits
-                    (host, state, step, generation, next_probe_at, updated_at, revision)
-                VALUES (?, ?, ?, ?, ?, ?, 1)
-                ON CONFLICT(host) DO NOTHING
-                """,
-                (circuit.host, *_columns(circuit)),
-            )
-            return None if cursor.rowcount != 1 else _with_revision(circuit, 1)
+        async with self._database.connection() as conn:
+            if circuit.revision == 0:
+                cursor = await conn.execute(
+                    """
+                    INSERT INTO host_circuits
+                        (host, state, step, generation, next_probe_at, updated_at, revision)
+                    VALUES (?, ?, ?, ?, ?, ?, 1)
+                    ON CONFLICT(host) DO NOTHING
+                    """,
+                    (circuit.host, *_columns(circuit)),
+                )
+                return None if cursor.rowcount != 1 else _with_revision(circuit, 1)
 
-        next_revision = circuit.revision + 1
-        cursor = await self._conn.execute(
-            """
-            UPDATE host_circuits
-            SET state = ?, step = ?, generation = ?, next_probe_at = ?, updated_at = ?,
-                revision = ?
-            WHERE host = ? AND revision = ?
-            """,
-            (*_columns(circuit), next_revision, circuit.host, circuit.revision),
-        )
-        return None if cursor.rowcount != 1 else _with_revision(circuit, next_revision)
+            next_revision = circuit.revision + 1
+            cursor = await conn.execute(
+                """
+                UPDATE host_circuits
+                SET state = ?, step = ?, generation = ?, next_probe_at = ?, updated_at = ?,
+                    revision = ?
+                WHERE host = ? AND revision = ?
+                """,
+                (*_columns(circuit), next_revision, circuit.host, circuit.revision),
+            )
+            return None if cursor.rowcount != 1 else _with_revision(circuit, next_revision)
 
 
 def _with_revision(circuit: HostCircuit, revision: int) -> HostCircuit:

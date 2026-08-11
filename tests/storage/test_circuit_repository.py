@@ -3,9 +3,10 @@
 The circuit is the one row two independent processes race over: both may see an elapsed
 OPEN circuit and both may try to become the single permitted prober, and a writer from a
 resolved incident may replay its transition over a newer one. The transport's in-process
-locks cannot arbitrate either case, so these tests drive two stores on two separate
-connections -- the persistence-level stand-in for two processes -- and assert exactly one
-writer wins every contested transition.
+locks cannot arbitrate either case, so these tests drive two independent stores over one
+database -- the persistence-level stand-in for two processes, since each store opens its
+own connection per operation -- and assert exactly one writer wins every contested
+transition.
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ from cinema_friend.domain.errors import BfiChallengeError, CircuitOpenError
 from cinema_friend.domain.results import CircuitState, HostCircuit
 from cinema_friend.storage.circuit_repository import SqliteCircuitStore
 from cinema_friend.storage.database import Database
+from cinema_friend.storage.draft_repository import DraftRepository
 from tests.fakes import FakeClock, FakeSession, response
 
 HOST = "whatson.bfi.org.uk"
@@ -34,8 +36,8 @@ _DEFAULT_PROBE = NOW + timedelta(minutes=30)
 
 
 @pytest.fixture
-def store(conn: aiosqlite.Connection) -> SqliteCircuitStore:
-    return SqliteCircuitStore(conn)
+def store(database: Database) -> SqliteCircuitStore:
+    return SqliteCircuitStore(database)
 
 
 def circuit(
@@ -158,7 +160,7 @@ async def test_circuits_for_different_hosts_are_independent(
 
 
 async def test_a_row_written_before_the_fencing_migration_adopts_revision_one(
-    conn: aiosqlite.Connection,
+    conn: aiosqlite.Connection, store: SqliteCircuitStore
 ) -> None:
     """An upgraded deployment's existing circuit must be swappable, not stuck at zero.
 
@@ -172,7 +174,6 @@ async def test_a_row_written_before_the_fencing_migration_adopts_revision_one(
         """,
         (HOST, "2026-01-01T12:00:00.000000+00:00"),
     )
-    store = SqliteCircuitStore(conn)
     existing = await store.load(HOST)
     assert existing.revision == 1
     assert await store.compare_and_swap(circuit(revision=existing.revision)) is not None
@@ -248,43 +249,35 @@ async def test_a_stale_writer_cannot_overwrite_a_newer_generation(
 async def test_compare_and_swap_from_absent_loses_to_a_concurrent_creator(
     database: Database, store: SqliteCircuitStore
 ) -> None:
-    other_conn = await database.connect()
-    try:
-        other = SqliteCircuitStore(other_conn)
-        first_view = await store.load(HOST)
-        second_view = await other.load(HOST)
-        assert first_view.revision == second_view.revision == 0
+    other = SqliteCircuitStore(database)
+    first_view = await store.load(HOST)
+    second_view = await other.load(HOST)
+    assert first_view.revision == second_view.revision == 0
 
-        assert await store.compare_and_swap(circuit(generation=1, revision=0)) is not None
-        assert await other.compare_and_swap(circuit(generation=9, revision=0)) is None
-        assert (await store.load(HOST)).generation == 1
-    finally:
-        await other_conn.close()
+    assert await store.compare_and_swap(circuit(generation=1, revision=0)) is not None
+    assert await other.compare_and_swap(circuit(generation=9, revision=0)) is None
+    assert (await store.load(HOST)).generation == 1
 
 
-async def test_two_connections_claiming_one_probe_produce_a_single_winner(
+async def test_two_independent_stores_claiming_one_probe_produce_a_single_winner(
     database: Database, store: SqliteCircuitStore
 ) -> None:
     await store.save(circuit(state=CircuitState.OPEN, backoff_step=1, generation=2))
-    other_conn = await database.connect()
-    try:
-        other = SqliteCircuitStore(other_conn)
-        first_view = await store.load(HOST)
-        second_view = await other.load(HOST)
+    other = SqliteCircuitStore(database)
+    first_view = await store.load(HOST)
+    second_view = await other.load(HOST)
 
-        claim = circuit(state=CircuitState.HALF_OPEN, updated_at=NOW + timedelta(seconds=1))
-        outcomes = [
-            await store.compare_and_swap(with_revision(claim, first_view.revision)),
-            await other.compare_and_swap(with_revision(claim, second_view.revision)),
-        ]
-        assert [item is not None for item in outcomes] == [True, False]
-        assert (await other.load(HOST)).state is CircuitState.HALF_OPEN
-    finally:
-        await other_conn.close()
+    claim = circuit(state=CircuitState.HALF_OPEN, updated_at=NOW + timedelta(seconds=1))
+    outcomes = [
+        await store.compare_and_swap(with_revision(claim, first_view.revision)),
+        await other.compare_and_swap(with_revision(claim, second_view.revision)),
+    ]
+    assert [item is not None for item in outcomes] == [True, False]
+    assert (await other.load(HOST)).state is CircuitState.HALF_OPEN
 
 
 # ---------------------------------------------------------------------------
-# Transport integration across two connections (two-process stand-in)
+# Transport integration across independent stores (two-process stand-in)
 # ---------------------------------------------------------------------------
 
 
@@ -316,134 +309,149 @@ class RendezvousStore:
 
 
 async def test_two_transports_sharing_a_database_run_exactly_one_probe(
-    database: Database, conn: aiosqlite.Connection
+    database: Database, store: SqliteCircuitStore
 ) -> None:
-    """Two transports, two connections, one elapsed circuit: one probe, one rejection."""
+    """Two transports, two stores, one elapsed circuit: one probe, one rejection."""
     clock = FakeClock(NOW)
-    seed = SqliteCircuitStore(conn)
-    await seed.save(elapsed_open(clock))
+    await store.save(elapsed_open(clock))
 
-    connections = [await database.connect(), await database.connect()]
-    try:
-        barrier = asyncio.Barrier(2)
-        sessions = [FakeSession([response(200, ARTICLE)]) for _ in connections]
-        stores: list[HostCircuitStore] = [
-            RendezvousStore(SqliteCircuitStore(connection), barrier)
-            for connection in connections
-        ]
-        transports = [
-            BfiTransport(settings(), store, clock, session=session, jitter_source=lambda: 0.0)
-            for store, session in zip(stores, sessions, strict=True)
-        ]
-        outcomes = await asyncio.gather(
-            transports[0].get(FILM_URL, DocumentKind.ARTICLE),
-            transports[1].get(SEAT_MAP_URL, DocumentKind.SEAT_MAP),
-            return_exceptions=True,
-        )
+    barrier = asyncio.Barrier(2)
+    sessions = [FakeSession([response(200, ARTICLE)]) for _ in range(2)]
+    stores: list[HostCircuitStore] = [
+        RendezvousStore(SqliteCircuitStore(database), barrier) for _ in range(2)
+    ]
+    transports = [
+        BfiTransport(settings(), racer, clock, session=session, jitter_source=lambda: 0.0)
+        for racer, session in zip(stores, sessions, strict=True)
+    ]
+    outcomes = await asyncio.gather(
+        transports[0].get(FILM_URL, DocumentKind.ARTICLE),
+        transports[1].get(SEAT_MAP_URL, DocumentKind.SEAT_MAP),
+        return_exceptions=True,
+    )
 
-        assert sorted(type(item).__name__ for item in outcomes) == [
-            "CircuitOpenError",
-            "FetchedDocument",
-        ]
-        assert sum(len(session.calls) for session in sessions) == 1
-        final = await seed.load(HOST)
-        assert final.state is CircuitState.CLOSED
-        assert final.generation == 1
-    finally:
-        for connection in connections:
-            await connection.close()
+    assert sorted(type(item).__name__ for item in outcomes) == [
+        "CircuitOpenError",
+        "FetchedDocument",
+    ]
+    assert sum(len(session.calls) for session in sessions) == 1
+    final = await store.load(HOST)
+    assert final.state is CircuitState.CLOSED
+    assert final.generation == 1
 
 
 async def test_a_superseded_prober_cannot_close_a_circuit_another_process_reopened(
-    database: Database, conn: aiosqlite.Connection
+    database: Database, store: SqliteCircuitStore
 ) -> None:
     """A slow prober's success must not erase a newer incident recorded elsewhere."""
     clock = FakeClock(NOW)
-    seed = SqliteCircuitStore(conn)
-    await seed.save(elapsed_open(clock))
+    await store.save(elapsed_open(clock))
 
-    prober_conn = await database.connect()
-    try:
-        prober = BfiTransport(
-            settings(),
-            SqliteCircuitStore(prober_conn),
-            clock,
-            session=FakeSession([response(200, ARTICLE)]),
-            jitter_source=lambda: 0.0,
+    prober = BfiTransport(
+        settings(),
+        SqliteCircuitStore(database),
+        clock,
+        session=FakeSession([response(200, ARTICLE)]),
+        jitter_source=lambda: 0.0,
+    )
+    claimed = await prober._begin_circuit_check(HOST)
+    assert claimed.probing
+
+    # Another process treats the claim as abandoned and records a new incident,
+    # advancing the persisted revision past the prober's claim.
+    superseding = await store.load(HOST)
+    assert await store.compare_and_swap(
+        HostCircuit(
+            host=HOST,
+            state=CircuitState.OPEN,
+            backoff_step=1,
+            generation=2,
+            next_probe=clock.now() + timedelta(minutes=30),
+            updated_at=clock.now(),
+            revision=superseding.revision,
         )
-        claimed = await prober._begin_circuit_check(HOST)
-        assert claimed.probing
+    )
 
-        # Another process treats the claim as abandoned and records a new incident,
-        # advancing the persisted revision past the prober's claim.
-        superseding = await seed.load(HOST)
-        assert await seed.compare_and_swap(
-            HostCircuit(
-                host=HOST,
-                state=CircuitState.OPEN,
-                backoff_step=1,
-                generation=2,
-                next_probe=clock.now() + timedelta(minutes=30),
-                updated_at=clock.now(),
-                revision=superseding.revision,
-            )
-        )
+    await prober._close_circuit(HOST, claimed)
 
-        await prober._close_circuit(HOST, claimed)
-
-        current = await seed.load(HOST)
-        assert current.state is CircuitState.OPEN
-        assert current.generation == 2
-        assert current.backoff_step == 1
-    finally:
-        await prober_conn.close()
+    current = await store.load(HOST)
+    assert current.state is CircuitState.OPEN
+    assert current.generation == 2
+    assert current.backoff_step == 1
 
 
 async def test_a_superseded_prober_cannot_advance_a_newer_incident(
-    database: Database, conn: aiosqlite.Connection
+    database: Database, store: SqliteCircuitStore
 ) -> None:
     """The failure-path mirror: a stale probe failure must not advance the newer backoff."""
     clock = FakeClock(NOW)
-    seed = SqliteCircuitStore(conn)
-    await seed.save(elapsed_open(clock))
+    await store.save(elapsed_open(clock))
 
-    prober_conn = await database.connect()
-    try:
-        prober = BfiTransport(
-            settings(),
-            SqliteCircuitStore(prober_conn),
-            clock,
-            session=FakeSession([]),
-            jitter_source=lambda: 0.0,
+    prober = BfiTransport(
+        settings(),
+        SqliteCircuitStore(database),
+        clock,
+        session=FakeSession([]),
+        jitter_source=lambda: 0.0,
+    )
+    claimed = await prober._begin_circuit_check(HOST)
+    superseding = await store.load(HOST)
+    assert await store.compare_and_swap(
+        HostCircuit(
+            host=HOST,
+            state=CircuitState.OPEN,
+            backoff_step=3,
+            generation=2,
+            next_probe=clock.now() + timedelta(hours=2),
+            updated_at=clock.now(),
+            revision=superseding.revision,
         )
-        claimed = await prober._begin_circuit_check(HOST)
-        superseding = await seed.load(HOST)
-        assert await seed.compare_and_swap(
-            HostCircuit(
-                host=HOST,
-                state=CircuitState.OPEN,
-                backoff_step=3,
-                generation=2,
-                next_probe=clock.now() + timedelta(hours=2),
-                updated_at=clock.now(),
-                revision=superseding.revision,
-            )
-        )
+    )
 
-        await prober._advance_circuit_after_challenge(HOST, claimed)
+    await prober._advance_circuit_after_challenge(HOST, claimed)
 
-        current = await seed.load(HOST)
-        assert current.generation == 2
-        assert current.backoff_step == 3
-    finally:
-        await prober_conn.close()
+    current = await store.load(HOST)
+    assert current.generation == 2
+    assert current.backoff_step == 3
+
+
+async def test_a_circuit_write_survives_an_unrelated_transaction_rollback(
+    database: Database, conn: aiosqlite.Connection
+) -> None:
+    """The circuit is an independent stop signal and must not ride a caller's rollback.
+
+    A check that meets a challenge trips the circuit and then fails, and a failing check
+    rolls its own transaction back. If the circuit write had joined that transaction it
+    would be discarded with it, the ``OPEN`` state would never reach the database, and
+    the next check would go straight back at a host that is actively rate-limiting.
+
+    The write is issued while the caller's ``BEGIN IMMEDIATE`` is still open, so it can
+    only be waiting on SQLite's single writer lock -- which is the proof that it is on a
+    connection of its own rather than joining the caller's transaction.
+    """
+    store = SqliteCircuitStore(database)
+    drafts = DraftRepository()
+    await store.load(HOST)
+
+    with pytest.raises(RuntimeError):
+        async with database.transaction(conn):
+            await drafts.upsert(conn, 11, "awaiting_url", {"step": "url"}, NOW)
+            write = asyncio.create_task(store.save(circuit()))
+            await asyncio.sleep(0.05)
+            assert not write.done(), "the circuit write joined the caller's transaction"
+            raise RuntimeError("the check failed after tripping the circuit")
+    await asyncio.wait_for(write, timeout=5)
+
+    assert await drafts.get(conn, 11) is None
+    observed = await SqliteCircuitStore(database).load(HOST)
+    assert observed.state is CircuitState.OPEN
+    assert observed.revision == 1
 
 
 async def test_open_circuit_still_blocks_when_read_from_sqlite(
-    conn: aiosqlite.Connection,
+    store: SqliteCircuitStore,
 ) -> None:
     clock = FakeClock(NOW)
-    store = SqliteCircuitStore(conn)
     await store.save(
         HostCircuit(
             host=HOST,
@@ -462,26 +470,22 @@ async def test_open_circuit_still_blocks_when_read_from_sqlite(
 
 
 async def test_a_challenge_trips_the_persisted_circuit_for_every_process(
-    database: Database, conn: aiosqlite.Connection
+    database: Database, store: SqliteCircuitStore
 ) -> None:
-    """The trip must be visible to another connection, not just to the transport that saw it."""
+    """The trip must be visible to another store, not just to the transport that saw it."""
     clock = FakeClock(NOW)
-    other_conn = await database.connect()
-    try:
-        transport = BfiTransport(
-            settings(),
-            SqliteCircuitStore(other_conn),
-            clock,
-            session=FakeSession([response(403, "", headers={"cf-mitigated": "challenge"})]),
-            jitter_source=lambda: 0.0,
-        )
-        with pytest.raises(BfiChallengeError):
-            await transport.get(FILM_URL, DocumentKind.ARTICLE)
+    transport = BfiTransport(
+        settings(),
+        SqliteCircuitStore(database),
+        clock,
+        session=FakeSession([response(403, "", headers={"cf-mitigated": "challenge"})]),
+        jitter_source=lambda: 0.0,
+    )
+    with pytest.raises(BfiChallengeError):
+        await transport.get(FILM_URL, DocumentKind.ARTICLE)
 
-        observer = await SqliteCircuitStore(conn).load(HOST)
-        assert observer.state is CircuitState.OPEN
-        assert observer.generation == 1
-        assert observer.backoff_step == 0
-        assert observer.next_probe == NOW + timedelta(minutes=15)
-    finally:
-        await other_conn.close()
+    observer = await store.load(HOST)
+    assert observer.state is CircuitState.OPEN
+    assert observer.generation == 1
+    assert observer.backoff_step == 0
+    assert observer.next_probe == NOW + timedelta(minutes=15)
