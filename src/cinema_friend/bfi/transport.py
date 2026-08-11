@@ -6,7 +6,7 @@ import asyncio
 import random
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from enum import Enum
 from typing import Protocol, cast
 from urllib.parse import urljoin, urlsplit
@@ -50,6 +50,17 @@ _SERVER_ERROR_DELAYS: tuple[float, ...] = (1.0, 3.0)
 _FORBIDDEN_DELAYS: tuple[float, ...] = (2.0, 4.0, 6.0)
 
 _MAX_REDIRECT_HOPS = 5
+
+# How long a persisted HALF_OPEN record is trusted as "someone is actively
+# probing" before it is treated as abandoned (the process that claimed it
+# died mid-probe) and made reclaimable again. Must comfortably exceed the
+# worst-case bounded in-flight duration of a single probe: up to
+# _MAX_REDIRECT_HOPS + 1 hops, each bounded by the slower retry ladder
+# (2 + 4 + 6 = 12s for unmarked 403s), i.e. 6 * 12 = 72s worst case. 120s
+# leaves comfortable margin while staying far shorter than the shortest
+# circuit re-probe step (15 minutes), so a crashed prober is reclaimed long
+# before the next scheduled probe would occur anyway.
+_PROBE_LEASE_SECONDS = 120.0
 
 
 class DocumentKind(Enum):
@@ -152,11 +163,19 @@ class BfiTransport:
       ``settings.bfi_min_spacing_seconds``); the outbound call itself runs
       outside the lock so two permitted requests can overlap in flight.
     - ``_probe_lock`` serializes the transition that claims the single
-      permitted probe of an elapsed-but-still-open circuit. It is held only
-      long enough to read-check-write the circuit state (never for the
-      duration of the outbound probe request), so a rejected concurrent
-      caller fails fast with :class:`CircuitOpenError` instead of queueing to
-      become a second prober.
+      permitted probe of an elapsed-but-still-open circuit, or of a stale
+      (lease-expired) ``HALF_OPEN`` record left behind by a process that
+      died mid-probe. It is held only long enough to read-check-write the
+      circuit state (never for the duration of the outbound probe request),
+      so a rejected concurrent caller fails fast with
+      :class:`CircuitOpenError` instead of queueing to become a second
+      prober.
+    - ``_advance_lock`` serializes the read-modify-write that records a
+      challenge against the circuit, so two requests racing against the
+      same ``CLOSED`` circuit generation coalesce onto exactly one fresh
+      ``OPEN`` transition instead of the second one mistaking the first's
+      own transition for a later, separate incident and double-advancing
+      the backoff step.
     """
 
     def __init__(
@@ -178,6 +197,7 @@ class BfiTransport:
         self._semaphore = asyncio.Semaphore(settings.bfi_max_concurrency)
         self._spacing_lock = asyncio.Lock()
         self._probe_lock = asyncio.Lock()
+        self._advance_lock = asyncio.Lock()
         self._min_spacing = settings.bfi_min_spacing_seconds
         self._last_start_monotonic: float | None = None
         self._jitter: Callable[[], float] = jitter_source or (lambda: random.uniform(0.0, 0.2))
@@ -187,15 +207,19 @@ class BfiTransport:
 
     async def get(self, url: str, kind: DocumentKind) -> FetchedDocument:
         host = _hostname(url)
-        probing = await self._begin_circuit_check(host)
+        probing, observed_generation = await self._begin_circuit_check(host)
         try:
             document = await self._fetch_following_redirects(url, kind)
         except BfiChallengeError:
-            await self._advance_circuit_after_challenge(host)
+            await self._advance_circuit_after_challenge(
+                host, probing=probing, observed_generation=observed_generation
+            )
             raise
         except BaseException:
             if probing:
-                await self._advance_circuit_after_challenge(host)
+                await self._advance_circuit_after_challenge(
+                    host, probing=probing, observed_generation=observed_generation
+                )
             raise
         else:
             if probing:
@@ -204,26 +228,49 @@ class BfiTransport:
 
     # -- circuit breaker -----------------------------------------------
 
-    async def _begin_circuit_check(self, host: str) -> bool:
-        """Enforce the persisted circuit; return True if this call claimed the probe slot."""
+    async def _begin_circuit_check(self, host: str) -> tuple[bool, int]:
+        """Enforce the persisted circuit.
+
+        Returns ``(claimed_probe, observed_generation)``: ``claimed_probe``
+        is True if this call claimed the (possibly reclaimed) probe slot;
+        ``observed_generation`` is the circuit generation this call saw
+        while making that decision, threaded through to
+        :meth:`_advance_circuit_after_challenge` so it can recognise a
+        challenge as part of the same incident another concurrent caller
+        already recorded.
+        """
         circuit = await self.circuit_store.load(host)
         if circuit.state is CircuitState.CLOSED:
-            return False
-        if circuit.state is CircuitState.HALF_OPEN:
-            raise CircuitOpenError(f"circuit for {host} is already being probed")
+            return False, circuit.generation
         now = self._clock.now()
+        if circuit.state is CircuitState.HALF_OPEN:
+            if (now - circuit.updated_at).total_seconds() < _PROBE_LEASE_SECONDS:
+                raise CircuitOpenError(f"circuit for {host} is already being probed")
+            # The persisted HALF_OPEN lease has expired without ever being
+            # resolved to CLOSED or OPEN -- the process that claimed it most
+            # likely died mid-probe. Reclaim it exactly like an elapsed OPEN
+            # circuit rather than leaving the host permanently blocked.
+            return await self._claim_probe(host, now)
         if circuit.next_probe is None or now < circuit.next_probe:
             raise CircuitOpenError(f"circuit for {host} is open until {circuit.next_probe}")
+        return await self._claim_probe(host, now)
+
+    async def _claim_probe(self, host: str, now: datetime) -> tuple[bool, int]:
         async with self._probe_lock:
             # Re-read after acquiring the lock: another caller may have
             # already claimed the probe (or the window may have moved) while
             # we were waiting.
             circuit = await self.circuit_store.load(host)
-            if (
-                circuit.state is not CircuitState.OPEN
-                or circuit.next_probe is None
-                or now < circuit.next_probe
-            ):
+            elapsed_open = (
+                circuit.state is CircuitState.OPEN
+                and circuit.next_probe is not None
+                and now >= circuit.next_probe
+            )
+            stale_half_open = (
+                circuit.state is CircuitState.HALF_OPEN
+                and (now - circuit.updated_at).total_seconds() >= _PROBE_LEASE_SECONDS
+            )
+            if not (elapsed_open or stale_half_open):
                 raise CircuitOpenError(f"circuit for {host} is open")
             await self.circuit_store.save(
                 HostCircuit(
@@ -235,27 +282,37 @@ class BfiTransport:
                     updated_at=now,
                 )
             )
-            return True
+            return True, circuit.generation
 
-    async def _advance_circuit_after_challenge(self, host: str) -> None:
-        circuit = await self.circuit_store.load(host)
-        now = self._clock.now()
-        if circuit.state is CircuitState.CLOSED:
-            backoff_step = 0
-            generation = circuit.generation + 1
-        else:
-            backoff_step = min(circuit.backoff_step + 1, len(_CIRCUIT_DELAYS) - 1)
-            generation = circuit.generation
-        await self.circuit_store.save(
-            HostCircuit(
-                host=host,
-                state=CircuitState.OPEN,
-                backoff_step=backoff_step,
-                generation=generation,
-                next_probe=now + _CIRCUIT_DELAYS[backoff_step],
-                updated_at=now,
+    async def _advance_circuit_after_challenge(
+        self, host: str, *, probing: bool, observed_generation: int
+    ) -> None:
+        async with self._advance_lock:
+            circuit = await self.circuit_store.load(host)
+            now = self._clock.now()
+            if not probing and circuit.state is CircuitState.CLOSED:
+                # Fresh trip: the first challenge to observe CLOSED wins.
+                backoff_step = 0
+                generation = circuit.generation + 1
+            elif not probing and circuit.generation == observed_generation + 1:
+                # A concurrent sibling request observed the same CLOSED
+                # generation we did and has already recorded the fresh
+                # OPEN transition for this incident. Don't double-advance
+                # the backoff step for a second signal from the same trip.
+                return
+            else:
+                backoff_step = min(circuit.backoff_step + 1, len(_CIRCUIT_DELAYS) - 1)
+                generation = circuit.generation
+            await self.circuit_store.save(
+                HostCircuit(
+                    host=host,
+                    state=CircuitState.OPEN,
+                    backoff_step=backoff_step,
+                    generation=generation,
+                    next_probe=now + _CIRCUIT_DELAYS[backoff_step],
+                    updated_at=now,
+                )
             )
-        )
 
     async def _close_circuit(self, host: str) -> None:
         circuit = await self.circuit_store.load(host)
@@ -283,7 +340,16 @@ class BfiTransport:
             location = _header(response.headers, "location")
             if not location:
                 raise BfiNetworkError(f"redirect from {current_url} is missing a Location header")
-            current_url = validate_redirect_target(urljoin(current_url, location))
+            target = urljoin(current_url, location)
+            # validate_redirect_target() is a strict gate (Task 2, article
+            # routes only) -- it raises on a disallowed target but its
+            # return value is a rewritten canonical URL, not the requested
+            # one. Discard that return value and request the actual
+            # validated absolute Location instead, so redirect query state
+            # (e.g. a continuation token) survives and a chain of distinct
+            # default.asp targets doesn't collapse onto one repeated URL.
+            validate_redirect_target(target)
+            current_url = target
         raise BfiNetworkError(f"too many redirects starting from {url}")
 
     # -- single hop with bounded retries -----------------------------------

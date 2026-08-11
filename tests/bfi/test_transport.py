@@ -8,11 +8,16 @@ from pathlib import Path
 
 import pytest
 
-from cinema_friend.bfi.transport import BfiTransport, DocumentKind, FetchedDocument
-from cinema_friend.bfi.urls import film_page_url, seat_map_url
+from cinema_friend.bfi.transport import (
+    _PROBE_LEASE_SECONDS,
+    BfiTransport,
+    DocumentKind,
+    FetchedDocument,
+)
+from cinema_friend.bfi.urls import PERMALINK_PARAM, film_page_url, seat_map_url
 from cinema_friend.config import Settings
 from cinema_friend.domain.errors import BfiChallengeError, BfiNetworkError, CircuitOpenError
-from cinema_friend.domain.results import CircuitState
+from cinema_friend.domain.results import CircuitState, HostCircuit
 from tests.fakes import (
     FakeClock,
     FakeNetworkError,
@@ -260,6 +265,121 @@ async def test_probe_failure_does_not_leave_circuit_stuck_half_open():
     assert circuit.backoff_step == 1
 
 
+async def test_fresh_half_open_rejects_concurrent_claim_within_lease():
+    """A HALF_OPEN record younger than the probe lease still excludes competitors.
+
+    This is the same-process case a live prober relies on: the persisted
+    state alone (no additional in-memory flag) is enough to reject a second
+    caller as long as the lease hasn't expired.
+    """
+    clock = FakeClock(datetime(2026, 1, 1, tzinfo=UTC))
+    store = MemoryCircuitStore(
+        HostCircuit(
+            host=BFI_HOST,
+            state=CircuitState.HALF_OPEN,
+            backoff_step=1,
+            generation=2,
+            next_probe=clock.now() + timedelta(minutes=30),
+            updated_at=clock.now(),
+        )
+    )
+    session = FakeSession([])
+    transport = make_transport(session=session, circuit_store=store, clock=clock)
+    with pytest.raises(CircuitOpenError):
+        await transport.get(FILM_URL, DocumentKind.ARTICLE)
+    assert len(session.calls) == 0
+
+
+async def test_stale_half_open_is_reclaimed_after_simulated_process_restart():
+    """A HALF_OPEN record whose lease has expired is claimable again.
+
+    Simulates the process that saved HALF_OPEN dying mid-probe: nothing in
+    that process's memory (a lock, a task) survives, only the persisted
+    record. A brand-new BfiTransport instance -- standing in for a fresh
+    process reading the same store -- must be able to reclaim the stale
+    lease and complete a probe, rather than leaving the host permanently
+    blocked.
+    """
+    clock = FakeClock(datetime(2026, 1, 1, tzinfo=UTC))
+    stale_updated_at = clock.now() - timedelta(seconds=_PROBE_LEASE_SECONDS + 1)
+    store = MemoryCircuitStore(
+        HostCircuit(
+            host=BFI_HOST,
+            state=CircuitState.HALF_OPEN,
+            backoff_step=2,
+            generation=3,
+            next_probe=clock.now() + timedelta(hours=1),
+            updated_at=stale_updated_at,
+        )
+    )
+    session = FakeSession([response(200, ARTICLE)])
+    transport = make_transport(session=session, circuit_store=store, clock=clock)
+    document = await transport.get(FILM_URL, DocumentKind.ARTICLE)
+    assert document.status_code == 200
+    circuit = await store.load(BFI_HOST)
+    assert circuit.state is CircuitState.CLOSED
+    assert circuit.backoff_step == 0
+    assert circuit.generation == 3
+
+
+async def test_only_one_caller_reclaims_a_stale_half_open():
+    clock = FakeClock(datetime(2026, 1, 1, tzinfo=UTC))
+    stale_updated_at = clock.now() - timedelta(seconds=_PROBE_LEASE_SECONDS + 1)
+    store = MemoryCircuitStore(
+        HostCircuit(
+            host=BFI_HOST,
+            state=CircuitState.HALF_OPEN,
+            backoff_step=2,
+            generation=3,
+            next_probe=clock.now() + timedelta(hours=1),
+            updated_at=stale_updated_at,
+        )
+    )
+    session = FakeSession([response(200, ARTICLE)])
+    transport = make_transport(session=session, circuit_store=store, clock=clock)
+
+    results = await asyncio.gather(
+        transport.get(FILM_URL, DocumentKind.ARTICLE),
+        transport.get(SEAT_MAP_URL, DocumentKind.SEAT_MAP),
+        return_exceptions=True,
+    )
+    outcomes = sorted(type(item).__name__ for item in results)
+    assert outcomes == ["CircuitOpenError", "FetchedDocument"]
+    assert len(session.calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# Concurrent challenge advancement (incident-aware, atomic)
+# ---------------------------------------------------------------------------
+
+
+async def test_two_concurrent_challenges_from_closed_produce_one_fresh_open_transition():
+    """Two requests racing against a CLOSED circuit must coalesce onto one trip.
+
+    Both calls observe CLOSED at the same generation and both get
+    challenged. The circuit must end up OPEN at backoff_step == 0 with
+    generation + 1 -- the fresh-trip state -- not backoff_step == 1, which
+    would mean the second challenge treated the first one's own transition
+    as a second, later incident and skipped the first backoff rung.
+    """
+    clock = FakeClock(datetime(2026, 1, 1, tzinfo=UTC))
+    session = FakeSession([response(429), response(429)])
+    transport = make_transport(session=session, clock=clock)
+
+    results = await asyncio.gather(
+        transport.get(FILM_URL, DocumentKind.ARTICLE),
+        transport.get(SEAT_MAP_URL, DocumentKind.SEAT_MAP),
+        return_exceptions=True,
+    )
+    assert all(isinstance(item, BfiChallengeError) for item in results)
+    assert len(session.calls) == 2
+    circuit = await transport.circuit_store.load(BFI_HOST)
+    assert circuit.state is CircuitState.OPEN
+    assert circuit.generation == 1
+    assert circuit.backoff_step == 0
+    assert circuit.next_probe == clock.now() + timedelta(minutes=15)
+
+
 # ---------------------------------------------------------------------------
 # Redirects
 # ---------------------------------------------------------------------------
@@ -275,8 +395,35 @@ async def test_follows_valid_redirect_to_article_target():
     )
     document = await make_transport(session=session).get(FILM_URL, DocumentKind.ARTICLE)
     assert document.status_code == 200
-    assert document.url == FILM_URL
-    assert session.calls == [FILM_URL, FILM_URL]
+    # The transport must request the actual validated Location, not whatever
+    # canonical URL validate_redirect_target() happens to compute for it.
+    assert document.url == redirected_to
+    assert session.calls == [FILM_URL, redirected_to]
+
+
+async def test_redirect_requests_validated_location_not_canonical_url():
+    """validate_redirect_target() is a gate, not a URL rewrite.
+
+    A redirect back onto default.asp that carries query state beyond the
+    permalink (e.g. a continuation token) must be requested exactly as
+    given -- not collapsed to film_page_url()'s bare canonical form, which
+    would both discard that state and risk looping the same default.asp
+    request on every hop.
+    """
+    redirected_to = (
+        "https://whatson.bfi.org.uk/imax/Online/default.asp?"
+        f"{PERMALINK_PARAM}=dog-stars&continuationToken=abc123"
+    )
+    session = FakeSession(
+        [
+            response(302, headers={"location": redirected_to}),
+            response(200, ARTICLE),
+        ]
+    )
+    document = await make_transport(session=session).get(FILM_URL, DocumentKind.ARTICLE)
+    assert document.status_code == 200
+    assert document.url == redirected_to
+    assert session.calls == [FILM_URL, redirected_to]
 
 
 async def test_redirect_to_disallowed_target_is_rejected():
