@@ -111,7 +111,7 @@ A watch contains:
 - State: `active`, `paused`, `backoff`, `completed`, `expired`, or `failed`.
 - Next due time, last check time, and host backoff metadata.
 
-Dates and times are interpreted with `zoneinfo.ZoneInfo("Europe/London")` and stored as UTC instants where an instant is required. A daily time window whose start is later than its end wraps across midnight. The performance's London calendar date must still fall inside the selected date range. A preferred date and time must fall within the selected range.
+Dates and times are interpreted with `zoneinfo.ZoneInfo("Europe/London")` and stored as UTC instants where an instant is required. A daily time window whose start is later than its end wraps across midnight. The performance's London calendar date must still fall inside the selected date range. A preferred date and time must satisfy both the date predicate and the daily time predicate.
 
 ### Performance
 
@@ -163,10 +163,12 @@ SQLite uses foreign keys and WAL mode. The schema contains:
 - `result_options`: every ranked option belonging to a snapshot.
 - `notified_options`: option keys already surfaced for a watch.
 - `notification_state`: last notified best-ranking tuple and degradation/recovery flags.
+- `notification_deliveries`: pending, delivered, or failed Telegram deliveries keyed for idempotent retry.
+- `host_circuits`: persisted Cloudflare/rate-limit circuit state and next probe time.
 
-Latest results remain available after restart. Result snapshots older than 24 hours are removed, except for the newest snapshot of each watch. Check-run summaries are retained for 30 days. Notification keys remain for the watch lifetime. Deleting a watch cascades to its drafts, results, checks, and notification state.
+Latest results remain available after restart. Result snapshots older than 24 hours are removed, except for the newest snapshot of each watch. Check-run summaries are retained for 30 days. Notification keys remain for the watch lifetime. Deleting a watch cascades to its results, checks, and notification state. A conversation draft belongs to a user rather than a watch and is removed by `/cancel`, confirmation, or a 24-hour expiry job.
 
-Writes for a successful check use one transaction: insert the check result and complete snapshot, update the watch schedule, decide notification state, and commit. Telegram delivery occurs after commit. A delivery failure leaves a retryable notification record rather than pretending the notification succeeded.
+Writes for a successful check use one transaction: insert the check result and complete snapshot, update the watch schedule, decide whether a notification is due, create its pending delivery record, and commit. Telegram delivery occurs after commit. A second transaction marks the delivery and its option keys as surfaced. A delivery failure leaves the pending record retryable rather than pretending the notification succeeded.
 
 ## Telegram Interaction
 
@@ -232,10 +234,10 @@ The gateway accepts only:
 
 - Scheme `https`.
 - Exact host `whatson.bfi.org.uk`.
-- BFI IMAX paths under `/imax/`.
-- Film/article routes whose query or path identifies a BFI content article.
+- `/imax/Online/default.asp` with exactly one non-empty `BOparam::WScontent::loadArticle::permalink` value, apart from known inert tracking parameters.
+- `/imax/Online/article/<slug>` with one non-empty path segment after `article`.
 
-User information, fragments, non-default ports, alternate hosts, redirects to alternate hosts, and arbitrary paths are rejected. Redirects are followed only when every hop remains on the exact allowed host and under `/imax/`.
+User information, fragments, non-default ports, duplicate permalink values, alternate hosts, redirects to alternate hosts, and arbitrary paths are rejected. Redirects are followed only when every hop remains on the exact allowed host and resolves to one of the accepted route shapes.
 
 ### Film Discovery
 
@@ -261,7 +263,7 @@ For each candidate performance:
 5. Exclude wheelchair spaces, companion seats, and other restricted access seats identified by seat messages or metadata.
 6. Parse category/price-zone labels for display without using them in rank.
 
-The gateway allows at most two in-flight BFI requests and starts requests at least one second apart. Identical film or performance requests share one in-flight operation. A completed response may be reused only within 60 seconds, preventing concurrent watches from creating duplicate load without presenting materially stale availability.
+The gateway allows at most two in-flight BFI requests and starts requests at least one second apart. Requests use a 10-second connection timeout and a 30-second total timeout. Identical film or performance requests share one in-flight operation. A completed response may be reused only within 60 seconds, preventing concurrent watches from creating duplicate load without presenting materially stale availability.
 
 ### Adjacency
 
@@ -271,7 +273,7 @@ Seats form a contiguous run only when they:
 - Have consecutive displayed numeric seat numbers.
 - Have an SVG horizontal gap no greater than 1.75 times that row's median normal adjacent-seat gap.
 
-The geometric rule prevents consecutive numbers on opposite sides of an aisle from being treated as adjacent. Non-numeric or structurally ambiguous seat labels are excluded and recorded as a parser-contract warning.
+The row median is calculated from absolute horizontal gaps between numerically consecutive physical seats; aisle outliers therefore do not define normal spacing. The geometric rule prevents consecutive numbers on opposite sides of an aisle from being treated as adjacent. A row with fewer than three usable gaps, a zero-width row, or a non-numeric or structurally ambiguous seat label is excluded and recorded as a parser-contract warning.
 
 For a requested quantity `N`, every sliding window of exactly `N` seats within each contiguous run becomes an option. A run of five seats therefore produces four distinct two-seat options. Options are deduplicated by their stable option key.
 
@@ -312,7 +314,7 @@ The deterministic sort key is:
 
 1. Preferred exact-seat overlap, descending.
 2. Preferred-row match, descending.
-3. Five-point view-score band, descending.
+3. Five-point view-score band (`floor(view_score / 5)`), descending.
 4. Absolute minutes from the preferred performance date/time, ascending; all options tie when none is supplied.
 5. Raw view score, descending.
 6. Performance start, ascending.
@@ -326,7 +328,7 @@ The scheduler scans for due watches once per minute. A recurring watch's next ru
 
 Startup recovers overdue watches from SQLite and staggers them through the same host rate limiter. A filesystem lock prevents a second service instance from running against the same database.
 
-An immediate creation or `/check` response displays the current snapshot and marks every current option as already surfaced, including options beyond the first page.
+An immediate creation or `/check` response displays the current snapshot. After that Telegram delivery succeeds, every current option is marked as already surfaced, including options beyond the first page.
 
 Later recurring checks send one digest when either:
 
@@ -340,12 +342,12 @@ The digest shows the current top ten, counts of all current and new options, and
 Errors are typed and handled distinctly:
 
 - **Input error:** remain in the wizard step and explain the correction.
-- **Network or BFI 5xx error:** make bounded retries with short jitter, then put the watch into backoff.
+- **Network or BFI 5xx error:** retry twice after delays of approximately one and three seconds, each with up to 20 percent positive jitter, then put the watch into backoff.
 - **BFI parser-contract error:** pause the affected watch, retain its last valid snapshot, and alert its owner once.
 - **Telegram delivery error:** retain a pending notification for retry.
 - **Database error:** fail the operation, log it, and do not emit a success-shaped response.
 
-A Cloudflare challenge or rate-limit condition is detected from 403/429 statuses, the `cf-mitigated` response header, and known interstitial markers. Detection opens a host-wide circuit breaker. No BFI requests are attempted until the next retry point.
+A Cloudflare challenge or rate-limit condition is detected from 403/429 statuses, the `cf-mitigated` response header, and known interstitial markers. These responses are not retried immediately. Detection opens the persisted host-wide circuit breaker. No BFI requests are attempted until the next retry point, when one coordinator-owned request acts as the probe; its result either closes the circuit or advances the delay.
 
 The retry sequence is:
 
@@ -367,9 +369,9 @@ Configuration is loaded from a user-owned file with mode `0600`:
 - `TELEGRAM_ALLOWED_USER_IDS`
 - `DATABASE_PATH`
 - `LOG_LEVEL`
-- A truthful service user-agent/contact string
+- `BFI_USER_AGENT`, containing a truthful service name and contact string
 
-Secrets are never stored in SQLite or written to logs. Logs are structured, redact URL tokens and Telegram credentials, and include watch/check correlation IDs. BFI HTML and transient `sToken` values are neither logged nor persisted.
+Secrets are never stored in SQLite or written to logs. Logs are structured, redact URL tokens and Telegram credentials, and include watch/check correlation IDs. BFI HTML and transient `sToken` values are neither logged nor persisted. The single-instance lock is `<DATABASE_PATH>.lock` and is held for the process lifetime.
 
 ## Testing Strategy
 
