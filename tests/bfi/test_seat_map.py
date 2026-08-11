@@ -171,3 +171,111 @@ getPerformanceEcommerceObject({{"item_id":"{PERFORMANCE_ID}"}})
     assert seat_map.seats[0].zone is not None
     assert seat_map.seats[0].zone.label == "(unlisted zone)"
     assert seat_map.seats[0].zone.price is None
+
+
+# ---------------------------------------------------------------------------
+# Fix round 1: U → UNAVAILABLE semantics
+# ---------------------------------------------------------------------------
+
+
+def test_u_status_maps_to_unavailable():
+    extra = (
+        '<circle id="seat-u" data-status="U" data-seat-section="BFI IMAX" '
+        'data-seat-row="L" data-seat-seat="20" cx="382" cy="180"/>'
+    )
+    seat_map = parse_seat_map(seat_map_html(extra_circles=extra), PERFORMANCE_ID)
+    u_seat = next(s for s in seat_map.seats if s.seat_id == "seat-u")
+    assert u_seat.status is SeatStatus.UNAVAILABLE
+
+
+def test_u_status_is_not_reserved_or_available():
+    extra = (
+        '<circle id="seat-u2" data-status="U" data-seat-section="BFI IMAX" '
+        'data-seat-row="L" data-seat-seat="21" cx="396" cy="180"/>'
+    )
+    seat_map = parse_seat_map(seat_map_html(extra_circles=extra), PERFORMANCE_ID)
+    u_seat = next(s for s in seat_map.seats if s.seat_id == "seat-u2")
+    assert u_seat.status is not SeatStatus.RESERVED
+    assert u_seat.status is not SeatStatus.AVAILABLE
+
+
+# ---------------------------------------------------------------------------
+# Fix round 1: zone-script mismatched pairs raise BfiContractError
+# ---------------------------------------------------------------------------
+
+
+def test_zone_script_extra_id_raises():
+    """A script block with two zone IDs but one label assignment is malformed."""
+    html = f"""<html><script>
+getPerformanceEcommerceObject({{"item_id":"{PERFORMANCE_ID}"}})
+let priceZoneId = "{ZONE_ID}";
+let priceZoneId = "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE";
+priceZoneInfo[priceZoneId].label = "1 Standard";
+</script>
+<div class="zone-label">1 Standard</div>
+<div class="price-zone-price-text">- £22.00</div>
+<svg><g id="{ZONE_ID}">
+  <circle id="s-1" data-status="A" data-seat-section="BFI IMAX"
+    data-seat-row="A" data-seat-seat="1" cx="10" cy="10"/>
+</g></svg></html>"""
+    with pytest.raises(BfiContractError, match="zone-script"):
+        parse_seat_map(html, PERFORMANCE_ID)
+
+
+def test_zone_script_extra_label_raises():
+    """A script block with one zone ID but two label assignments is malformed."""
+    html = f"""<html><script>
+getPerformanceEcommerceObject({{"item_id":"{PERFORMANCE_ID}"}})
+let priceZoneId = "{ZONE_ID}";
+priceZoneInfo[priceZoneId].label = "1 Standard";
+priceZoneInfo[priceZoneId].label = "Duplicate Label";
+</script>
+<div class="zone-label">1 Standard</div>
+<div class="price-zone-price-text">- £22.00</div>
+<svg><g id="{ZONE_ID}">
+  <circle id="s-2" data-status="A" data-seat-section="BFI IMAX"
+    data-seat-row="A" data-seat-seat="1" cx="10" cy="10"/>
+</g></svg></html>"""
+    with pytest.raises(BfiContractError, match="zone-script"):
+        parse_seat_map(html, PERFORMANCE_ID)
+
+
+# ---------------------------------------------------------------------------
+# Fix round 1: invalid / non-finite coordinate handling
+# ---------------------------------------------------------------------------
+
+
+def test_missing_cx_raises():
+    html = f"""<html><script>
+getPerformanceEcommerceObject({{"item_id":"{PERFORMANCE_ID}"}})
+</script>
+<svg><g id="{ZONE_ID}">
+  <circle id="bad-1" data-status="A" data-seat-section="BFI IMAX"
+    data-seat-row="A" data-seat-seat="1" cy="10"/>
+</g></svg></html>"""
+    with pytest.raises(BfiContractError, match="invalid coordinates"):
+        parse_seat_map(html, PERFORMANCE_ID)
+
+
+def test_non_numeric_cy_raises():
+    html = f"""<html><script>
+getPerformanceEcommerceObject({{"item_id":"{PERFORMANCE_ID}"}})
+</script>
+<svg><g id="{ZONE_ID}">
+  <circle id="bad-2" data-status="A" data-seat-section="BFI IMAX"
+    data-seat-row="A" data-seat-seat="1" cx="10" cy="notanumber"/>
+</g></svg></html>"""
+    with pytest.raises(BfiContractError, match="invalid coordinates"):
+        parse_seat_map(html, PERFORMANCE_ID)
+
+
+def test_inf_cx_raises():
+    html = f"""<html><script>
+getPerformanceEcommerceObject({{"item_id":"{PERFORMANCE_ID}"}})
+</script>
+<svg><g id="{ZONE_ID}">
+  <circle id="bad-3" data-status="A" data-seat-section="BFI IMAX"
+    data-seat-row="A" data-seat-seat="1" cx="inf" cy="10"/>
+</g></svg></html>"""
+    with pytest.raises(BfiContractError, match="non-finite"):
+        parse_seat_map(html, PERFORMANCE_ID)

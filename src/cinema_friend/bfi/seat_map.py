@@ -25,7 +25,7 @@ _PRICE_RE = re.compile(r"£\s*([\d,]+\.?\d*)")
 _STATUS_MAP: dict[str, SeatStatus] = {
     "A": SeatStatus.AVAILABLE,
     "S": SeatStatus.SOLD,
-    "U": SeatStatus.RESERVED,
+    "U": SeatStatus.UNAVAILABLE,
     "O": SeatStatus.CONTENDED,
 }
 
@@ -60,7 +60,12 @@ def parse_seat_map(html: str, expected_performance_id: str) -> SeatMap:
     for block in re.findall(r"(?s)<script[^>]*>(.*?)</script>", html):
         id_matches = list(_ZONE_ID_RE.finditer(block))
         label_matches = list(_ZONE_LABEL_RE.finditer(block))
-        for id_m, lbl_m in zip(id_matches, label_matches, strict=False):
+        if len(id_matches) != len(label_matches):
+            raise BfiContractError(
+                f"zone-script parsing error: {len(id_matches)} zone ID(s) but "
+                f"{len(label_matches)} label assignment(s)"
+            )
+        for id_m, lbl_m in zip(id_matches, label_matches, strict=True):
             zone_labels[id_m.group(1).upper()] = lbl_m.group(1)
 
     tree = lxml.html.fromstring(html)

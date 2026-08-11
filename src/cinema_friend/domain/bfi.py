@@ -14,6 +14,7 @@ _LONDON = ZoneInfo("Europe/London")
 class SeatStatus(Enum):
     AVAILABLE = "available"
     RESERVED = "reserved"
+    UNAVAILABLE = "unavailable"
     SOLD = "sold"
     CONTENDED = "contended"
     RESTRICTED = "restricted"
