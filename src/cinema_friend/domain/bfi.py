@@ -31,6 +31,8 @@ class Seat:
     note: str
     row: str
     column: int
+    x: float
+    y: float
 
 
 @dataclass(frozen=True, slots=True)

@@ -53,6 +53,14 @@ class RankedOption:
 
 
 @dataclass(frozen=True, slots=True)
+class ResultSnapshot:
+    snapshot_id: int
+    watch_id: int
+    checked_at: datetime
+    options: tuple[RankedOption, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class CheckResult:
     check_run_id: int
     watch_id: int

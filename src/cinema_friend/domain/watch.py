@@ -40,6 +40,8 @@ class WatchCriteria:
             raise InputError("interval must not be set for ONE_OFF mode")
         if self.preferred_utc_instant is not None:
             inst = self.preferred_utc_instant
+            if inst.tzinfo is None or inst.utcoffset() != timedelta(0):
+                raise InputError("preferred_utc_instant must be a UTC-aware datetime")
             inst_date = inst.date()
             inst_time = inst.timetz().replace(tzinfo=None)
             if not (self.date_from <= inst_date <= self.date_to):
