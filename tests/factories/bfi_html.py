@@ -30,6 +30,9 @@ _DEFAULT_ROW: list[Any] = [
     ["Subtitles"],
 ]
 
+PERFORMANCE_ID = "2475959F-2B73-4EA6-AD26-AFA8AEB785FD"
+ZONE_ID = "3F5950DF-50B9-45EB-A78A-E0E518827835"
+
 
 def performance_row(**overrides: Any) -> list[Any]:
     """Return a single searchResults row as a list."""
@@ -86,3 +89,37 @@ def make_article_html(
     # un-escape path (finding \' inside a JSON double-quoted string) is exercised.
     literal = literal.replace("'", r"\'")
     return f"<script>var articleContext = {literal};\n</script>"
+
+
+def seat_map_html(
+    performance_id: str = PERFORMANCE_ID,
+    zone_id: str = ZONE_ID,
+    zone_label: str = "1 Standard",
+    price_text: str = "- £22.00",
+    extra_circles: str = "",
+) -> str:
+    """Return a minimal seat-map HTML page suitable for ``parse_seat_map`` tests.
+
+    The page includes:
+    - A ``getPerformanceEcommerceObject`` call with *performance_id*.
+    - One price zone whose GUID is *zone_id*, label is *zone_label*, and price is
+      taken from *price_text* (``"- £22.00"`` format).
+    - Two circles in the zone (seat-1 duplicated to exercise deduplication, seat-2).
+    - An optional *extra_circles* snippet appended inside the zone ``<g>``.
+    """
+    return f"""<html><script>
+getPerformanceEcommerceObject({{"item_id":"{performance_id}"}})
+let priceZoneId = "{zone_id}";
+priceZoneInfo[priceZoneId].label = "{zone_label}";
+</script>
+<div class="zone-label">{zone_label}</div>
+<div class="price-zone-price-text">{price_text}</div>
+<svg><g id="{zone_id}">
+  <circle id="seat-1" data-status="A" data-seat-section="BFI IMAX"
+    data-seat-row="L" data-seat-seat="17" cx="340" cy="180"/>
+  <circle id="seat-1" data-status="A" data-seat-section="BFI IMAX"
+    data-seat-row="L" data-seat-seat="17" cx="340" cy="180"/>
+  <circle id="seat-2" data-status="S" data-seat-section="BFI IMAX"
+    data-seat-row="L" data-seat-seat="18" cx="354" cy="180"/>
+  {extra_circles}
+</g></svg></html>"""

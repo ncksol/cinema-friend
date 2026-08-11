@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal
 from enum import Enum
 from zoneinfo import ZoneInfo
 
@@ -14,6 +15,7 @@ class SeatStatus(Enum):
     AVAILABLE = "available"
     RESERVED = "reserved"
     SOLD = "sold"
+    CONTENDED = "contended"
     RESTRICTED = "restricted"
     UNKNOWN = "unknown"
 
@@ -21,8 +23,8 @@ class SeatStatus(Enum):
 @dataclass(frozen=True, slots=True)
 class PriceZone:
     zone_id: str
-    name: str
-    price_pence: int
+    label: str
+    price: Decimal | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,8 +48,8 @@ class SeatBlock:
 
 @dataclass(frozen=True, slots=True)
 class SeatMap:
-    blocks: tuple[SeatBlock, ...]
-    source_url: str
+    performance_id: str
+    seats: tuple[Seat, ...]
 
 
 @dataclass(frozen=True, slots=True)

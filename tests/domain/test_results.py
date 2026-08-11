@@ -43,7 +43,7 @@ _SEAT = Seat(
     seat_id="L17",
     raw_status_code="A",
     status=SeatStatus.AVAILABLE,
-    zone=PriceZone(zone_id="z1", name="Premium", price_pence=1500),
+    zone=PriceZone(zone_id="z1", label="Premium", price=None),
     note="",
     row="L",
     column=17,
