@@ -174,6 +174,53 @@ async def test_list_due_excludes_future_next_run_at(
     assert result == ()
 
 
+async def test_list_due_includes_backoff_watch_whose_probe_time_has_arrived(
+    conn: aiosqlite.Connection, repo: WatchRepository
+) -> None:
+    backoff = _watch(
+        watch_id=_uuid(1), status=WatchStatus.BACKOFF, next_check_at=_NOW - timedelta(minutes=1)
+    )
+    await repo.create(conn, backoff)
+
+    result = await repo.list_due(conn, _NOW)
+
+    assert [w.watch_id for w in result] == [_uuid(1)]
+
+
+async def test_list_due_excludes_backoff_watch_still_waiting_out_its_probe_time(
+    conn: aiosqlite.Connection, repo: WatchRepository
+) -> None:
+    backoff = _watch(
+        watch_id=_uuid(1), status=WatchStatus.BACKOFF, next_check_at=_NOW + timedelta(minutes=1)
+    )
+    await repo.create(conn, backoff)
+
+    result = await repo.list_due(conn, _NOW)
+
+    assert result == ()
+
+
+async def test_list_due_orders_active_and_backoff_watches_together(
+    conn: aiosqlite.Connection, repo: WatchRepository
+) -> None:
+    await repo.create(
+        conn,
+        _watch(
+            watch_id=_uuid(1), status=WatchStatus.ACTIVE, next_check_at=_NOW - timedelta(minutes=1)
+        ),
+    )
+    await repo.create(
+        conn,
+        _watch(
+            watch_id=_uuid(2), status=WatchStatus.BACKOFF, next_check_at=_NOW - timedelta(minutes=5)
+        ),
+    )
+
+    result = await repo.list_due(conn, _NOW)
+
+    assert [w.watch_id for w in result] == [_uuid(2), _uuid(1)]
+
+
 async def test_list_due_excludes_paused_watch(
     conn: aiosqlite.Connection, repo: WatchRepository
 ) -> None:

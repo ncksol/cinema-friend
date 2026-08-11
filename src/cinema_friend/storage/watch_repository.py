@@ -135,14 +135,21 @@ class WatchRepository:
         return tuple(_row_to_watch(row) for row in rows)
 
     async def list_due(self, conn: aiosqlite.Connection, now: datetime) -> tuple[Watch, ...]:
-        """Return active watches whose ``next_run_at`` has arrived, earliest first."""
+        """Return watches whose ``next_run_at`` has arrived, earliest first.
+
+        Both ``ACTIVE`` and ``BACKOFF`` rows qualify. A watch in backoff is not broken,
+        it is waiting out a host problem, and its ``next_run_at`` is precisely the time
+        the host circuit said it was worth probing again. Excluding it would leave every
+        backed-off watch stranded, since nothing else re-arms them. The scheduler tells
+        the two apart by status and triggers a backed-off watch as a ``RECOVERY`` check.
+        """
         cursor = await conn.execute(
             """
             SELECT * FROM watches
-            WHERE status = ? AND next_run_at IS NOT NULL AND next_run_at <= ?
+            WHERE status IN (?, ?) AND next_run_at IS NOT NULL AND next_run_at <= ?
             ORDER BY next_run_at, id
             """,
-            (WatchStatus.ACTIVE.value, encode_datetime(now)),
+            (WatchStatus.ACTIVE.value, WatchStatus.BACKOFF.value, encode_datetime(now)),
         )
         rows = await cursor.fetchall()
         return tuple(_row_to_watch(row) for row in rows)
