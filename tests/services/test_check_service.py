@@ -32,7 +32,14 @@ import pytest
 
 from cinema_friend.bfi.gateway import BfiGateway
 from cinema_friend.bfi.urls import film_page_url, pagination_url, seat_map_url
-from cinema_friend.domain.bfi import Performance, PriceZone, Seat, SeatMap, SeatStatus
+from cinema_friend.domain.bfi import (
+    Performance,
+    PerformanceListing,
+    PriceZone,
+    Seat,
+    SeatMap,
+    SeatStatus,
+)
 from cinema_friend.domain.errors import (
     BfiChallengeError,
     BfiContractError,
@@ -151,6 +158,7 @@ class FakeGateway:
 
     def __init__(self) -> None:
         self.performances: list[Performance] = []
+        self.title: str | None = None
         self.maps: dict[str, SeatMap] = {}
         self.seat_map_calls: list[str] = []
         self.list_error: BaseException | None = None
@@ -158,13 +166,13 @@ class FakeGateway:
         self.list_entered = asyncio.Event()
         self.list_gate: asyncio.Event | None = None
 
-    async def list_performances(self, slug: str) -> tuple[Performance, ...]:
+    async def list_performances(self, slug: str) -> PerformanceListing:
         self.list_entered.set()
         if self.list_gate is not None:
             await self.list_gate.wait()
         if self.list_error is not None:
             raise self.list_error
-        return tuple(self.performances)
+        return PerformanceListing(title=self.title, performances=tuple(self.performances))
 
     async def load_seat_map(self, performance: Performance) -> SeatMap:
         self.seat_map_calls.append(performance.performance_id)
@@ -634,6 +642,46 @@ async def test_scheduled_check_with_nothing_new_writes_a_snapshot_but_no_deliver
     assert snapshot is not None
     assert snapshot.snapshot_id == result.snapshot_id
     assert await harness.deliveries() == ()
+
+
+async def test_successful_check_populates_the_watch_title_from_the_listing(
+    harness: Harness,
+) -> None:
+    watch = await harness.add_watch()
+    harness.gateway.title = "Dog Stars"
+    harness.gateway.performances = [make_performance()]
+    harness.gateway.maps[PERF_1] = centre_pair_map()
+
+    await harness.service.check(watch.watch_id, CheckTrigger.SCHEDULED)
+
+    assert (await harness.watch(watch.watch_id)).title == "Dog Stars"
+
+
+async def test_successful_check_keeps_the_title_even_when_all_performances_are_filtered_out(
+    harness: Harness,
+) -> None:
+    watch = await harness.add_watch()
+    harness.gateway.title = "Dog Stars"
+    harness.gateway.performances = [make_performance(start_utc=START_UTC.replace(hour=9))]
+
+    result = await harness.service.check(watch.watch_id, CheckTrigger.SCHEDULED)
+
+    assert result.performance_count == 0
+    assert (await harness.latest_snapshot(watch.watch_id)).options == ()
+    assert (await harness.watch(watch.watch_id)).title == "Dog Stars"
+
+
+async def test_empty_listing_preserves_the_existing_watch_title(harness: Harness) -> None:
+    watch = await harness.add_watch()
+    stored = replace(watch, title="Existing title", updated_at=NOW + timedelta(seconds=1))
+    async with harness.database.connection() as conn, harness.database.transaction(conn):
+        await harness.watches.update(conn, stored)
+    harness.gateway.title = "Dog Stars"
+    harness.gateway.performances = []
+
+    await harness.service.check(watch.watch_id, CheckTrigger.SCHEDULED)
+
+    assert (await harness.watch(watch.watch_id)).title == "Existing title"
 
 
 # ---------------------------------------------------------------------------

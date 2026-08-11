@@ -30,6 +30,7 @@ class ArticlePage:
     s_token: str
     current_page: int
     total_pages: int
+    title: str | None
     rows: tuple[Mapping[str, object], ...]
 
 
@@ -77,6 +78,7 @@ def _parse_context_dict(ctx: Mapping[str, object]) -> ArticlePage:
     article_id = _require_str(ctx, "articleId")
     _validate_guid(article_id, "articleId")
     s_token = _require_str(ctx, "sToken")
+    title = _optional_str(ctx, "title")
     current_page = _require_pagination_int(pagination, "current_page")
     total_pages = _require_pagination_int(pagination, "total_pages")
 
@@ -95,6 +97,7 @@ def _parse_context_dict(ctx: Mapping[str, object]) -> ArticlePage:
         s_token=s_token,
         current_page=current_page,
         total_pages=total_pages,
+        title=title,
         rows=tuple(rows),
     )
 
@@ -172,6 +175,15 @@ def _require_str(mapping: Mapping[str, object], key: str) -> str:
     if not isinstance(value, str):
         raise BfiContractError(f"{key!r} must be a string; got {type(value).__name__!r}")
     return value
+
+
+def _optional_str(mapping: Mapping[str, object], key: str) -> str | None:
+    value = mapping.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise BfiContractError(f"{key!r} must be a string; got {type(value).__name__!r}")
+    return value or None
 
 
 def _require_int(mapping: Mapping[str, object], key: str) -> int:

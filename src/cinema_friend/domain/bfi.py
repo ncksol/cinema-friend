@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
@@ -75,3 +76,18 @@ class Performance:
     def sales_status_base(self) -> str:
         """Return sales status code with any trailing ``*`` stripped."""
         return self.sales_status_code.rstrip("*")
+
+
+@dataclass(frozen=True, slots=True)
+class PerformanceListing:
+    title: str | None
+    performances: tuple[Performance, ...]
+
+    def __iter__(self) -> Iterator[Performance]:
+        return iter(self.performances)
+
+    def __len__(self) -> int:
+        return len(self.performances)
+
+    def __getitem__(self, index: int) -> Performance:
+        return self.performances[index]

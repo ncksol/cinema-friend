@@ -21,7 +21,7 @@ from cinema_friend.bfi.seat_map import parse_seat_map
 from cinema_friend.bfi.transport import DocumentKind, FetchedDocument
 from cinema_friend.bfi.urls import film_page_url, pagination_url
 from cinema_friend.clock import Clock
-from cinema_friend.domain.bfi import Performance, SeatMap, SeatStatus
+from cinema_friend.domain.bfi import Performance, PerformanceListing, SeatMap, SeatStatus
 from cinema_friend.domain.errors import BfiContractError
 
 logger = logging.getLogger(__name__)
@@ -88,7 +88,7 @@ class BfiGateway:
         self._inflight: dict[str, asyncio.Task[FetchedDocument]] = {}
         self._cache: dict[str, tuple[float, FetchedDocument]] = {}
 
-    async def list_performances(self, slug: str) -> tuple[Performance, ...]:
+    async def list_performances(self, slug: str) -> PerformanceListing:
         """Fetch and assemble every paginated performance row for *slug*.
 
         Deduplicates rows by ``performance_id`` (an exact repeat, e.g. from
@@ -103,15 +103,17 @@ class BfiGateway:
 
         performances: dict[str, Performance] = {}
         self._collect_page(first_page, performances)
+        title = first_page.title
 
         for page_number in range(2, first_page.total_pages + 1):
             page_url = pagination_url(first_page.s_token, page_number, first_page.article_id)
             next_document = await self._fetch_document(page_url, DocumentKind.ARTICLE)
             page = parse_article_page(next_document.text)
             _validate_pagination_identity(first_page, page, page_number)
+            title = _merge_title(title, page.title, page_number)
             self._collect_page(page, performances)
 
-        return tuple(performances.values())
+        return PerformanceListing(title=title, performances=tuple(performances.values()))
 
     async def load_seat_map(self, performance: Performance) -> SeatMap:
         """Fetch the seat map for *performance* and cross-check availability.
@@ -215,6 +217,16 @@ def _validate_pagination_identity(first: ArticlePage, page: ArticlePage, page_nu
             f"page {page_number} total_pages changed: "
             f"expected {first.total_pages}, got {page.total_pages}"
         )
+
+
+def _merge_title(current: str | None, page_title: str | None, page_number: int) -> str | None:
+    if not page_title:
+        return current
+    if current is None or current == page_title:
+        return page_title
+    raise BfiContractError(
+        f"page {page_number} title changed: expected {current!r}, got {page_title!r}"
+    )
 
 
 def _availability_drift(performance: Performance, seat_map: SeatMap) -> AvailabilityDrift:

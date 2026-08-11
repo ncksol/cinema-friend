@@ -67,6 +67,7 @@ async def test_lists_every_paginated_performance_and_deduplicates():
         total_pages=2,
         token=TOKEN,
         article_id=ARTICLE_ID,
+        title_with_apostrophe="Dog Stars",
     )
     page_2 = make_article_html(
         rows=[
@@ -77,6 +78,7 @@ async def test_lists_every_paginated_performance_and_deduplicates():
         total_pages=2,
         token=TOKEN,
         article_id=ARTICLE_ID,
+        title_with_apostrophe="Dog Stars",
     )
     gateway, transport, _ = make_gateway(
         transport=FakeTransport(
@@ -89,6 +91,7 @@ async def test_lists_every_paginated_performance_and_deduplicates():
 
     performances = await gateway.list_performances(SLUG)
 
+    assert performances.title == "Dog Stars"
     assert [item.performance_id for item in performances] == [PERF_1, PERF_2, PERF_3]
     assert transport.calls == [FILM_URL, PAGE_2_URL]
 
@@ -204,6 +207,35 @@ async def test_changing_article_id_across_pages_is_contract_error():
     )
 
     with pytest.raises(BfiContractError, match="article_id"):
+        await gateway.list_performances(SLUG)
+
+
+async def test_conflicting_page_titles_are_contract_error():
+    page_1 = make_article_html(
+        rows=[performance_row(performance_id=PERF_1)],
+        total_pages=2,
+        token=TOKEN,
+        article_id=ARTICLE_ID,
+        title_with_apostrophe="Dog Stars",
+    )
+    page_2 = make_article_html(
+        rows=[performance_row(performance_id=PERF_2)],
+        current_page=2,
+        total_pages=2,
+        token=TOKEN,
+        article_id=ARTICLE_ID,
+        title_with_apostrophe="Different Film",
+    )
+    gateway, _, _ = make_gateway(
+        transport=FakeTransport(
+            {
+                FILM_URL: fetched_document(page_1, url=FILM_URL),
+                PAGE_2_URL: fetched_document(page_2, url=PAGE_2_URL),
+            }
+        )
+    )
+
+    with pytest.raises(BfiContractError, match="title"):
         await gateway.list_performances(SLUG)
 
 

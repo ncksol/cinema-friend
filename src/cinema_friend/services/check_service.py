@@ -44,7 +44,7 @@ from uuid import UUID
 import aiosqlite
 
 from cinema_friend.clock import Clock
-from cinema_friend.domain.bfi import Performance, SeatMap
+from cinema_friend.domain.bfi import Performance, PerformanceListing, SeatMap
 from cinema_friend.domain.errors import (
     BfiChallengeError,
     BfiContractError,
@@ -103,7 +103,7 @@ class AvailabilityGateway(Protocol):
     transport's dependency graph and makes the fetch trivially substitutable in tests.
     """
 
-    async def list_performances(self, slug: str) -> tuple[Performance, ...]: ...
+    async def list_performances(self, slug: str) -> PerformanceListing: ...
 
     async def load_seat_map(self, performance: Performance) -> SeatMap: ...
 
@@ -159,7 +159,7 @@ class CheckService:
         watch = await self._load_watch(watch_id)
         started_at = self._clock.now()
         try:
-            candidates, maps = await self._fetch(watch)
+            listing, candidates, maps = await self._fetch(watch)
         except BfiChallengeError as error:
             return await self._persist_challenge(watch, trigger, started_at, error)
         except CircuitOpenError as error:
@@ -169,7 +169,7 @@ class CheckService:
         except BfiNetworkError as error:
             return await self._persist_network_error(watch, trigger, started_at, error)
         options = rank_options(watch.criteria, tuple(zip(candidates, maps, strict=True)))
-        return await self._persist_success(watch, trigger, started_at, candidates, options)
+        return await self._persist_success(watch, trigger, started_at, listing, candidates, options)
 
     async def _load_watch(self, watch_id: UUID) -> Watch:
         try:
@@ -181,20 +181,22 @@ class CheckService:
             raise InputError(_NOT_FOUND)
         return watch
 
-    async def _fetch(self, watch: Watch) -> tuple[tuple[Performance, ...], tuple[SeatMap, ...]]:
+    async def _fetch(
+        self, watch: Watch
+    ) -> tuple[PerformanceListing, tuple[Performance, ...], tuple[SeatMap, ...]]:
         """Fetch the listing, discard what cannot match, then load the survivors' maps.
 
         Eligibility is applied before any seat map is requested. Filtering afterwards
         would be identical in outcome and far more expensive: a listing page routinely
         holds dozens of performances, of which a single watch usually wants one or two.
         """
-        performances = await self._gateway.list_performances(watch.criteria.slug)
+        listing = await self._gateway.list_performances(watch.criteria.slug)
         candidates = tuple(
             performance
-            for performance in performances
+            for performance in listing.performances
             if performance_matches(watch.criteria, performance)
         )
-        return candidates, await self._load_seat_maps(candidates)
+        return listing, candidates, await self._load_seat_maps(candidates)
 
     async def _load_seat_maps(self, candidates: Sequence[Performance]) -> tuple[SeatMap, ...]:
         """Load every candidate's seat map concurrently, surfacing the first failure.
@@ -224,6 +226,7 @@ class CheckService:
         watch: Watch,
         trigger: CheckTrigger,
         started_at: datetime,
+        listing: PerformanceListing,
         candidates: Sequence[Performance],
         options: Sequence[RankedOption],
     ) -> CheckResult:
@@ -259,7 +262,11 @@ class CheckService:
                 outcome=CheckOutcome.SUCCESS,
                 performance_count=len(candidates),
             )
-            await self._watches.update(conn, self._reschedule(watch, trigger, completed_at))
+            title = watch.title if not listing.performances else (listing.title or watch.title)
+            await self._watches.update(
+                conn,
+                replace(self._reschedule(watch, trigger, completed_at), title=title),
+            )
             if decision.requires_snapshot:
                 await self._notifications.create_delivery(
                     conn,
