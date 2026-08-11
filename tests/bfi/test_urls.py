@@ -64,14 +64,16 @@ def test_validate_redirect_target_canonicalizes_allowed_urls():
         == "https://whatson.bfi.org.uk/imax/Online/default.asp"
         "?BOparam::WScontent::loadArticle::permalink=dog-stars"
     )
-    assert (
+
+
+def test_validate_redirect_target_rejects_map_select():
+    from cinema_friend.bfi.urls import validate_redirect_target
+
+    with pytest.raises(InputError):
         validate_redirect_target(
             "https://whatson.bfi.org.uk/imax/Online/mapSelect.asp"
             "?BOparam::WSmap::loadMap::performance_ids=2152D1E8-CFF7-419F-BE57-F51C1E490F24"
         )
-        == "https://whatson.bfi.org.uk/imax/Online/mapSelect.asp"
-        "?BOparam::WSmap::loadMap::performance_ids=2152D1E8-CFF7-419F-BE57-F51C1E490F24"
-    )
 
 
 def test_parse_article_url_rejects_duplicate_permalink():

@@ -127,9 +127,4 @@ def validate_redirect_target(raw_url: str) -> str:
     split = _validate_host(raw_url)
     if split.path == DEFAULT_PATH or split.path.startswith(ARTICLE_PREFIX):
         return parse_article_url(raw_url).canonical_url
-    if split.path == MAP_SELECT_PATH:
-        performance_ids = _query_values(split.query, MAP_PARAM)
-        if performance_ids is None:
-            raise InputError("BFI seat map redirects require performance_ids")
-        return seat_map_url(_validate_guid(performance_ids[0]))
     raise InputError("redirect target must stay on an allowed BFI route")
