@@ -8,7 +8,9 @@
 
 Cinema Friend is a small, allow-listed Telegram bot that runs continuously on a spare Mac. A user supplies a BFI IMAX film URL and screening preferences. The service reads BFI's public, server-rendered film and seat-map pages, finds every matching contiguous seat block, ranks the options, and returns links that open the relevant BFI seat map for manual purchase.
 
-The service is read-only with respect to BFI. It does not select or reserve seats, add tickets to a basket, automate checkout, solve CAPTCHAs, rotate proxies, or otherwise evade access controls.
+BFI's public pages sit behind Cloudflare, which fingerprints the TLS handshake. The gateway therefore issues its GETs through a Chrome-impersonating HTTP client (`curl_cffi`) rather than an ordinary HTTP library. This is the minimum needed to read a page any member of the public can open in a browser; it is not a challenge bypass. See "BFI Access Method and Web Contract".
+
+The service is read-only with respect to BFI. It does not select or reserve seats, add tickets to a basket, automate checkout, solve CAPTCHAs, rotate proxies or IP addresses, or attempt to answer an access-control challenge once one is presented.
 
 ## Goals
 
@@ -25,8 +27,9 @@ The service is read-only with respect to BFI. It does not select or reserve seat
 
 ## Non-goals
 
-- Automated CAPTCHA or Cloudflare challenge solving.
-- Browser automation, browser fingerprint impersonation, or proxy rotation.
+- Automated CAPTCHA or Cloudflare challenge solving. A presented challenge is treated as a stop signal, not an obstacle to work around.
+- Persistent browser automation, headless browser drivers, or CDP-driven sessions. The gateway impersonates a browser's TLS fingerprint only, at the HTTP client layer.
+- Proxy rotation, IP rotation, or distributing load across identities to raise the effective request rate.
 - Automatic seat selection, reservation, basket creation, payment, or purchase.
 - Supporting cinemas other than BFI IMAX.
 - Public bot registration; access is limited to configured Telegram user IDs.
@@ -34,21 +37,192 @@ The service is read-only with respect to BFI. It does not select or reserve seat
 - Price filtering or ranking by standard, premium, or VIP category.
 - Natural-language interpretation through an LLM.
 
-## Observed BFI Web Contract
+## BFI Access Method and Web Contract
 
-The sample film page exposes performance data in a JavaScript object named `articleContext`. Its `searchResults` records include the performance ID, start date and time, sales status, availability status, venue, and article metadata.
+`whatson.bfi.org.uk` runs Tessitura Network "Online" 7.90, the classic ASP product rather than TNEW. Two unauthenticated `GET` routes expose everything the service needs. Neither requires a cookie, login, or session token for a cold read.
 
-The public seat-map route accepts a performance ID:
+This is an undocumented public HTML/SVG contract, not an official or supported BFI API. It carries no version, no deprecation notice, and no compatibility guarantee. Every field the service relies on is validated on every parse, and the gateway fails closed if the contract changes. A parse failure is never interpreted as no availability.
 
-```text
-https://whatson.bfi.org.uk/imax/Online/mapSelect.asp
-  ?BOparam%3A%3AWSmap%3A%3AloadMap%3A%3Aperformance_ids=<performance-id>
-  &createBO%3A%3AWSmap=1
+### Transport
+
+Cloudflare fingerprints the TLS handshake in front of these routes. Plain `curl`, `requests`, `httpx`, and `wget` receive `HTTP 403` with a `cf-mitigated: challenge` response header regardless of `User-Agent`, `sec-ch-ua`, or any other header value, because the JA3/JA4 fingerprint is what is inspected. Header spoofing does not change the outcome, and a clean headless browser session is challenged as well.
+
+The gateway therefore uses `curl_cffi`, which binds libcurl-impersonate and reproduces a real Chrome TLS and HTTP/2 fingerprint:
+
+```python
+from curl_cffi.requests import AsyncSession
+
+session = AsyncSession(impersonate="chrome")
 ```
 
-The returned SVG marks seats with stable IDs and attributes including availability status, section, row, seat number, and coordinates. The same URL is suitable for the Telegram purchase link: it opens BFI's seat map and leaves all purchase actions to the user.
+One long-lived `AsyncSession` is created at startup, shared by every BFI request, and closed on shutdown. There is no browser process, no CDP connection, no proxy pool, and no challenge handling.
 
-This is an undocumented public web contract, not a supported BFI API. The gateway therefore validates every required field and fails closed if the contract changes. A parse failure is never interpreted as no availability.
+Two consequences are accepted deliberately:
+
+- The impersonation profile fixes the `User-Agent` and the rest of the browser header set. The service cannot also advertise a truthful bot identity in `User-Agent`, because a custom agent string paired with a Chrome fingerprint is incoherent and is itself a bot signal. The honest identification the design can still offer is behavioural: strictly read-only requests, a low and rate-limited request volume, no purchase or write path, and immediate backoff on any challenge.
+- The impersonation profile is a compatibility surface. `BFI_IMPERSONATE_PROFILE` makes it configurable so a profile can be changed without a code release if Cloudflare's checks move.
+
+Sporadic `403` responses still occur under sustained request rates even with impersonation, so retry and circuit-breaker handling remain mandatory.
+
+### Endpoints
+
+Performances for one film article:
+
+```text
+GET https://whatson.bfi.org.uk/imax/Online/default.asp
+      ?BOparam::WScontent::loadArticle::permalink=<slug>
+```
+
+Seat map for one performance:
+
+```text
+GET https://whatson.bfi.org.uk/imax/Online/mapSelect.asp
+      ?BOparam::WSmap::loadMap::performance_ids=<performance-id>
+```
+
+The `::` sequences in parameter *names* must be sent literally. Standard encoders emit `%3A%3A`, so query strings are assembled by concatenation rather than passed as a params mapping. Parameter *values* are percent-encoded normally; the `sToken` pagination value in particular contains commas and must be encoded.
+
+The seat-map URL doubles as the Telegram purchase link. It opens BFI's own seat map in the user's browser and leaves seat selection and checkout entirely to the user. No `createBO` parameter is required.
+
+### Performance Records
+
+The film page embeds a JavaScript object literal, not JSON:
+
+```js
+var articleContext = {
+  searchHeaders : [ "Id", "Object Type", ... ],   // display labels
+  searchNames   : [ "id", "object_type", ... ],   // 98 field names
+  searchResults : [ [ ...98 values... ], ... ],   // one array per row
+  pagination    : { current_page: "1", page_size: "5", total_pages: "2" },
+  articleId     : "2152D1E8-CFF7-419F-BE57-F51C1E490F24",
+  sToken        : "1,060cecdb,...",
+  ...
+};
+```
+
+Parsing steps, in order:
+
+1. Extract the object literal following `var articleContext = `, terminated by the `};` that closes the assignment statement.
+2. Quote bare keys (`searchNames :` becomes `"searchNames" :`).
+3. Strip trailing commas before `}` or `]`.
+4. Replace `\'`, which is legal in JavaScript and illegal in JSON, with `'`.
+5. Decode as JSON, then zip `searchNames` against each `searchResults` row to produce one record per row.
+6. Validate that `searchNames`, `searchResults`, `pagination`, and `articleId` are present and that every consumed field below exists on every record. A missing element is a parser-contract error.
+
+Fields the service consumes:
+
+| field | meaning |
+|---|---|
+| `id` | performance GUID; the key for the seat map |
+| `object_type` | `P` performance, `A` article, `B` bundle, `M` misc item, `G` gift, `S` stored value. Only `P` rows are performances |
+| `availability_num` | exact count of seats remaining |
+| `availability_status` | `E` excellent, `G` good, `L` limited, `S` sold out, plus `U` and `N` in the client code |
+| `sales_status` | `S`, `O`, `R` on sale; `C` not yet on sale; `N` not on sale; `X` cancelled. A trailing `*` flags a promotion and does not change the base meaning |
+| `options` | array of option codes. `2` present means reserved seating, so `mapSelect.asp` is meaningful for that performance |
+| `start_date` | local start, e.g. `Wednesday 26 August 2026 18:15` |
+| `start_date_time`, `start_date_date`, `start_date_month`, `start_date_year` | split components |
+| `min_price`, `max_price` | e.g. `£0.00` and `£26.00`. The `£0.00` floor is a comp or access price type, not a purchasable standard price |
+| `keywords` | format, e.g. `IMAX (with laser)` |
+| `venue_description` | e.g. `BFI IMAX, Waterloo` |
+| `venue_name` | screen configuration |
+| `short_description`, `name` | film title, preferring `short_description` |
+| `additional_info` | relative URL back to the performance's article |
+
+Rows are filtered to `object_type == "P"` and deduplicated by `id`.
+
+### Pagination
+
+`page_size` is set per article and is 5 on a film page, so a film with more than five performances always paginates. Pages 2 and above:
+
+```text
+GET /imax/Online/default.asp
+      ?sToken=<percent-encoded sToken from page 1>
+      &BOset::WScontent::SearchResultsInfo::current_page=<n>
+      &doWork::WScontent::getPage=
+      &BOparam::WScontent::getPage::article_id=<articleId>
+```
+
+Each page returns the same `articleContext` shape. `sToken` and `articleId` are read from page 1 and are required only for subsequent pages. The gateway iterates from page 2 to `pagination.total_pages` inclusive and treats a page count that changes mid-chain, or a page that yields no rows, as a parser-contract error rather than as an empty result. `sToken` is transient and is neither logged nor persisted.
+
+### Seat Map
+
+`mapSelect.asp` returns a server-rendered SVG inside an HTML page. There is no XHR call and no separate data feed. Every seat is one `<circle>`, nested inside a `<g>` whose `id` is the price-zone GUID:
+
+```html
+<g id="3F5950DF-50B9-45EB-A78A-E0E518827835" style="fill: #1DABFF; stroke: #1DABFF">
+  <circle role="button" r="2" class="seatA"
+          id="9D64A4E0-69B3-4512-B3A4-E86ADA4C7955"
+          data-status="A"
+          data-seat-section="BFI IMAX" data-seat-row="P" data-seat-seat="29"
+          data-tsdesc="BFI IMAX P 29"
+          data-seatviewid="BFI IMAX-P-29"
+          data-tsmessage="NB: This is a space for wheelchair users..."
+          cx="596.143" cy="153.938" />
+</g>
+```
+
+| attribute | meaning |
+|---|---|
+| `id` | stable seat GUID |
+| `data-status` | `A` available, `S` sold, `U` unavailable (held, killed, or restricted), `O` sitting in another customer's basket |
+| `class` | mirrors status as `seatA`, `seatS`, `seatu` |
+| `data-seat-section`, `data-seat-row`, `data-seat-seat` | seat identity |
+| `data-tsmessage` | obstruction or accessibility note |
+| `cx`, `cy` | position within the seat-map coordinate space |
+| enclosing `<g id>` | price-zone GUID |
+
+Parsing uses `lxml` over the whole document. Each `<circle>` carrying `data-status` is a seat; its price zone is the `id` of its nearest ancestor `<g>`. The same seat `id` can appear on more than one circle, because a seat is drawn as an outline and a fill, so seats are deduplicated by `id`. Only `data-status="A"` counts as available. `O` is contended rather than permanently gone — it can revert to `A` when another customer's basket times out — but it is not offerable now and is excluded from option generation exactly like `S` and `U`.
+
+Price zones are resolved from inline legend scripts:
+
+```js
+let priceZoneId = "3F5950DF-50B9-45EB-A78A-E0E518827835";
+priceZoneInfo[priceZoneId].label  = "1 Standard";
+priceZoneInfo[priceZoneId].colour = "#1DABFF";
+```
+
+with the price taken from the adjacent `<span class="price-zone-price-text">`. A zone GUID can appear on the map without a corresponding legend entry, in which case it carries no purchasable price; such a zone resolves to an unlisted zone with a null price and is a display-only condition, not an error.
+
+Observed zones and prices:
+
+| zone | price |
+|---|---|
+| 1 Standard | £22.00 |
+| Premium | £25.00 |
+| BFI IMAX VIP | £26.00 |
+| BFI IMAX wheelchair space | £22.00 |
+| BFI IMAX assistant or companion | £22.00 |
+
+The wheelchair and companion zone labels, together with `data-tsmessage` text, are the two independent signals used to exclude restricted access seats.
+
+### Venue Geometry
+
+BFI IMAX presents 493 seats across 15 rows labelled `A` to `Q`, skipping `I` and `O`. The skipped letters are why row distance in the ranking formula is computed from observed row order by median vertical (`cy`) position rather than from alphabetic distance.
+
+### Cross-Source Consistency
+
+`availability_num` and the seat map are independently produced. In a single controlled read they agree exactly, and 387 against 387 was observed for the verified performance. At runtime the two documents are fetched seconds apart and genuine bookings occur in between, so the gateway tolerates small drift rather than requiring equality; the smoke test, which reads both in immediate succession, asserts the exact match. This is the cheapest available detector of drift in either parser.
+
+### Verification
+
+Verified live from the target Mac on 2026-08-11, read-only, five HTTP requests in total: one plain-`httpx` control plus four `curl_cffi` reads.
+
+| check | result |
+|---|---|
+| Control: plain `httpx` GET of the film page | `HTTP 403`, `cf-mitigated: challenge` |
+| `curl_cffi` `Session(impersonate="chrome")`, film page `dog-stars` | `HTTP 200`, 124,680 bytes |
+| `curl_cffi` `AsyncSession(impersonate="chrome")`, same page | `HTTP 200`, 124,686 bytes, `articleContext` present |
+| `articleContext` parse | 98 field names, 5 rows, `pagination` `{current_page: 1, page_size: 5, total_pages: 2}` |
+| Page 2 via `sToken` + `getPage` | `HTTP 200`, 122,951 bytes |
+| Performance records after `object_type == "P"` filter and dedup | 8 records, all consumed fields present, all `options` containing `2` |
+| Seat map for `2475959F-2B73-4EA6-AD26-AFA8AEB785FD` (Wed 26 Aug 2026 18:15) | `HTTP 200`, 504,320 bytes |
+| Seats parsed | 493 unique, all carrying `cx`/`cy`; statuses `A` 387, `S` 86, `U` 20 |
+| `availability_num` versus `data-status="A"` count | 387 versus 387, exact match |
+| Price zones resolved from legend | 5 zones, all with prices |
+| Rows observed | `A`–`Q` excluding `I` and `O`, 15 rows |
+| Seats carrying `data-tsmessage` | 8, all wheelchair-space or companion wording |
+
+Payload sizes measured in that run set the fetch strategy. One film-page request is roughly 124 KB and carries up to `page_size` performances, so the full performance list for a film costs one such request per page of the pagination chain. One seat map is roughly 504 KB and covers a single performance. Seat maps are therefore fetched only for performances that survive every cheaper filter.
 
 ## System Architecture
 
@@ -66,9 +240,10 @@ A single Python asyncio process contains the following units:
    - Domain services depend on interfaces rather than Telegram, HTTP, or SQLite details.
 
 3. **BFI gateway**
-   - Performs only HTTPS GET requests to validated BFI IMAX routes.
-   - Parses film pages and seat maps into typed domain records.
-   - Applies host-level concurrency, rate limiting, request coalescing, and circuit breaking.
+   - Owns the single shared `curl_cffi` Chrome-impersonating session and performs only HTTPS GET requests to validated BFI IMAX routes.
+   - Builds query strings literally so Tessitura's `::` parameter names survive unencoded.
+   - Parses film pages and seat maps into typed domain records, validating the contract on every parse.
+   - Applies host-level concurrency, rate limiting, request coalescing, challenge detection, and circuit breaking.
 
 4. **Ranking engine**
    - Is a pure, deterministic unit with no network, database, or Telegram dependencies.
@@ -86,10 +261,11 @@ A single Python asyncio process contains the following units:
 The initial implementation uses Python 3.12 or later with:
 
 - `python-telegram-bot` for async long polling and callback handling.
-- `httpx` for async HTTP sessions.
-- `chompjs` for parsing the embedded JavaScript object literal.
+- `curl_cffi` for async HTTP through a Chrome-impersonating TLS stack. It is the only supported transport for BFI; an ordinary async HTTP client cannot reach these routes.
 - `lxml` for HTML and SVG parsing.
 - `aiosqlite` for async SQLite access.
+
+The `articleContext` JavaScript literal is normalised and decoded with the standard library, using the steps set out in the contract section, so no additional JavaScript-parsing dependency is required.
 
 ## Domain Model
 
@@ -121,6 +297,8 @@ A performance contains:
 - Film title.
 - London-local start instant.
 - Sales and headline availability states.
+- Exact seats-remaining count from `availability_num`.
+- Reserved-seating flag, true when `options` contains `2`.
 - Venue and booking type where supplied.
 - Canonical direct seat-map URL.
 
@@ -131,9 +309,9 @@ A seat contains:
 - Stable BFI seat ID.
 - Section, row, and displayed seat number.
 - SVG `x` and `y` coordinates.
-- Availability state.
-- Price-zone/category label when available, for display only.
-- A restricted-access flag derived from BFI's seat messages and metadata.
+- Raw BFI status code and its mapped availability state.
+- Price-zone GUID and resolved zone label and price when available, for display only.
+- A restricted-access flag derived from the zone label and from BFI's `data-tsmessage` seat message.
 
 ### Ranked Option
 
@@ -234,23 +412,29 @@ The gateway accepts only:
 
 - Scheme `https`.
 - Exact host `whatson.bfi.org.uk`.
-- `/imax/Online/default.asp` with exactly one non-empty `BOparam::WScontent::loadArticle::permalink` value, apart from known inert tracking parameters.
+- `/imax/Online/default.asp` with exactly one non-empty `BOparam::WScontent::loadArticle::permalink` value.
 - `/imax/Online/article/<slug>` with one non-empty path segment after `article`.
 
-User information, fragments, non-default ports, duplicate permalink values, alternate hosts, redirects to alternate hosts, and arbitrary paths are rejected. Redirects are followed only when every hop remains on the exact allowed host and resolves to one of the accepted route shapes.
+Additional query parameters that are not the permalink are ignored rather than treated as grounds for rejection, because the request sent to BFI is rebuilt from the slug and never replays the user's parameters. User information, fragments, non-default ports, duplicate or conflicting permalink values, alternate hosts, redirects to alternate hosts, and arbitrary paths are rejected. Redirects are followed only when every hop remains on the exact allowed host and resolves to one of the accepted route shapes.
+
+Validation reduces the URL to a single article slug, which is the watch's canonical identity. Requests are then reconstructed from that slug in the literal form given in the contract section rather than by replaying the user's raw URL, so tracking parameters and encoding variations cannot reach BFI.
+
+One slug is one article. BFI publishes subtitled variants as separate articles, so `dog-stars` and `dog-stars-sdh` are distinct watches and a watch on one does not surface performances of the other. The wizard shows this caveat whenever the slug ends in a recognised variant suffix, initially `-sdh`, and treats the suffix list as a best-effort hint rather than a validation rule. The aggregate programme article that lists every IMAX film in one result set is not used; watches are per-film by design.
 
 ### Film Discovery
 
-1. Normalize and validate the supplied URL.
-2. Fetch the film page through a persistent `httpx.AsyncClient` cookie jar.
-3. Locate and parse the `articleContext` object.
-4. Validate the article identity, title, search-field mapping, and performance records.
-5. Convert performance starts to `Europe/London`.
-6. Apply the inclusive date and daily time predicates.
-7. Skip records that BFI marks as not yet on sale, unavailable, or sold out.
-8. Construct the canonical seat-map URL for each remaining performance.
+1. Normalize and validate the supplied URL and reduce it to an article slug.
+2. Fetch the film page through the shared Chrome-impersonating session, with the permalink parameter name sent literally.
+3. Locate and parse the `articleContext` object literal using the documented normalisation steps.
+4. Validate the article identity, pagination block, search-field mapping, and performance records.
+5. Follow the `sToken` pagination chain to `total_pages` and merge every page's rows.
+6. Keep rows whose `object_type` is `P` and deduplicate by performance ID.
+7. Convert performance starts to `Europe/London`.
+8. Apply the inclusive date and daily time predicates.
+9. Skip performances whose `sales_status` is not an on-sale code, whose `options` does not contain `2`, or whose `availability_num` is below the requested ticket quantity.
+10. Construct the canonical seat-map URL for each remaining performance.
 
-The headline availability filter avoids unnecessary seat-map requests. A future poll re-evaluates the film page, so a sold-out performance that gains availability is checked then.
+Filtering on the exact `availability_num` count rather than only on the coarse availability band avoids fetching a roughly 504 KB seat map for a performance that cannot possibly hold the requested block. A performance without reserved seating has no meaningful seat map; it is recorded as an unsupported-performance skip rather than an error. A future poll re-evaluates the film page, so a performance that later gains enough seats is checked then.
 
 ### Seat Retrieval
 
@@ -258,12 +442,20 @@ For each candidate performance:
 
 1. Fetch its canonical seat-map URL with GET.
 2. Verify that returned performance metadata matches the requested performance ID.
-3. Parse all physical seat positions to establish row geometry.
-4. Retain seats whose BFI status is available.
-5. Exclude wheelchair spaces, companion seats, and other restricted access seats identified by seat messages or metadata.
-6. Parse category/price-zone labels for display without using them in rank.
+3. Resolve the price-zone legend into zone GUID, label, and price.
+4. Parse every `<circle>` carrying `data-status`, attach the zone of its nearest ancestor `<g>`, falling back to an unlisted zone with no price when that GUID has no legend entry, and deduplicate by seat ID so a seat drawn as both outline and fill is counted once.
+5. Use all parsed physical seat positions to establish row geometry.
+6. Retain only seats whose status code is `A`. Codes `S`, `U`, and `O` are all unofferable; `O` is recorded as contended rather than sold, because it can revert when another customer's basket times out.
+7. Exclude wheelchair spaces, companion seats, and other restricted access seats, identified by the seat's price-zone label and by its `data-tsmessage` text.
 
-The gateway allows at most two in-flight BFI requests and starts requests at least one second apart. Requests use a 10-second connection timeout and a 30-second total timeout. Identical film or performance requests share one in-flight operation. A completed response may be reused only within 60 seconds, preventing concurrent watches from creating duplicate load without presenting materially stale availability.
+Zone labels and prices are carried for display only and never affect rank.
+
+The gateway allows at most two in-flight BFI requests and starts requests at least one second apart. Requests use a 10-second connection timeout and a 45-second total timeout, which is deliberate headroom over the sub-second responses observed for both routes. Identical film or performance requests share one in-flight operation. A completed response may be reused only within 60 seconds, preventing concurrent watches from creating duplicate load without presenting materially stale availability.
+
+The gateway cross-checks the count of `A` seats against the `availability_num` reported for the same performance on the film page. The two documents are fetched seconds apart and real bookings occur in between, so an exact match is not required:
+
+- A difference of more than five seats is logged as a contract-drift signal for the smoke test to investigate. The check does not fail.
+- A seat map that yields zero parsed seats, or zero available seats while `availability_num` is positive, is a parser-contract error. It is never reported as no availability.
 
 ### Adjacency
 
@@ -300,13 +492,14 @@ row_score = max(0, 40 - 5 * row_distance)
 
 row_center = midpoint of the minimum and maximum physical seat x-coordinates in the row
 half_width = (maximum row x - minimum row x) / 2
+block_center_x = midpoint of the minimum and maximum x-coordinates of the block's seats
 normalized_offset = abs(block_center_x - row_center) / half_width
 center_score = 60 * max(0, 1 - normalized_offset)
 
 view_score = row_score + center_score
 ```
 
-Rows are ordered by their observed median SVG position, so omitted letters do not distort distance. Rows L and M are the default ideal band, and horizontal centring has the stronger weight. The score is rounded to two decimal places. Standard, premium, and VIP categories do not change it.
+Rows are ordered front to back by their observed median vertical (`cy`) coordinate, so omitted letters such as `I` and `O` do not distort distance. Row distance is counted in steps along that observed order, not in alphabetic steps. Rows L and M are the default ideal band, and horizontal centring has the stronger weight. The score is rounded to two decimal places. Standard, premium, and VIP categories do not change it.
 
 ### Final Ordering
 
@@ -337,17 +530,21 @@ Later recurring checks send one digest when either:
 
 The digest shows the current top ten, counts of all current and new options, and a button to browse the complete snapshot. All current option keys are marked surfaced only after the Telegram delivery succeeds. Unchanged snapshots, worse-only changes, and mere disappearances are silent.
 
-## Error Handling and Cloudflare
+## Error Handling, Rate Limiting, and Cloudflare
 
 Errors are typed and handled distinctly:
 
 - **Input error:** remain in the wizard step and explain the correction.
 - **Network or BFI 5xx error:** retry twice after delays of approximately one and three seconds, each with up to 20 percent positive jitter, then put the watch into backoff.
+- **Transient BFI 403:** a `403` that carries no challenge marker is treated as rate pressure. Retry up to three times with delays of approximately two, four, and six seconds plus jitter. Exhausting those retries is escalated to the challenge path.
+- **BFI challenge or rate-limit condition:** open the host-wide circuit breaker, as described below.
 - **BFI parser-contract error:** pause the affected watch, retain its last valid snapshot, and alert its owner once.
 - **Telegram delivery error:** retain a pending notification for retry.
 - **Database error:** fail the operation, log it, and do not emit a success-shaped response.
 
-A Cloudflare challenge or rate-limit condition is detected from 403/429 statuses, the `cf-mitigated` response header, and known interstitial markers. These responses are not retried immediately. Detection opens the persisted host-wide circuit breaker. No BFI requests are attempted until the next retry point, when one coordinator-owned request acts as the probe; its result either closes the circuit or advances the delay.
+A challenge or rate-limit condition is detected from a `429` status, from a `403` carrying the `cf-mitigated` response header, from a `403` that persists across the transient-403 retries, and from a `200` whose body is a Cloudflare interstitial rather than a parseable BFI document. The body check matters because a challenge page can return `200`; a document that parses as neither `articleContext` nor a seat map is inspected for interstitial markers before it is classified as a parser-contract error.
+
+These responses are not retried immediately. Detection opens the persisted host-wide circuit breaker. No BFI requests are attempted until the next retry point, when one coordinator-owned request acts as the probe; its result either closes the circuit or advances the delay.
 
 The retry sequence is:
 
@@ -357,7 +554,9 @@ The retry sequence is:
 
 Each delay receives positive jitter of up to 10 percent. Affected users receive one degraded-service alert, not one alert per watch. A successful probe closes the circuit, restores due scheduling, and sends one recovery alert.
 
-The service does not attempt to answer, bypass, outsource, or automate the challenge. If BFI permanently protects the public route, the service remains visibly degraded until an authorized data source or a separately approved design replaces the gateway.
+Sustained request rates provoke sporadic challenges even through an impersonating client, so the rate limits in the retrieval flow are a correctness requirement rather than politeness. The 15-minute minimum recurring interval, the two-request concurrency ceiling, the one-second minimum spacing, the response-coalescing window, and the exact-count filter that suppresses avoidable seat-map fetches together bound the load a full watch list can generate.
+
+The service does not attempt to answer, bypass, outsource, or automate a challenge once one is presented. Impersonating a browser's TLS fingerprint to read a public page is the transport the site requires of any client; responding to a challenge is not, and the circuit breaker exists so the service backs off instead. If BFI permanently protects the public route, the service remains visibly degraded until an authorized data source or a separately approved design replaces the gateway.
 
 ## Operations and Security
 
@@ -369,18 +568,24 @@ Configuration is loaded from a user-owned file with mode `0600`:
 - `TELEGRAM_ALLOWED_USER_IDS`
 - `DATABASE_PATH`
 - `LOG_LEVEL`
-- `BFI_USER_AGENT`, containing a truthful service name and contact string
+- `BFI_IMPERSONATE_PROFILE`, the `curl_cffi` impersonation profile, defaulting to `chrome`
 
-Secrets are never stored in SQLite or written to logs. Logs are structured, redact URL tokens and Telegram credentials, and include watch/check correlation IDs. BFI HTML and transient `sToken` values are neither logged nor persisted. The single-instance lock is `<DATABASE_PATH>.lock` and is held for the process lifetime.
+There is no configurable `User-Agent`. The impersonation profile supplies a coherent browser header set, and overriding one header within it would both break the fingerprint and defeat the purpose of the transport.
+
+Secrets are never stored in SQLite or written to logs. Logs are structured, redact URL tokens and Telegram credentials, and include watch/check correlation IDs. BFI HTML, SVG bodies, and transient `sToken` values are neither logged nor persisted; only parsed records, statuses, and byte counts are retained. The single-instance lock is `<DATABASE_PATH>.lock` and is held for the process lifetime.
 
 ## Testing Strategy
 
 ### Unit Tests
 
-- URL normalization, host/path restrictions, and redirect validation.
-- `articleContext` extraction and required-field validation.
-- SVG seat parsing, access-seat exclusion, and category extraction.
-- Row spacing and aisle-aware adjacency.
+- URL normalization, host/path restrictions, slug reduction, and redirect validation.
+- Literal query-string construction, asserting that `::` in parameter names is never percent-encoded and that the `sToken` value is.
+- `articleContext` extraction, JavaScript-literal normalisation (bare keys, trailing commas, `\'` escapes), required-field validation, `object_type` filtering, and deduplication.
+- Pagination chain assembly from `sToken`, `articleId`, and `total_pages`, including a truncated or empty later page.
+- SVG seat parsing, duplicate outline/fill circle deduplication, price-zone resolution from the enclosing `<g>`, unlisted-zone fallback, access-seat exclusion by zone label and by `data-tsmessage`, and treatment of `O` as unofferable.
+- Performance eligibility filtering on `sales_status`, `options` containing `2`, and `availability_num` against requested quantity.
+- Challenge classification: `429`, `403` with `cf-mitigated`, repeated `403` without it, and a `200` interstitial body.
+- Row spacing and aisle-aware adjacency, including rows whose letters skip `I` and `O`.
 - Every sliding block for quantities one through eight.
 - View-score formula, explicit preferences, quality bands, time tie-breaks, and deterministic final ordering.
 - Date/time filtering across daylight-saving changes and midnight-wrapping time windows.
@@ -391,22 +596,24 @@ Secrets are never stored in SQLite or written to logs. Logs are structured, reda
 - Telegram wizard and command handlers with fake updates and callback ownership checks.
 - SQLite migrations, transactions, restart recovery, retention, and cascade deletion using temporary databases.
 - Scheduler due-time and circuit-breaker behavior with a fake clock and deterministic jitter.
-- HTTP-mocked end-to-end checks for available, no-match, sold-out, malformed, 5xx, 403, 429, and recovery responses.
+- HTTP-mocked end-to-end checks for available, no-match, sold-out, unreserved-seating, malformed, 5xx, transient 403, challenged 403, 429, interstitial 200, and recovery responses.
+- Rate-limit conformance: concurrency ceiling, minimum request spacing, and coalescing window under a fake clock.
 - Telegram delivery failure followed by idempotent retry.
 
-Fixtures are minimal synthetic HTML/SVG documents that preserve the required contract without committing full BFI pages.
+Fixtures are minimal synthetic HTML/SVG documents that preserve the required contract without committing full BFI pages. No test makes a live BFI request.
 
 ### Manual Contract Smoke Test
 
-A separately invoked smoke test performs one film-page GET and one seat-map GET for a supplied live performance. It verifies parsing and reports contract drift. It is not part of normal automated test runs and does not poll.
+A separately invoked smoke test performs one film-page GET, its pagination chain, and one seat-map GET for one returned performance. It asserts that each response is `HTTP 200`, that `articleContext` parses into performance records with every consumed field present, that the seat map parses into deduplicated seats carrying status, row, seat, coordinates, and price zone, and that `availability_num` equals the count of `data-status="A"` for that performance. It reports contract drift and the observed impersonation profile. It is not part of normal automated test runs, does not scan the programme, and does not poll.
 
 ## Acceptance Criteria
 
-1. Given a valid BFI IMAX film URL, date/time criteria, and quantity, the bot returns every distinct eligible contiguous block for every matching on-sale performance.
+1. Given a valid BFI IMAX film URL, date/time criteria, and quantity, the bot returns every distinct eligible contiguous block for every matching on-sale performance, across the complete paginated performance list rather than the first page alone.
 2. Results follow the approved preference, view-quality, and preferred-time ordering and remain deterministic across repeated runs over identical input.
 3. Every result link opens the correct BFI performance seat map and requires the user to select seats and complete purchase manually.
 4. Recurring watches run no more frequently than configured, survive service restarts, and expire after their date range.
 5. A new or improved option sends one digest; an unchanged result sends none.
 6. Unauthorized Telegram users cannot create, inspect, mutate, or page through watches.
-7. Retrieval, parser, Cloudflare, and delivery failures are visible and never presented as no ticket availability.
-8. The service never performs a BFI write action or automated access-control challenge handling.
+7. Retrieval, parser, challenge, and delivery failures are visible and never presented as no ticket availability.
+8. The service never performs a BFI write action and never attempts to answer or bypass an access-control challenge; a detected challenge opens the circuit breaker and degrades the service visibly.
+9. Every BFI request goes through the shared Chrome-impersonating session with literal `::` parameter names, and observed rate limits hold under a full watch list.
