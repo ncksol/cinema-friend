@@ -8,6 +8,7 @@ not exist at all.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 
@@ -15,7 +16,7 @@ import pytest
 
 from cinema_friend.domain.errors import InputError
 from cinema_friend.domain.state import WatchMode, WatchStatus
-from cinema_friend.domain.watch import WatchCriteria
+from cinema_friend.domain.watch import Watch, WatchCriteria
 from cinema_friend.services.watch_service import WatchService
 from cinema_friend.storage.database import Database
 from cinema_friend.storage.watch_repository import WatchRepository
@@ -60,6 +61,20 @@ def fake_clock() -> FakeClock:
 @pytest.fixture
 def service(database: Database, fake_clock: FakeClock) -> WatchService:
     return WatchService(database, WatchRepository(), fake_clock)
+
+
+async def _force_status(database: Database, watch: Watch, status: WatchStatus) -> Watch:
+    """Write ``watch`` back with ``status``, bypassing the service under test.
+
+    Only the lifecycle guards in :class:`WatchService` decide what status transitions
+    are legal; this helper exists purely to plant a watch in a state
+    ``pause``/``resume`` should never themselves produce (``COMPLETED``, ``EXPIRED``,
+    ``FAILED``), so those guards can be exercised directly.
+    """
+    forced = replace(watch, status=status)
+    async with database.connection() as conn, database.transaction(conn):
+        await WatchRepository().update(conn, forced)
+    return forced
 
 
 # ---------------------------------------------------------------------------
@@ -147,7 +162,7 @@ async def test_pause_rejects_a_different_owner(service: WatchService) -> None:
 
 
 async def test_pause_clears_the_next_check(service: WatchService) -> None:
-    watch = await service.create(11, criteria())
+    watch = await service.create(11, recurring_criteria())
 
     paused = await service.pause(owner_user_id=11, watch_id=watch.watch_id)
 
@@ -174,6 +189,68 @@ async def test_resume_schedules_an_immediate_check(
 
     assert resumed.status is WatchStatus.ACTIVE
     assert resumed.next_check_at == fake_clock.now()
+
+
+# ---------------------------------------------------------------------------
+# Pause / resume lifecycle guards: terminal states and one-off mode
+# ---------------------------------------------------------------------------
+#
+# ``pause`` only ever moves ACTIVE -> PAUSED; ``resume`` only ever moves
+# PAUSED -> ACTIVE. Every other combination -- a terminal status the checker owns
+# (COMPLETED/EXPIRED/FAILED), or a ONE_OFF watch that was never eligible for either
+# transition in the first place -- must be rejected with the identical
+# ``InputError("watch not found")`` used for a missing or non-owned watch. Reusing that
+# one message keeps "wrong state" indistinguishable from "not yours" or "does not
+# exist": the caller learns only that the operation did not happen, never why.
+
+_TERMINAL_STATUSES = (WatchStatus.COMPLETED, WatchStatus.EXPIRED, WatchStatus.FAILED)
+
+
+@pytest.mark.parametrize("status", _TERMINAL_STATUSES)
+async def test_pause_rejects_a_terminal_recurring_watch(
+    service: WatchService, database: Database, status: WatchStatus
+) -> None:
+    watch = await service.create(11, recurring_criteria())
+    await _force_status(database, watch, status)
+
+    with pytest.raises(InputError, match="watch not found"):
+        await service.pause(11, watch.watch_id)
+
+
+async def test_pause_rejects_a_one_off_watch(service: WatchService) -> None:
+    watch = await service.create(11, criteria())
+    assert watch.status is WatchStatus.ACTIVE  # sanity: this is not a terminal-state case
+
+    with pytest.raises(InputError, match="watch not found"):
+        await service.pause(11, watch.watch_id)
+
+
+@pytest.mark.parametrize("status", _TERMINAL_STATUSES)
+async def test_resume_rejects_a_terminal_recurring_watch(
+    service: WatchService, database: Database, status: WatchStatus
+) -> None:
+    watch = await service.create(11, recurring_criteria())
+    await _force_status(database, watch, status)
+
+    with pytest.raises(InputError, match="watch not found"):
+        await service.resume(11, watch.watch_id)
+
+
+async def test_resume_rejects_an_already_active_recurring_watch(service: WatchService) -> None:
+    """Resume applies only to PAUSED watches; an ACTIVE one is not resumable again."""
+    watch = await service.create(11, recurring_criteria())
+
+    with pytest.raises(InputError, match="watch not found"):
+        await service.resume(11, watch.watch_id)
+
+
+async def test_resume_rejects_a_one_off_watch(service: WatchService, database: Database) -> None:
+    watch = await service.create(11, criteria())
+    paused = await _force_status(database, watch, WatchStatus.PAUSED)
+    assert paused.status is WatchStatus.PAUSED  # sanity: only the mode should block resume
+
+    with pytest.raises(InputError, match="watch not found"):
+        await service.resume(11, watch.watch_id)
 
 
 # ---------------------------------------------------------------------------

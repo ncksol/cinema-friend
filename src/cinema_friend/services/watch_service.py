@@ -21,7 +21,7 @@ import aiosqlite
 from cinema_friend.bfi.urls import parse_article_url
 from cinema_friend.clock import Clock
 from cinema_friend.domain.errors import InputError
-from cinema_friend.domain.state import WatchStatus
+from cinema_friend.domain.state import WatchMode, WatchStatus
 from cinema_friend.domain.watch import Watch, WatchCriteria
 from cinema_friend.storage.database import Database
 from cinema_friend.storage.watch_repository import WatchRepository
@@ -73,11 +73,20 @@ class WatchService:
     async def pause(self, owner_user_id: int, watch_id: UUID) -> Watch:
         """Stop scheduling checks for a watch its owner controls.
 
+        Only an ``ACTIVE`` ``RECURRING`` watch can be paused -- a ``ONE_OFF`` watch was
+        never eligible in the first place, and a watch already in a terminal state
+        (``COMPLETED``/``EXPIRED``/``FAILED``) or already ``PAUSED`` has nothing to stop.
+        Any of those cases raises the identical not-found error a missing or
+        non-owned watch would, so an invalid operation on your own watch never reveals
+        more than "that did not happen" -- the same guarantee ownership already gets.
+
         Clears ``next_check_at`` so a paused watch can never be picked up as due; only
         :meth:`resume` puts it back on the schedule.
         """
         async with self._database.connection() as conn, self._database.transaction(conn):
             watch = await self._fetch_owned(conn, owner_user_id, watch_id)
+            if watch.criteria.mode is not WatchMode.RECURRING or watch.status is not WatchStatus.ACTIVE:
+                raise InputError(_NOT_FOUND)
             paused = replace(
                 watch,
                 status=WatchStatus.PAUSED,
@@ -88,7 +97,13 @@ class WatchService:
         return paused
 
     async def resume(self, owner_user_id: int, watch_id: UUID) -> Watch:
-        """Reactivate a watch and schedule an immediate check.
+        """Reactivate a paused watch and schedule an immediate check.
+
+        Only a ``PAUSED`` ``RECURRING`` watch can be resumed -- a ``ONE_OFF`` watch was
+        never pausable, an already-``ACTIVE`` watch has nothing to resume, and a
+        terminal-state watch (``COMPLETED``/``EXPIRED``/``FAILED``) is done. Any of
+        those cases raises the same not-found error as a missing or non-owned watch,
+        for the same reason :meth:`pause` does.
 
         Resuming, like creating, is the owner explicitly asking to hear the current
         state again, so the very next check is scheduled for now rather than waiting for
@@ -96,6 +111,8 @@ class WatchService:
         """
         async with self._database.connection() as conn, self._database.transaction(conn):
             watch = await self._fetch_owned(conn, owner_user_id, watch_id)
+            if watch.criteria.mode is not WatchMode.RECURRING or watch.status is not WatchStatus.PAUSED:
+                raise InputError(_NOT_FOUND)
             now = self._clock.now()
             resumed = replace(
                 watch,

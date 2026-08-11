@@ -75,25 +75,31 @@ _WORSE_OPTION = ranked_option("K1-K2", _WORSE)
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("trigger", [CheckTrigger.MANUAL])
-def test_manual_trigger_always_requires_a_snapshot_even_with_no_change(
+@pytest.mark.parametrize("trigger", [CheckTrigger.MANUAL, CheckTrigger.CREATION])
+def test_manual_and_creation_triggers_always_require_a_snapshot_even_with_no_change(
     trigger: CheckTrigger,
 ) -> None:
-    """Creation reuses the manual-check path, so it must respond immediately too."""
+    """Both an explicit ``/check`` and the immediate check a new watch schedules must
+    respond, even when nothing changed since the owner was last told."""
     decision = decide_result_notification(
         trigger,
         (_GOOD_OPTION,),
         known_keys=frozenset({_GOOD_OPTION.key}),
         last_best=_GOOD,
+        recipient_user_id=11,
     )
 
     assert decision.requires_snapshot is True
     assert decision.kind == "results"
+    assert decision.recipient_user_id == 11
 
 
-def test_manual_trigger_requires_a_snapshot_even_with_no_options() -> None:
+@pytest.mark.parametrize("trigger", [CheckTrigger.MANUAL, CheckTrigger.CREATION])
+def test_manual_and_creation_triggers_require_a_snapshot_even_with_no_options(
+    trigger: CheckTrigger,
+) -> None:
     decision = decide_result_notification(
-        CheckTrigger.MANUAL, (), known_keys=frozenset(), last_best=None
+        trigger, (), known_keys=frozenset(), last_best=None, recipient_user_id=11
     )
 
     assert decision.requires_snapshot is True
@@ -101,25 +107,36 @@ def test_manual_trigger_requires_a_snapshot_even_with_no_options() -> None:
     assert decision.best_rank is None
 
 
-def test_scheduled_unchanged_options_produce_no_delivery() -> None:
+@pytest.mark.parametrize("trigger", [CheckTrigger.SCHEDULED, CheckTrigger.RECOVERY])
+def test_scheduled_and_recovery_triggers_produce_no_delivery_when_unchanged(
+    trigger: CheckTrigger,
+) -> None:
+    """A system-initiated recheck -- scheduled or post-recovery -- is change-only,
+    just like a scheduled one: neither is the owner asking, so silence is correct
+    when nothing new or better appeared."""
     decision = decide_result_notification(
-        CheckTrigger.SCHEDULED,
+        trigger,
         (_GOOD_OPTION,),
         known_keys=frozenset({_GOOD_OPTION.key}),
         last_best=_GOOD,
+        recipient_user_id=11,
     )
 
     assert decision.requires_snapshot is False
     assert decision.new_option_keys == frozenset()
 
 
-def test_scheduled_never_surfaced_lower_ranked_option_still_notifies_once() -> None:
+@pytest.mark.parametrize("trigger", [CheckTrigger.SCHEDULED, CheckTrigger.RECOVERY])
+def test_scheduled_and_recovery_triggers_notify_once_for_a_never_surfaced_option(
+    trigger: CheckTrigger,
+) -> None:
     """A brand-new option is worth telling the owner about even if it ranks worst."""
     decision = decide_result_notification(
-        CheckTrigger.SCHEDULED,
+        trigger,
         (_GOOD_OPTION, _WORSE_OPTION),
         known_keys=frozenset({_GOOD_OPTION.key}),
         last_best=_GOOD,
+        recipient_user_id=11,
     )
 
     assert decision.requires_snapshot is True
@@ -135,6 +152,7 @@ def test_scheduled_known_option_with_a_better_rank_notifies_once() -> None:
         (_BETTER_OPTION,),
         known_keys=frozenset({_BETTER_OPTION.key}),
         last_best=_GOOD,
+        recipient_user_id=11,
     )
 
     assert decision.requires_snapshot is True
@@ -149,6 +167,7 @@ def test_scheduled_disappearance_is_silent() -> None:
         (_WORSE_OPTION,),
         known_keys=frozenset({_GOOD_OPTION.key, _WORSE_OPTION.key}),
         last_best=_GOOD,
+        recipient_user_id=11,
     )
 
     assert decision.requires_snapshot is False
@@ -161,10 +180,25 @@ def test_scheduled_worse_only_change_is_silent() -> None:
         (_WORSE_OPTION,),
         known_keys=frozenset({_WORSE_OPTION.key}),
         last_best=_GOOD,
+        recipient_user_id=11,
     )
 
     assert decision.requires_snapshot is False
     assert decision.best_rank == _WORSE
+
+
+def test_decision_carries_the_recipient_user_id_unchanged() -> None:
+    """``NotificationDecision`` must name who it is for; Task 11 persists deliveries
+    keyed on this recipient and cannot derive it from anything else in the decision."""
+    decision = decide_result_notification(
+        CheckTrigger.MANUAL,
+        (),
+        known_keys=frozenset(),
+        last_best=None,
+        recipient_user_id=42,
+    )
+
+    assert decision.recipient_user_id == 42
 
 
 # ---------------------------------------------------------------------------

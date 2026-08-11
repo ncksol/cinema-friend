@@ -22,6 +22,7 @@ class WatchStatus(Enum):
 class CheckTrigger(Enum):
     SCHEDULED = "scheduled"
     MANUAL = "manual"
+    CREATION = "creation"
     RECOVERY = "recovery"
 
 
