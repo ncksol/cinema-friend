@@ -27,5 +27,14 @@ class PersistenceError(Exception):
     """Raised on database read/write failures."""
 
 
+class ConflictError(Exception):
+    """Raised when persisted state changed under a unit of work that had already read it.
+
+    Distinct from :class:`PersistenceError`: the database is healthy and did exactly what
+    it was told. Someone else legitimately changed the row first, and the losing caller
+    must abandon its work rather than write over the winner.
+    """
+
+
 class DeliveryError(Exception):
     """Raised when a Telegram notification cannot be delivered."""

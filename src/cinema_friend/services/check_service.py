@@ -14,6 +14,12 @@ lock across the fetch would serialise every other watch in the process behind on
 host. ``started_at`` is captured before the fetch, so the persisted check run still
 records when the work really began rather than when it finished.
 
+That window is long enough for the watch to be paused, deleted, or edited under a
+running check, so the watch is re-read and re-compared inside the transaction before
+anything is written, and the check is abandoned if it no longer matches. The lock this
+service does not hold during the fetch is exactly the lock a concurrent lifecycle
+action needs, and the point of not holding it is that those actions get to win.
+
 One piece of state deliberately escapes the transaction: the host circuit breaker.
 The transport owns it and writes it through its own connection, precisely so that a
 rolled-back check cannot also roll back the evidence that a host is unhealthy. This
@@ -44,6 +50,7 @@ from cinema_friend.domain.errors import (
     BfiContractError,
     BfiNetworkError,
     CircuitOpenError,
+    ConflictError,
     InputError,
     PersistenceError,
 )
@@ -56,7 +63,9 @@ from cinema_friend.domain.results import (
 from cinema_friend.domain.state import CheckOutcome, CheckTrigger, WatchMode, WatchStatus
 from cinema_friend.domain.watch import Watch
 from cinema_friend.services.notification_policy import (
-    HostNotification,
+    QueuedNotification,
+    circuit_records_incident,
+    decide_contract_error_notification,
     decide_degradation_notification,
     decide_recovery_notification,
     decide_result_notification,
@@ -72,6 +81,11 @@ logger = logging.getLogger(__name__)
 
 _NOT_FOUND = "watch not found"
 _RESULTS_KIND = "results"
+
+#: Raised when the watch changed under a check that had already read it. The check is
+#: abandoned rather than reconciled: it ranked against criteria, and decided a schedule,
+#: that no longer describe the watch it would be writing to.
+_CONFLICT = "watch changed while its check was running"
 
 #: Upper bound on the proportional jitter added to a recurring watch's interval, so a
 #: fleet of watches created together does not stay in lockstep against one host.
@@ -136,6 +150,11 @@ class CheckService:
         the scheduler must be able to act on. Anything unanticipated propagates
         untouched: laundering an unknown defect into a tidy ``CheckResult`` would hide
         a bug behind a row that claims the system merely had a bad network day.
+
+        ``ConflictError`` propagates for the same reason. A watch that changed mid-check
+        has no outcome to record -- the run was abandoned, not failed -- and the caller
+        needs to know the difference between a check that decided something and one that
+        found it was no longer entitled to.
         """
         watch = await self._load_watch(watch_id)
         started_at = self._clock.now()
@@ -222,7 +241,7 @@ class CheckService:
         circuit = (
             await self._circuits.load(_host_of(watch)) if trigger is CheckTrigger.RECOVERY else None
         )
-        async with self._write() as conn:
+        async with self._write(watch) as conn:
             check_run_id = await self._results.start_check(
                 conn, watch_id=watch.watch_id, trigger=trigger, started_at=started_at
             )
@@ -256,9 +275,9 @@ class CheckService:
                     ),
                     completed_at,
                 )
-            if circuit is not None:
+            if circuit is not None and circuit_records_incident(circuit):
                 owners = await self._watches.list_active_owner_ids(conn, circuit.host)
-                await self._queue_host_alerts(
+                await self._queue_alerts(
                     conn, decide_recovery_notification(circuit, owners), completed_at
                 )
         return CheckResult(
@@ -321,12 +340,17 @@ class CheckService:
     async def _persist_contract_error(
         self, watch: Watch, trigger: CheckTrigger, started_at: datetime, error: BfiContractError
     ) -> CheckResult:
-        """Pause the watch: the page no longer looks like anything we can parse.
+        """Pause the watch, keep its last good snapshot, and tell its owner once.
 
         Retrying cannot help. Either the site changed shape or the watch points at
         something that is not a film page, and both need a human. Pausing clears
         ``next_run_at`` so the scheduler stops burning requests on it, while the last
         good snapshot is left in place so the user can still see what was found.
+
+        A paused watch that says nothing is indistinguishable from a working one that
+        keeps finding nothing, so the owner is alerted -- once per watch, whatever the
+        parse does next -- in the same transaction that pauses it. A pause nobody was
+        told about, or an alert about a watch that is still running, are both wrong.
         """
         logger.warning("watch %s paused after contract error: %s", watch.watch_id, error)
         return await self._persist_failure(
@@ -339,6 +363,7 @@ class CheckService:
             error=error,
             status=WatchStatus.PAUSED,
             next_check_at=None,
+            owner_alerts=(decide_contract_error_notification(watch.watch_id, watch.user_id),),
         )
 
     async def _persist_network_error(
@@ -378,13 +403,14 @@ class CheckService:
         status: WatchStatus,
         next_check_at: datetime | None,
         degraded_circuit: HostCircuit | None = None,
+        owner_alerts: Sequence[QueuedNotification] = (),
     ) -> CheckResult:
-        """Record the failed run and the watch's new state in one transaction."""
+        """Record the failed run, the watch's new state, and any alert, in one transaction."""
         if status is WatchStatus.BACKOFF and next_check_at is None:
             # Only reachable if a host failure surfaced without an open circuit behind
             # it. Leaving next_run_at unset would strand the watch permanently.
             next_check_at = completed_at + _FALLBACK_BACKOFF
-        async with self._write() as conn:
+        async with self._write(watch) as conn:
             check_run_id = await self._results.start_check(
                 conn, watch_id=watch.watch_id, trigger=trigger, started_at=started_at
             )
@@ -408,9 +434,10 @@ class CheckService:
             )
             if degraded_circuit is not None:
                 owners = await self._watches.list_active_owner_ids(conn, degraded_circuit.host)
-                await self._queue_host_alerts(
+                await self._queue_alerts(
                     conn, decide_degradation_notification(degraded_circuit, owners), completed_at
                 )
+            await self._queue_alerts(conn, owner_alerts, completed_at)
         return CheckResult(
             check_run_id=check_run_id,
             watch_id=watch.watch_id,
@@ -422,10 +449,10 @@ class CheckService:
             error_detail=str(error),
         )
 
-    async def _queue_host_alerts(
+    async def _queue_alerts(
         self,
         conn: aiosqlite.Connection,
-        alerts: Sequence[HostNotification],
+        alerts: Sequence[QueuedNotification],
         now: datetime,
     ) -> None:
         for alert in alerts:
@@ -470,16 +497,32 @@ class CheckService:
         return completed_at + interval + interval * self._jitter()
 
     @asynccontextmanager
-    async def _write(self) -> AsyncIterator[aiosqlite.Connection]:
-        """Open the one transaction a check commits through.
+    async def _write(self, observed: Watch) -> AsyncIterator[aiosqlite.Connection]:
+        """Open the one transaction a check commits through, if the watch still matches.
 
-        Repository transactions nest as savepoints inside it, so each repository keeps
-        its own atomicity guarantee while the check as a whole still commits or vanishes
-        as a unit. Storage faults are re-raised as ``PersistenceError`` so callers see
-        one typed failure rather than a driver exception leaking upward.
+        A check reads its watch, then spends seconds on the network with nothing held.
+        A pause, a delete, an edit, or another check can all land in that window, so the
+        watch is re-read as the first statement inside the transaction and compared with
+        what this check actually worked from. Any difference at all -- status, criteria,
+        schedule, or a row that has since been deleted -- aborts before a single write.
+
+        ``BEGIN IMMEDIATE`` takes the write lock before that re-read, so nothing can slip
+        between the comparison and the writes it authorises. Aborting raises rather than
+        reconciling: the results were ranked against criteria, and the schedule computed
+        from an interval, that may no longer be the watch's. Writing them anyway would
+        undo a deliberate lifecycle action -- reviving a paused watch, or resurrecting a
+        deleted one as a foreign-key error at best.
+
+        Repository transactions nest as savepoints inside this one, so each repository
+        keeps its own atomicity guarantee while the check as a whole still commits or
+        vanishes as a unit. Storage faults are re-raised as ``PersistenceError`` so
+        callers see one typed failure rather than a driver exception leaking upward.
         """
         try:
             async with self._database.connection() as conn, self._database.transaction(conn):
+                current = await self._watches.get(conn, observed.watch_id)
+                if current != observed:
+                    raise ConflictError(f"{_CONFLICT}: {observed.watch_id}")
                 yield conn
         except sqlite3.Error as error:
             raise PersistenceError(str(error)) from error

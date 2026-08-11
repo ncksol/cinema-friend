@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+from uuid import UUID
 
 from cinema_friend.domain.results import HostCircuit, NotificationPayload, RankedOption, RankVector
 from cinema_friend.domain.state import CheckTrigger
@@ -18,6 +19,7 @@ from cinema_friend.domain.state import CheckTrigger
 _RESULTS_KIND = "results"
 _DEGRADATION_KIND = "degradation"
 _RECOVERY_KIND = "recovery"
+_CONTRACT_ERROR_KIND = "contract_error"
 _RECOVERY_TEXT = "back online"
 
 # Both an explicit "/check" and the immediate check a new watch schedules on creation
@@ -53,8 +55,14 @@ class NotificationDecision:
 
 
 @dataclass(frozen=True, slots=True)
-class HostNotification:
-    """One recipient's host alert, paired with its deterministic idempotency key."""
+class QueuedNotification:
+    """One deliverable message paired with its deterministic idempotency key.
+
+    Host alerts key on host, generation, kind, and owner; a watch-scoped alert keys on
+    the watch. Either way the key is derived from the fact being announced rather than
+    from the attempt announcing it, so replaying a decision cannot produce a second
+    message.
+    """
 
     idempotency_key: str
     payload: NotificationPayload
@@ -108,7 +116,7 @@ def _host_notifications(
     *,
     kind: str,
     recovery_text: str | None,
-) -> tuple[HostNotification, ...]:
+) -> tuple[QueuedNotification, ...]:
     """One notification per distinct owner, keyed by host, generation, kind, and owner.
 
     Deduplicating owners first is what keeps a user with several watches against the
@@ -117,7 +125,7 @@ def _host_notifications(
     the same, single delivery.
     """
     return tuple(
-        HostNotification(
+        QueuedNotification(
             idempotency_key=f"{circuit.host}:{circuit.generation}:{kind}:{owner_user_id}",
             payload=NotificationPayload(
                 kind=kind,
@@ -133,17 +141,62 @@ def _host_notifications(
     )
 
 
+def circuit_records_incident(circuit: HostCircuit) -> bool:
+    """Whether ``circuit`` has ever been tripped by a real host failure.
+
+    ``generation`` advances only when a closed circuit trips, so a generation of zero
+    means no incident was ever recorded for this host -- whatever the circuit's current
+    state happens to be. That is the only honest evidence that a host was reported down,
+    and therefore the only thing that makes "it is back" true.
+    """
+    return circuit.generation >= 1
+
+
 def decide_degradation_notification(
     circuit: HostCircuit, owner_user_ids: Iterable[int]
-) -> tuple[HostNotification, ...]:
+) -> tuple[QueuedNotification, ...]:
     """Return one degradation alert per distinct owner of a watch against ``circuit``."""
     return _host_notifications(circuit, owner_user_ids, kind=_DEGRADATION_KIND, recovery_text=None)
 
 
 def decide_recovery_notification(
     circuit: HostCircuit, owner_user_ids: Iterable[int]
-) -> tuple[HostNotification, ...]:
-    """Return one recovery alert per distinct owner of a watch against ``circuit``."""
+) -> tuple[QueuedNotification, ...]:
+    """Return one recovery alert per distinct owner of a watch against ``circuit``.
+
+    Nothing is announced for a circuit that records no incident. A watch can enter
+    backoff without the host ever being implicated -- exhausted network retries put it
+    there on its own schedule -- and its probe succeeding is then just a check that
+    worked, not a host coming back. Sending on that would tell every owner of a watch on
+    the host about an outage none of them was told about, and would consume the
+    generation-0 idempotency key so the *real* first recovery could never be sent.
+    """
+    if not circuit_records_incident(circuit):
+        return ()
     return _host_notifications(
         circuit, owner_user_ids, kind=_RECOVERY_KIND, recovery_text=_RECOVERY_TEXT
+    )
+
+
+def decide_contract_error_notification(
+    watch_id: UUID, recipient_user_id: int
+) -> QueuedNotification:
+    """Return the single alert owed to the owner of a watch paused by a contract error.
+
+    Keyed on the watch alone, so however many times the parse fails -- and however many
+    times the failure is retried -- the owner is told once that this watch has stopped.
+    The payload carries identity only: which watch, whose it is. Nothing here decides how
+    it reads, because rendering is Task 14's contract, not this module's.
+    """
+    return QueuedNotification(
+        idempotency_key=f"{_CONTRACT_ERROR_KIND}:{watch_id}",
+        payload=NotificationPayload(
+            kind=_CONTRACT_ERROR_KIND,
+            recipient_user_id=recipient_user_id,
+            watch_id=watch_id,
+            snapshot_id=None,
+            new_option_count=0,
+            host=None,
+            recovery_text=None,
+        ),
     )

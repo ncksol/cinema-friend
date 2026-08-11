@@ -19,9 +19,10 @@ The three things these tests exist to pin down are:
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
-from collections.abc import AsyncIterator, Sequence
-from dataclasses import dataclass
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -37,6 +38,7 @@ from cinema_friend.domain.errors import (
     BfiContractError,
     BfiNetworkError,
     CircuitOpenError,
+    ConflictError,
     InputError,
     PersistenceError,
 )
@@ -50,6 +52,7 @@ from cinema_friend.domain.results import (
 from cinema_friend.domain.state import CheckOutcome, CheckTrigger, WatchMode, WatchStatus
 from cinema_friend.domain.watch import Watch, WatchCriteria
 from cinema_friend.services.check_service import CheckService
+from cinema_friend.services.watch_service import WatchService
 from cinema_friend.storage.circuit_repository import SqliteCircuitStore
 from cinema_friend.storage.database import Database
 from cinema_friend.storage.notification_repository import NotificationRepository
@@ -139,7 +142,12 @@ def centre_pair_map(performance_id: str = PERF_1) -> SeatMap:
 
 
 class FakeGateway:
-    """Serves canned performances and seat maps, recording which maps were asked for."""
+    """Serves canned performances and seat maps, recording which maps were asked for.
+
+    ``list_gate`` lets a test hold a check inside its network phase: the check has
+    already read its watch and has no connection open, which is exactly the window a
+    concurrent pause, delete, or edit lands in.
+    """
 
     def __init__(self) -> None:
         self.performances: list[Performance] = []
@@ -147,8 +155,13 @@ class FakeGateway:
         self.seat_map_calls: list[str] = []
         self.list_error: BaseException | None = None
         self.map_error: BaseException | None = None
+        self.list_entered = asyncio.Event()
+        self.list_gate: asyncio.Event | None = None
 
     async def list_performances(self, slug: str) -> tuple[Performance, ...]:
+        self.list_entered.set()
+        if self.list_gate is not None:
+            await self.list_gate.wait()
         if self.list_error is not None:
             raise self.list_error
         return tuple(self.performances)
@@ -259,6 +272,33 @@ class Harness:
         async with self.database.connection() as conn:
             return [w.watch_id for w in await self.watches.list_due(conn, now)]
 
+    def watch_service(self) -> WatchService:
+        """A second service over the same database, standing in for a concurrent caller."""
+        return WatchService(self.database, WatchRepository(), self.clock)
+
+    async def check_during_fetch(
+        self,
+        watch_id: UUID,
+        trigger: CheckTrigger,
+        interleaved: Callable[[], Awaitable[None]],
+    ) -> None:
+        """Run ``interleaved`` while a check is parked in its network phase.
+
+        The check task blocks inside ``list_performances``, so it has already read its
+        watch and holds no connection; ``interleaved`` then runs to completion on its own
+        connection before the fetch is released. That is the real interleaving a slow BFI
+        response creates, made deterministic rather than timing-dependent.
+        """
+        gate = asyncio.Event()
+        self.gateway.list_gate = gate
+        task = asyncio.create_task(self.service.check(watch_id, trigger))
+        try:
+            await asyncio.wait_for(self.gateway.list_entered.wait(), timeout=5)
+            await interleaved()
+        finally:
+            gate.set()
+        await task
+
 
 def build_service(
     harness_parts: tuple[Database, FakeClock, FakeGateway, SqliteCircuitStore],
@@ -302,12 +342,17 @@ async def harness(tmp_path: Path) -> AsyncIterator[Harness]:
     )
 
 
-async def seed_open_circuit(
-    harness: Harness, *, next_probe: datetime, generation: int = 1, backoff_step: int = 0
+async def seed_circuit(
+    harness: Harness,
+    *,
+    state: CircuitState = CircuitState.OPEN,
+    next_probe: datetime | None = None,
+    generation: int = 1,
+    backoff_step: int = 0,
 ) -> HostCircuit:
     circuit = HostCircuit(
         host=HOST,
-        state=CircuitState.OPEN,
+        state=state,
         backoff_step=backoff_step,
         generation=generation,
         next_probe=next_probe,
@@ -315,6 +360,18 @@ async def seed_open_circuit(
     )
     await harness.circuits.save(circuit)
     return circuit
+
+
+async def seed_open_circuit(
+    harness: Harness, *, next_probe: datetime, generation: int = 1, backoff_step: int = 0
+) -> HostCircuit:
+    return await seed_circuit(
+        harness,
+        state=CircuitState.OPEN,
+        next_probe=next_probe,
+        generation=generation,
+        backoff_step=backoff_step,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -612,6 +669,72 @@ async def test_contract_error_pauses_the_watch_and_retains_the_latest_snapshot(
     assert kinds.count("contract") == 1
 
 
+async def test_contract_error_queues_one_alert_for_the_watch_owner(harness: Harness) -> None:
+    """A paused watch is silently dead unless its owner is told why it stopped."""
+    harness.gateway.list_error = BfiContractError("articleContext not found")
+    watch = await harness.add_watch(owner_user_id=77)
+
+    await harness.service.check(watch.watch_id, CheckTrigger.SCHEDULED)
+
+    deliveries = await harness.deliveries()
+    assert [delivery.payload.kind for delivery in deliveries] == ["contract_error"]
+    payload = deliveries[0].payload
+    assert payload.recipient_user_id == 77
+    assert payload.watch_id == watch.watch_id
+    assert payload.snapshot_id is None
+    assert payload.host is None
+    assert payload.recovery_text is None
+    assert deliveries[0].idempotency_key == f"contract_error:{watch.watch_id}"
+
+
+async def test_repeated_contract_errors_alert_the_owner_only_once(harness: Harness) -> None:
+    harness.gateway.list_error = BfiContractError("articleContext not found")
+    watch = await harness.add_watch()
+
+    await harness.service.check(watch.watch_id, CheckTrigger.SCHEDULED)
+    await harness.service.check(watch.watch_id, CheckTrigger.MANUAL)
+
+    deliveries = await harness.deliveries()
+    assert [delivery.payload.kind for delivery in deliveries] == ["contract_error"]
+    assert [row["outcome"] for row in await harness.check_runs()] == [
+        CheckOutcome.CONTRACT_ERROR.value,
+        CheckOutcome.CONTRACT_ERROR.value,
+    ]
+
+
+async def test_contract_alert_and_the_pause_are_committed_together(tmp_path: Path) -> None:
+    """No half state: either the owner is told and the watch is paused, or neither."""
+    database = Database(tmp_path / "cinema.db")
+    async with database.connection() as conn:
+        await database.migrate(conn)
+    clock = FakeClock(NOW)
+    gateway = FakeGateway()
+    gateway.list_error = BfiContractError("articleContext not found")
+    circuits = SqliteCircuitStore(database)
+    harness = Harness(
+        database=database,
+        clock=clock,
+        gateway=gateway,
+        circuits=circuits,
+        watches=WatchRepository(),
+        results=ResultRepository(database),
+        notifications=NotificationRepository(database),
+        service=build_service(
+            (database, clock, gateway, circuits),
+            notifications=ExplodingNotificationRepository(database),
+            jitter=0.0,
+        ),
+    )
+    watch = await harness.add_watch()
+
+    with pytest.raises(PersistenceError):
+        await harness.service.check(watch.watch_id, CheckTrigger.SCHEDULED)
+
+    assert await harness.check_runs() == []
+    assert await harness.watch(watch.watch_id) == watch
+    assert await harness.deliveries() == ()
+
+
 async def test_challenge_backs_off_until_the_persisted_host_probe_time(
     harness: Harness,
 ) -> None:
@@ -812,6 +935,168 @@ async def test_scheduled_success_on_a_backoff_watch_does_not_alert_recovery(
 
     assert [d.payload.kind for d in await harness.deliveries()] == ["results"]
     assert (await harness.watch(watch.watch_id)).status is WatchStatus.ACTIVE
+
+
+async def test_recovery_without_a_recorded_host_incident_announces_nothing(
+    harness: Harness,
+) -> None:
+    """A watch backed off by exhausted network retries never took the host down with it.
+
+    Nothing has touched the circuit, so it is closed at generation 0. Announcing "back
+    online" here would tell every owner on the host about an outage that never happened,
+    and would burn the generation-0 idempotency key while doing it.
+    """
+    harness.gateway.performances = [make_performance()]
+    harness.gateway.maps[PERF_1] = centre_pair_map()
+    watch = await harness.add_watch(status=WatchStatus.BACKOFF, next_check_at=NOW)
+
+    await harness.service.check(watch.watch_id, CheckTrigger.RECOVERY)
+
+    assert [d.payload.kind for d in await harness.deliveries()] == ["results"]
+    assert (await harness.watch(watch.watch_id)).status is WatchStatus.ACTIVE
+    assert (await harness.circuits.load(HOST)).generation == 0
+
+
+async def test_recovery_after_a_prior_incident_alerts_on_that_generation(
+    harness: Harness,
+) -> None:
+    """The transport's probe closes the circuit before the check returns; gen 3 still owns it."""
+    await seed_circuit(harness, state=CircuitState.CLOSED, generation=3, next_probe=None)
+    harness.gateway.performances = [make_performance()]
+    harness.gateway.maps[PERF_1] = centre_pair_map()
+    watch = await harness.add_watch(owner_user_id=11, status=WatchStatus.BACKOFF)
+
+    await harness.service.check(watch.watch_id, CheckTrigger.RECOVERY)
+
+    recoveries = [d for d in await harness.deliveries() if d.payload.kind == "recovery"]
+    assert [d.idempotency_key for d in recoveries] == [f"{HOST}:3:recovery:11"]
+
+
+async def test_a_second_recovery_in_one_generation_adds_no_second_alert(
+    harness: Harness,
+) -> None:
+    await seed_circuit(harness, state=CircuitState.CLOSED, generation=3)
+    harness.gateway.performances = [make_performance()]
+    harness.gateway.maps[PERF_1] = centre_pair_map()
+    first = await harness.add_watch(owner_user_id=11, status=WatchStatus.BACKOFF)
+    second = await harness.add_watch(owner_user_id=11, status=WatchStatus.BACKOFF)
+
+    await harness.service.check(first.watch_id, CheckTrigger.RECOVERY)
+    await harness.service.check(second.watch_id, CheckTrigger.RECOVERY)
+
+    recoveries = [d for d in await harness.deliveries() if d.payload.kind == "recovery"]
+    assert len(recoveries) == 1
+
+
+# ---------------------------------------------------------------------------
+# Concurrent lifecycle changes during the fetch
+# ---------------------------------------------------------------------------
+
+
+async def test_a_watch_paused_mid_fetch_is_not_dragged_back_onto_the_schedule(
+    harness: Harness,
+) -> None:
+    """Pause wins: the check that started before it must not resurrect the schedule."""
+    harness.gateway.performances = [make_performance()]
+    harness.gateway.maps[PERF_1] = centre_pair_map()
+    watch = await harness.add_watch(owner_user_id=11)
+
+    async def pause() -> None:
+        await harness.watch_service().pause(11, watch.watch_id)
+
+    with pytest.raises(ConflictError):
+        await harness.check_during_fetch(watch.watch_id, CheckTrigger.SCHEDULED, pause)
+
+    stored = await harness.watch(watch.watch_id)
+    assert stored.status is WatchStatus.PAUSED
+    assert stored.next_check_at is None
+    assert stored.last_check_at is None
+    assert await harness.check_runs() == []
+    assert await harness.latest_snapshot(watch.watch_id) is None
+    assert await harness.deliveries() == ()
+
+
+async def test_a_watch_deleted_mid_fetch_is_not_resurrected(harness: Harness) -> None:
+    """Deletion must abort the check outright, not surface as a foreign-key failure."""
+    harness.gateway.performances = [make_performance()]
+    harness.gateway.maps[PERF_1] = centre_pair_map()
+    watch = await harness.add_watch(owner_user_id=11)
+
+    async def delete() -> None:
+        await harness.watch_service().delete(11, watch.watch_id)
+
+    with pytest.raises(ConflictError):
+        await harness.check_during_fetch(watch.watch_id, CheckTrigger.MANUAL, delete)
+
+    async with harness.database.connection() as conn:
+        assert await harness.watches.get(conn, watch.watch_id) is None
+    assert await harness.check_runs() == []
+    assert await harness.deliveries() == ()
+
+
+async def test_a_watch_deleted_mid_fetch_records_no_failure_either(harness: Harness) -> None:
+    """The same guard covers the failure path, which writes a check run of its own."""
+    harness.gateway.list_error = BfiNetworkError("connection reset")
+    watch = await harness.add_watch(owner_user_id=11)
+
+    async def delete() -> None:
+        await harness.watch_service().delete(11, watch.watch_id)
+
+    with pytest.raises(ConflictError):
+        await harness.check_during_fetch(watch.watch_id, CheckTrigger.SCHEDULED, delete)
+
+    assert await harness.check_runs() == []
+
+
+async def test_criteria_edited_mid_fetch_abort_the_check_and_survive_it(
+    harness: Harness,
+) -> None:
+    """Results ranked against the old criteria must not be stored as the new ones' answer."""
+    harness.gateway.performances = [make_performance()]
+    harness.gateway.maps[PERF_1] = centre_pair_map()
+    watch = await harness.add_watch()
+    edited = replace(watch, criteria=criteria(quantity=4), updated_at=NOW + timedelta(seconds=1))
+
+    async def edit() -> None:
+        async with harness.database.connection() as conn, harness.database.transaction(conn):
+            await harness.watches.update(conn, edited)
+
+    with pytest.raises(ConflictError):
+        await harness.check_during_fetch(watch.watch_id, CheckTrigger.SCHEDULED, edit)
+
+    stored = await harness.watch(watch.watch_id)
+    assert stored == edited
+    assert await harness.check_runs() == []
+    assert await harness.latest_snapshot(watch.watch_id) is None
+
+
+async def test_a_concurrent_check_that_lands_first_aborts_the_slower_one(
+    harness: Harness,
+) -> None:
+    """Two checks on one watch produce one snapshot, not a blind overwrite of the newer."""
+    harness.gateway.performances = [make_performance()]
+    harness.gateway.maps[PERF_1] = centre_pair_map()
+    watch = await harness.add_watch()
+    fast_gateway = FakeGateway()
+    fast_gateway.performances = [make_performance()]
+    fast_gateway.maps[PERF_1] = centre_pair_map()
+    fast_service = build_service(
+        (harness.database, harness.clock, fast_gateway, harness.circuits),
+        notifications=harness.notifications,
+        jitter=0.0,
+    )
+
+    async def run_other_check() -> None:
+        await fast_service.check(watch.watch_id, CheckTrigger.MANUAL)
+
+    with pytest.raises(ConflictError):
+        await harness.check_during_fetch(watch.watch_id, CheckTrigger.SCHEDULED, run_other_check)
+
+    assert [row["trigger"] for row in await harness.check_runs()] == [CheckTrigger.MANUAL.value]
+    assert len(await harness.deliveries()) == 1
+    stored = await harness.watch(watch.watch_id)
+    assert stored.next_check_at == NOW
+    assert stored.last_check_at == NOW
 
 
 # ---------------------------------------------------------------------------

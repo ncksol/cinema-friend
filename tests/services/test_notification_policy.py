@@ -8,6 +8,7 @@ here needs a fixture beyond the values it is handed.
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from uuid import UUID
 
 import pytest
 
@@ -15,6 +16,8 @@ from cinema_friend.domain.bfi import Performance
 from cinema_friend.domain.results import CircuitState, HostCircuit, RankedOption, RankVector
 from cinema_friend.domain.state import CheckTrigger
 from cinema_friend.services.notification_policy import (
+    circuit_records_incident,
+    decide_contract_error_notification,
     decide_degradation_notification,
     decide_recovery_notification,
     decide_result_notification,
@@ -251,3 +254,63 @@ def test_degradation_and_recovery_keys_differ_by_generation() -> None:
 def test_host_alerts_with_no_owners_produce_nothing() -> None:
     assert decide_degradation_notification(_circuit(), owner_user_ids=[]) == ()
     assert decide_recovery_notification(_circuit(), owner_user_ids=[]) == ()
+
+
+def test_recovery_alert_is_withheld_when_no_incident_was_ever_recorded() -> None:
+    """A closed generation-0 circuit never broke, so there is nothing to announce.
+
+    A watch can sit in backoff for reasons the host knows nothing about -- an exhausted
+    network retry, say -- and its recovery probe must not tell every owner on that host
+    it is "back online" when it was never reported down.
+    """
+    assert (
+        decide_recovery_notification(
+            _circuit(generation=0, state=CircuitState.CLOSED), owner_user_ids=[11, 22]
+        )
+        == ()
+    )
+
+
+def test_recovery_alert_still_fires_once_the_circuit_has_closed_again() -> None:
+    """The probe that closes the circuit is exactly what makes recovery worth saying."""
+    notifications = decide_recovery_notification(
+        _circuit(generation=3, state=CircuitState.CLOSED), owner_user_ids=[11]
+    )
+
+    assert [item.idempotency_key for item in notifications] == ["whatson.bfi.org.uk:3:recovery:11"]
+
+
+@pytest.mark.parametrize("state", list(CircuitState))
+def test_circuit_records_incident_follows_the_generation_counter(state: CircuitState) -> None:
+    """Generation counts incidents; the current state says nothing about whether one happened."""
+    assert not circuit_records_incident(_circuit(generation=0, state=state))
+    assert circuit_records_incident(_circuit(generation=1, state=state))
+
+
+def test_contract_error_alert_is_keyed_once_per_watch() -> None:
+    watch_id = UUID("11111111-1111-4111-8111-111111111111")
+
+    first = decide_contract_error_notification(watch_id, recipient_user_id=11)
+    second = decide_contract_error_notification(watch_id, recipient_user_id=11)
+
+    assert first == second
+    assert first.idempotency_key == f"contract_error:{watch_id}"
+    assert first.payload.kind == "contract_error"
+    assert first.payload.recipient_user_id == 11
+    assert first.payload.watch_id == watch_id
+    assert first.payload.snapshot_id is None
+    assert first.payload.new_option_count == 0
+    assert first.payload.host is None
+    assert first.payload.recovery_text is None
+
+
+def test_contract_error_alerts_are_per_watch_not_per_owner() -> None:
+    """Two broken watches owned by one user are two separate things to tell them about."""
+    first = decide_contract_error_notification(
+        UUID("11111111-1111-4111-8111-111111111111"), recipient_user_id=11
+    )
+    second = decide_contract_error_notification(
+        UUID("22222222-2222-4222-8222-222222222222"), recipient_user_id=11
+    )
+
+    assert first.idempotency_key != second.idempotency_key
