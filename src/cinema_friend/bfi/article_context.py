@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -74,9 +75,10 @@ def _parse_context_dict(ctx: Mapping[str, object]) -> ArticlePage:
     results = _require_list(ctx, "searchResults")
     pagination = _require_dict(ctx, "pagination")
     article_id = _require_str(ctx, "articleId")
+    _validate_guid(article_id, "articleId")
     s_token = _require_str(ctx, "sToken")
-    current_page = int(_require_str(pagination, "current_page"))
-    total_pages = int(_require_str(pagination, "total_pages"))
+    current_page = _require_pagination_int(pagination, "current_page")
+    total_pages = _require_pagination_int(pagination, "total_pages")
 
     rows: list[Mapping[str, object]] = []
     for i, raw_row in enumerate(results):
@@ -115,10 +117,17 @@ def performance_from_row(row: Mapping[str, object]) -> Performance:
     sales_status = _require_str(row, "sales_status")
     availability_code = _require_str(row, "availability_code")
     availability_num = _require_int(row, "availability_num")
+    if availability_num < 0:
+        raise BfiContractError(
+            f"availability_num must be non-negative; got {availability_num}"
+        )
     reserved_seating = _require_bool(row, "reserved_seating")
     options = _require_str_list(row, "options")
 
-    start_london = datetime.strptime(start_date_raw, _START_FMT).replace(tzinfo=_LONDON)
+    try:
+        start_london = datetime.strptime(start_date_raw, _START_FMT).replace(tzinfo=_LONDON)
+    except ValueError as exc:
+        raise BfiContractError(f"start_date is not parseable: {start_date_raw!r}") from exc
     start_utc = start_london.astimezone(UTC)
 
     seat_map = _seat_map_url(performance_id)
@@ -129,7 +138,7 @@ def performance_from_row(row: Mapping[str, object]) -> Performance:
         start_utc=start_utc,
         sales_status_code=sales_status,
         availability_code=availability_code,
-        availability_num=max(0, availability_num),
+        availability_num=availability_num,
         reserved_seating=reserved_seating,
         seat_map_url=seat_map,
         options=tuple(options),
@@ -139,6 +148,21 @@ def performance_from_row(row: Mapping[str, object]) -> Performance:
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+
+def _validate_guid(value: str, field: str) -> None:
+    try:
+        uuid.UUID(value)
+    except ValueError as exc:
+        raise BfiContractError(f"{field!r} is not a valid GUID: {value!r}") from exc
+
+
+def _require_pagination_int(mapping: Mapping[str, object], key: str) -> int:
+    raw = _require_str(mapping, key)
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise BfiContractError(f"pagination {key!r} is not a valid integer: {raw!r}") from exc
 
 
 def _require_str(mapping: Mapping[str, object], key: str) -> str:

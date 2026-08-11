@@ -49,9 +49,11 @@ def performance_mapping(**overrides: Any) -> dict[str, Any]:
 def make_article_html(
     *,
     rows: list[list[Any]],
-    current_page: int = 1,
-    total_pages: int = 1,
+    current_page: int | str = 1,
+    total_pages: int | str = 1,
     token: str = "1,a/b+=",
+    article_id: str = "2152D1E8-CFF7-419F-BE57-F51C1E490F24",
+    title_with_apostrophe: str | None = None,
 ) -> str:
     """Produce a minimal HTML page that embeds a BFI articleContext script block.
 
@@ -60,8 +62,12 @@ def make_article_html(
       1. Bare (unquoted) ``searchNames`` key.
       2. A trailing comma before the closing ``}``.
       3. Escaped apostrophes (``\\'``) in string values.
+
+    Pass ``title_with_apostrophe`` to inject a ``"title"`` key whose value contains a
+    plain apostrophe; the factory will encode it as the JS ``\\'`` escape so the
+    normalisation path is exercised.
     """
-    context = {
+    context: dict[str, Any] = {
         "searchNames": REQUIRED_FIELDS,
         "searchResults": rows,
         "pagination": {
@@ -69,10 +75,14 @@ def make_article_html(
             "page_size": "5",
             "total_pages": str(total_pages),
         },
-        "articleId": "2152D1E8-CFF7-419F-BE57-F51C1E490F24",
+        "articleId": article_id,
         "sToken": token,
     }
+    if title_with_apostrophe is not None:
+        context["title"] = title_with_apostrophe
     literal = json.dumps(context).replace('"searchNames":', "searchNames :")
     literal = literal[:-1] + ",}"
-    literal = literal.replace("O'Brien", r"O\'Brien")
+    # Encode plain apostrophes in string values as the JS \' escape so the parser's
+    # un-escape path (finding \' inside a JSON double-quoted string) is exercised.
+    literal = literal.replace("'", r"\'")
     return f"<script>var articleContext = {literal};\n</script>"

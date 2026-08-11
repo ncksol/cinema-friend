@@ -193,3 +193,50 @@ def test_options_normalised_to_tuple_of_strings() -> None:
     row = performance_mapping(options=["Subtitles", "Relaxed"])
     perf = performance_from_row(row)
     assert perf.options == ("Subtitles", "Relaxed")  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# Fix round 1 — fail-closed validation and apostrophe path
+# ---------------------------------------------------------------------------
+
+
+def test_invalid_article_id_raises_contract_error() -> None:
+    """articleId that is not a valid GUID must raise BfiContractError."""
+    html = make_article_html(rows=[performance_row()], article_id="not-a-guid")
+    with pytest.raises(BfiContractError, match="articleId"):
+        parse_article_page(html)
+
+
+def test_non_integer_current_page_raises_contract_error() -> None:
+    """Non-integer current_page must raise BfiContractError, not ValueError."""
+    html = make_article_html(rows=[performance_row()], current_page="bad")
+    with pytest.raises(BfiContractError):
+        parse_article_page(html)
+
+
+def test_non_integer_total_pages_raises_contract_error() -> None:
+    """Non-integer total_pages must raise BfiContractError, not ValueError."""
+    html = make_article_html(rows=[performance_row()], total_pages="bad")
+    with pytest.raises(BfiContractError):
+        parse_article_page(html)
+
+
+def test_malformed_start_date_raises_contract_error() -> None:
+    """Unparseable start_date must raise BfiContractError, not ValueError."""
+    row = performance_mapping(start_date="not a date")
+    with pytest.raises(BfiContractError, match="start_date"):
+        performance_from_row(row)
+
+
+def test_negative_availability_raises_contract_error() -> None:
+    """Negative availability_num must raise BfiContractError, not be clamped."""
+    row = performance_mapping(availability_num=-1)
+    with pytest.raises(BfiContractError, match="availability_num"):
+        performance_from_row(row)
+
+
+def test_escaped_apostrophe_in_title_normalised() -> None:
+    """A JS-escaped apostrophe in a string value must survive round-trip as a plain apostrophe."""
+    html = make_article_html(rows=[performance_row()], title_with_apostrophe="O'Brien")
+    ctx = extract_article_context(html)
+    assert ctx.get("title") == "O'Brien"
