@@ -20,12 +20,14 @@ def seat(
     y: float = 100.0,
     status: SeatStatus = SeatStatus.AVAILABLE,
     section: str = "BFI IMAX",
+    seat_id: str | None = None,
+    zone: PriceZone | None = _ZONE,
 ) -> Seat:
     return Seat(
-        seat_id=f"{row}{column}",
+        seat_id=seat_id if seat_id is not None else f"{section}/{row}{column}",
         raw_status_code="A" if status is SeatStatus.AVAILABLE else "S",
         status=status,
-        zone=_ZONE,
+        zone=zone,
         note="",
         section=section,
         row=row,
@@ -214,7 +216,7 @@ def test_preferred_row_outranks_raw_score_when_no_seat_overlap() -> None:
     assert [option.seat_label for option in ranked] == ["K2-K3", "L2-L3"]
 
 
-def test_ties_break_deterministically_on_performance_id_then_seat_label() -> None:
+def test_ties_break_deterministically_on_performance_id_then_seat_key() -> None:
     start = datetime(2026, 8, 26, 18, 0, tzinfo=UTC)
     criteria = criteria_with_preferred_time(preferred_utc_instant=start)
     perf_b = performance("B-PERF", start)
@@ -226,3 +228,135 @@ def test_ties_break_deterministically_on_performance_id_then_seat_label() -> Non
     # performance-id tiebreak can make the ordering deterministic.
     ranked = rank_options(criteria, ((perf_b, map_b), (perf_a, map_a)))
     assert [option.performance.performance_id for option in ranked] == ["A-PERF", "B-PERF"]
+
+
+# ---------------------------------------------------------------------------
+# Seat identity: human-readable label vs stable seat IDs
+# ---------------------------------------------------------------------------
+
+
+def _adjacent_pair_map(
+    performance_id: str,
+    *,
+    section: str = "BFI IMAX",
+    row: str = "L",
+    seat_ids: tuple[str, str] | None = None,
+    zone: PriceZone | None = _ZONE,
+) -> SeatMap:
+    """Row of four seats where only columns 2 and 3 are purchasable."""
+    xs = [100.0, 114.0, 128.0, 142.0]
+    seats = []
+    for index, x in enumerate(xs):
+        column = index + 1
+        override: str | None = None
+        if seat_ids is not None and column in (2, 3):
+            override = seat_ids[column - 2]
+        seats.append(
+            seat(
+                row,
+                column,
+                x,
+                section=section,
+                seat_id=override,
+                zone=zone,
+                status=SeatStatus.SOLD if index in (0, 3) else SeatStatus.AVAILABLE,
+            )
+        )
+    return SeatMap(performance_id=performance_id, seats=tuple(seats))
+
+
+def _pair_criteria(**overrides: object) -> WatchCriteria:
+    return criteria_with_preferred_time(
+        preferred_utc_instant=datetime(2026, 8, 26, 18, 0, tzinfo=UTC),
+        quantity=2,
+        **overrides,  # type: ignore[arg-type]
+    )
+
+
+def test_seat_label_is_human_readable_row_and_seat_numbers_not_seat_ids() -> None:
+    perf = performance("p1", datetime(2026, 8, 26, 18, 0, tzinfo=UTC))
+    seat_map = _adjacent_pair_map(
+        "p1",
+        seat_ids=(
+            "1FA0A9C8-1111-4000-8000-000000000002",
+            "1FA0A9C8-2222-4000-8000-000000000003",
+        ),
+    )
+
+    (ranked,) = rank_options(_pair_criteria(), ((perf, seat_map),))
+
+    assert ranked.seat_label == "L2-L3"
+
+
+def test_seat_ids_preserve_the_stable_bfi_identifiers_in_block_order() -> None:
+    perf = performance("p1", datetime(2026, 8, 26, 18, 0, tzinfo=UTC))
+    seat_map = _adjacent_pair_map("p1", seat_ids=("guid-second", "guid-third"))
+
+    (ranked,) = rank_options(_pair_criteria(), ((perf, seat_map),))
+
+    assert ranked.seat_ids == ("guid-second", "guid-third")
+    assert ranked.key == "p1:guid-second|guid-third"
+    assert ranked.rank_vector.seat_key == "guid-second|guid-third"
+
+
+def test_identical_row_numbers_in_two_sections_share_a_label_but_not_a_key() -> None:
+    perf = performance("p1", datetime(2026, 8, 26, 18, 0, tzinfo=UTC))
+    stalls = _adjacent_pair_map(
+        "p1", section="Stalls", seat_ids=("stalls-2", "stalls-3")
+    )
+    balcony = _adjacent_pair_map(
+        "p1", section="Balcony", seat_ids=("balcony-2", "balcony-3")
+    )
+    seat_map = SeatMap(performance_id="p1", seats=stalls.seats + balcony.seats)
+
+    ranked = rank_options(_pair_criteria(), ((perf, seat_map),))
+
+    assert {option.seat_label for option in ranked} == {"L2-L3"}
+    assert len({option.key for option in ranked}) == len(ranked) == 2
+
+
+def test_preferred_seat_overlap_compares_human_labels_not_seat_ids() -> None:
+    perf = performance("p1", datetime(2026, 8, 26, 18, 0, tzinfo=UTC))
+    seat_map = _adjacent_pair_map("p1", seat_ids=("opaque-guid-a", "opaque-guid-b"))
+
+    (ranked,) = rank_options(
+        _pair_criteria(preferred_seats=frozenset({"L2"})), ((perf, seat_map),)
+    )
+
+    assert ranked.rank_vector.preferred_seat_overlap == 1
+
+
+def test_seat_categories_carry_the_distinct_price_zone_labels() -> None:
+    perf = performance("p1", datetime(2026, 8, 26, 18, 0, tzinfo=UTC))
+    seat_map = _adjacent_pair_map("p1")
+
+    (ranked,) = rank_options(_pair_criteria(), ((perf, seat_map),))
+
+    assert ranked.seat_categories == ("Premium",)
+
+
+def test_seat_categories_are_empty_when_no_zone_is_known() -> None:
+    perf = performance("p1", datetime(2026, 8, 26, 18, 0, tzinfo=UTC))
+    seat_map = _adjacent_pair_map("p1", zone=None)
+
+    (ranked,) = rank_options(_pair_criteria(), ((perf, seat_map),))
+
+    assert ranked.seat_categories == ()
+
+
+def test_ranked_options_carry_the_listing_title_when_one_is_known() -> None:
+    perf = performance("p1", datetime(2026, 8, 26, 18, 0, tzinfo=UTC))
+    seat_map = _adjacent_pair_map("p1")
+
+    (ranked,) = rank_options(_pair_criteria(), ((perf, seat_map),), title="Dog Stars")
+
+    assert ranked.title == "Dog Stars"
+
+
+def test_ranked_options_have_no_title_when_the_listing_did_not_name_the_film() -> None:
+    perf = performance("p1", datetime(2026, 8, 26, 18, 0, tzinfo=UTC))
+    seat_map = _adjacent_pair_map("p1")
+
+    (ranked,) = rank_options(_pair_criteria(), ((perf, seat_map),))
+
+    assert ranked.title is None

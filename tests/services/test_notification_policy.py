@@ -28,7 +28,7 @@ _START = datetime(2026, 8, 26, 18, 0, tzinfo=UTC)
 
 def rank_vector(
     *,
-    seat_label: str = "L17-L18",
+    seat_key: str = "seat-a|seat-b",
     preferred_seat_overlap: int = 1,
     preferred_row_match: int = 1,
     view_score_band: int = 19,
@@ -42,11 +42,14 @@ def rank_vector(
         preferred_time_distance_minutes=preferred_time_distance_minutes,
         raw_view_score=raw_view_score,
         performance_start=_START,
-        seat_label=seat_label,
+        seat_key=seat_key,
     )
 
 
-def ranked_option(seat_label: str, vector: RankVector, *, performance_id: str = "p1") -> RankedOption:
+def ranked_option(
+    seat_label: str, vector: RankVector, *, performance_id: str = "p1"
+) -> RankedOption:
+    seat_ids = tuple(f"guid-{part}" for part in seat_label.split("-"))
     return RankedOption(
         performance=Performance(
             performance_id=performance_id,
@@ -59,14 +62,15 @@ def ranked_option(seat_label: str, vector: RankVector, *, performance_id: str = 
             seat_map_url="https://whatson.bfi.org.uk/imax/Online/mapSelect.asp?ID=p1",
         ),
         seat_label=seat_label,
+        seat_ids=seat_ids,
         rank_vector=vector,
         price_pence=1500,
     )
 
 
-_GOOD = rank_vector(seat_label="L17-L18", raw_view_score=98.0)
-_BETTER = rank_vector(seat_label="L19-L20", raw_view_score=99.5)
-_WORSE = rank_vector(seat_label="K1-K2", preferred_seat_overlap=0, raw_view_score=60.0)
+_GOOD = rank_vector(seat_key="L17-L18", raw_view_score=98.0)
+_BETTER = rank_vector(seat_key="L19-L20", raw_view_score=99.5)
+_WORSE = rank_vector(seat_key="K1-K2", preferred_seat_overlap=0, raw_view_score=60.0)
 
 _GOOD_OPTION = ranked_option("L17-L18", _GOOD)
 _BETTER_OPTION = ranked_option("L19-L20", _BETTER)

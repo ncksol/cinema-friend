@@ -54,7 +54,7 @@ def payload(
     )
 
 
-def rank_vector(seat_label: str = "L17-L18") -> RankVector:
+def rank_vector(seat_key: str = "seat-a|seat-b") -> RankVector:
     return RankVector(
         preferred_seat_overlap=1,
         preferred_row_match=1,
@@ -62,7 +62,7 @@ def rank_vector(seat_label: str = "L17-L18") -> RankVector:
         preferred_time_distance_minutes=0,
         raw_view_score=95.5,
         performance_start=datetime(2026, 8, 26, 18, 0, tzinfo=UTC),
-        seat_label=seat_label,
+        seat_key=seat_key,
     )
 
 

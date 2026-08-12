@@ -31,7 +31,7 @@ class RankVector:
     preferred_time_distance_minutes: int
     raw_view_score: float
     performance_start: datetime
-    seat_label: str
+    seat_key: str
 
     def sort_key(self) -> tuple[int, int, int, int, float, datetime, str]:
         return (
@@ -41,16 +41,39 @@ class RankVector:
             self.preferred_time_distance_minutes,
             -self.raw_view_score,
             self.performance_start,
-            self.seat_label,
+            self.seat_key,
         )
+
+
+SEAT_ID_SEPARATOR = "|"
 
 
 @dataclass(frozen=True, slots=True)
 class RankedOption:
+    """One offerable seat block, carrying both how it is named and how it is identified.
+
+    ``seat_label`` is for people (``L17-L18``); ``seat_ids`` are the venue's stable seat
+    identifiers and are the only thing identity is ever derived from. The two are kept
+    apart because a label is neither unique -- two sections can each have a row L -- nor
+    stable across a re-parse, while an ID is both and is unreadable.
+    """
+
     performance: Performance
     seat_label: str
+    seat_ids: tuple[str, ...]
     rank_vector: RankVector
     price_pence: int | None
+    seat_categories: tuple[str, ...] = ()
+    title: str | None = None
+
+    @property
+    def seat_key(self) -> str:
+        """The block's seat IDs in order, joined by a separator no seat ID contains.
+
+        ``|`` rather than ``-`` because a BFI seat ID is a GUID and already contains
+        hyphens, so a hyphen join could not be read back unambiguously.
+        """
+        return SEAT_ID_SEPARATOR.join(self.seat_ids)
 
     @property
     def key(self) -> str:
@@ -58,8 +81,10 @@ class RankedOption:
 
         Persistence stores it, notification policy compares against it, and both must
         agree, so it is derived here rather than rebuilt independently in each layer.
+        Seat IDs, not labels, are what make it unique: identical row numbers in two
+        different sections would otherwise collide into one key.
         """
-        return f"{self.performance.performance_id}:{self.seat_label}"
+        return f"{self.performance.performance_id}:{self.seat_key}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,6 +109,13 @@ class CheckResult:
 
 @dataclass(frozen=True, slots=True)
 class SnapshotPage:
+    """One page of a stored snapshot, plus the watch title it belongs to.
+
+    ``watch_title`` is the watch's current name rather than anything stored on the
+    snapshot: it is the only title an empty snapshot can be shown under, since a
+    snapshot with no options carries no performance to take one from.
+    """
+
     snapshot_id: UUID
     checked_at: datetime
     options: tuple[RankedOption, ...]
@@ -91,6 +123,7 @@ class SnapshotPage:
     total_pages: int
     total_options: int
     total_performances: int
+    watch_title: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

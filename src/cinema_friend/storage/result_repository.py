@@ -54,6 +54,9 @@ def _encode_option(option: RankedOption) -> str:
             "options": list(performance.options),
         },
         "seat_label": option.seat_label,
+        "seat_ids": list(option.seat_ids),
+        "seat_categories": list(option.seat_categories),
+        "title": option.title,
         "rank_vector": {
             "preferred_seat_overlap": vector.preferred_seat_overlap,
             "preferred_row_match": vector.preferred_row_match,
@@ -61,7 +64,7 @@ def _encode_option(option: RankedOption) -> str:
             "preferred_time_distance_minutes": vector.preferred_time_distance_minutes,
             "raw_view_score": vector.raw_view_score,
             "performance_start": encode_datetime(vector.performance_start),
-            "seat_label": vector.seat_label,
+            "seat_key": vector.seat_key,
         },
         "price_pence": option.price_pence,
     }
@@ -85,6 +88,7 @@ def _decode_option(data: str) -> RankedOption:
             options=tuple(performance["options"]),
         ),
         seat_label=payload["seat_label"],
+        seat_ids=tuple(payload["seat_ids"]),
         rank_vector=RankVector(
             preferred_seat_overlap=vector["preferred_seat_overlap"],
             preferred_row_match=vector["preferred_row_match"],
@@ -92,9 +96,11 @@ def _decode_option(data: str) -> RankedOption:
             preferred_time_distance_minutes=vector["preferred_time_distance_minutes"],
             raw_view_score=vector["raw_view_score"],
             performance_start=decode_datetime(vector["performance_start"]),
-            seat_label=vector["seat_label"],
+            seat_key=vector["seat_key"],
         ),
         price_pence=payload["price_pence"],
+        seat_categories=tuple(payload["seat_categories"]),
+        title=payload["title"],
     )
 
 
@@ -262,12 +268,19 @@ class ResultRepository:
         if page_size < 1:
             raise InputError("page size must be at least 1")
         cursor = await conn.execute(
-            "SELECT checked_at FROM result_snapshots WHERE id = ?", (str(snapshot_id),)
+            """
+            SELECT result_snapshots.checked_at AS checked_at, watches.title AS watch_title
+            FROM result_snapshots
+            LEFT JOIN watches ON watches.id = result_snapshots.watch_id
+            WHERE result_snapshots.id = ?
+            """,
+            (str(snapshot_id),),
         )
         row = await cursor.fetchone()
         if row is None:
             raise InputError("snapshot not found")
         checked_at = decode_datetime(row["checked_at"])
+        watch_title = row["watch_title"]
 
         cursor = await conn.execute(
             """
@@ -301,6 +314,7 @@ class ResultRepository:
             total_pages=total_pages,
             total_options=total_options,
             total_performances=totals["total_performances"],
+            watch_title=watch_title,
         )
 
     async def _options(

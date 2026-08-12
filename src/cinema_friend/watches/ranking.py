@@ -7,7 +7,7 @@ from collections import defaultdict
 from collections.abc import Sequence
 
 from cinema_friend.domain.bfi import Performance, Seat, SeatBlock, SeatMap
-from cinema_friend.domain.results import RankedOption, RankVector
+from cinema_friend.domain.results import SEAT_ID_SEPARATOR, RankedOption, RankVector
 from cinema_friend.domain.watch import WatchCriteria
 from cinema_friend.watches.blocks import generate_blocks
 
@@ -85,41 +85,52 @@ def _time_distance_minutes(criteria: WatchCriteria, performance: Performance) ->
 def rank_options(
     criteria: WatchCriteria,
     performance_maps: Sequence[tuple[Performance, SeatMap]],
+    *,
+    title: str | None = None,
 ) -> tuple[RankedOption, ...]:
     """Generate and rank every adjacent seat-block option across performances.
 
     Options are ordered by :meth:`RankVector.sort_key`, with ties broken
-    deterministically by performance ID and seat label so ordering never
-    depends on the order of *performance_maps*.
+    deterministically by performance ID and the block's stable seat key, so
+    ordering never depends on the order of *performance_maps* and two blocks
+    that a person would name identically (the same row number in two sections)
+    still order deterministically.
+
+    *title* is the film name the listing carried at check time. It travels with
+    each option so a stored snapshot can be shown under the name it was found
+    under, rather than whatever the watch happens to be called later.
     """
     options: list[RankedOption] = []
     for performance, seat_map in performance_maps:
         for block in generate_blocks(seat_map, criteria):
             raw_view_score = score_block(block, seat_map.seats)
-            seat_ids = tuple(seat.seat_id for seat in block.seats)
-            seat_label = "-".join(seat_ids)
+            seat_ids = block.seat_ids
+            seat_labels = {seat.label for seat in block.seats}
             rank_vector = RankVector(
-                preferred_seat_overlap=len(set(seat_ids) & criteria.preferred_seats),
+                preferred_seat_overlap=len(seat_labels & criteria.preferred_seats),
                 preferred_row_match=1 if block.row in criteria.preferred_rows else 0,
                 view_score_band=int(raw_view_score // _VIEW_SCORE_BAND_WIDTH),
                 preferred_time_distance_minutes=_time_distance_minutes(criteria, performance),
                 raw_view_score=raw_view_score,
                 performance_start=performance.start_utc,
-                seat_label=seat_label,
+                seat_key=SEAT_ID_SEPARATOR.join(seat_ids),
             )
             options.append(
                 RankedOption(
                     performance=performance,
-                    seat_label=seat_label,
+                    seat_label=block.label,
+                    seat_ids=seat_ids,
                     rank_vector=rank_vector,
                     price_pence=_price_pence(block),
+                    seat_categories=block.categories,
+                    title=title,
                 )
             )
     options.sort(
         key=lambda option: (
             *option.rank_vector.sort_key(),
             option.performance.performance_id,
-            option.seat_label,
+            option.seat_key,
         )
     )
     return tuple(options)

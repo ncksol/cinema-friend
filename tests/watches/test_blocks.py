@@ -40,9 +40,10 @@ def seat(
     status: SeatStatus = SeatStatus.AVAILABLE,
     y: float = 100.0,
     section: str = "BFI IMAX",
+    seat_id: str | None = None,
 ) -> Seat:
     return Seat(
-        seat_id=f"{row}{column}",
+        seat_id=seat_id if seat_id is not None else f"{row}{column}",
         raw_status_code="A" if status is SeatStatus.AVAILABLE else "S",
         status=status,
         zone=_ZONE,
@@ -118,6 +119,23 @@ def test_excluded_seat_breaks_a_run() -> None:
         seat_map, criteria_for(quantity=2, excluded_seats=frozenset({"L3"}))
     )
     labels = {tuple(s.seat_id for s in block.seats) for block in blocks}
+    assert labels == {("L1", "L2"), ("L4", "L5")}
+
+
+def test_excluded_seats_are_matched_by_human_label_not_by_opaque_seat_id() -> None:
+    # A user types "L3"; the BFI seat map identifies that seat by an opaque GUID.
+    xs = [100.0, 114.0, 128.0, 142.0, 156.0]
+    seats = [
+        seat("L", i + 1, x, seat_id=f"1FA0A9C8-0000-4000-8000-00000000000{i + 1}")
+        for i, x in enumerate(xs)
+    ]
+    seat_map = SeatMap(performance_id="p1", seats=tuple(seats))
+
+    blocks = generate_blocks(
+        seat_map, criteria_for(quantity=2, excluded_seats=frozenset({"L3"}))
+    )
+
+    labels = {tuple(s.label for s in block.seats) for block in blocks}
     assert labels == {("L1", "L2"), ("L4", "L5")}
 
 

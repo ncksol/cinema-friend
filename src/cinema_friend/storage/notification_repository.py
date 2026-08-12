@@ -84,7 +84,7 @@ def _encode_rank(vector: RankVector) -> str:
             "preferred_time_distance_minutes": vector.preferred_time_distance_minutes,
             "raw_view_score": vector.raw_view_score,
             "performance_start": encode_datetime(vector.performance_start),
-            "seat_label": vector.seat_label,
+            "seat_key": vector.seat_key,
         },
         sort_keys=True,
     )
@@ -99,7 +99,7 @@ def _decode_rank(data: str) -> RankVector:
         preferred_time_distance_minutes=payload["preferred_time_distance_minutes"],
         raw_view_score=payload["raw_view_score"],
         performance_start=decode_datetime(payload["performance_start"]),
-        seat_label=payload["seat_label"],
+        seat_key=payload["seat_key"],
     )
 
 

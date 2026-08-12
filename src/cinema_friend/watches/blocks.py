@@ -13,7 +13,12 @@ _MIN_USABLE_GAPS = 3
 
 
 def _is_purchasable(seat: Seat, criteria: WatchCriteria) -> bool:
-    return seat.status is SeatStatus.AVAILABLE and seat.seat_id not in criteria.excluded_seats
+    """Whether *seat* can be offered under *criteria*.
+
+    Exclusions are matched on the seat's human label (``L3``), because that is what a
+    user types; the venue's opaque ``seat_id`` is never something they could name.
+    """
+    return seat.status is SeatStatus.AVAILABLE and seat.label not in criteria.excluded_seats
 
 
 def _median_gap(row_seats_sorted: list[Seat]) -> float | None:

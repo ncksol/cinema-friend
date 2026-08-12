@@ -684,6 +684,35 @@ async def test_empty_listing_preserves_the_existing_watch_title(harness: Harness
     assert (await harness.watch(watch.watch_id)).title == "Existing title"
 
 
+async def test_snapshot_options_carry_the_listing_title(harness: Harness) -> None:
+    watch = await harness.add_watch()
+    harness.gateway.title = "Dog Stars"
+    harness.gateway.performances = [make_performance()]
+    harness.gateway.maps[PERF_1] = centre_pair_map()
+
+    await harness.service.check(watch.watch_id, CheckTrigger.SCHEDULED)
+
+    snapshot = await harness.latest_snapshot(watch.watch_id)
+    assert snapshot is not None
+    assert [option.title for option in snapshot.options] == ["Dog Stars"]
+
+
+async def test_snapshot_options_fall_back_to_the_stored_watch_title(harness: Harness) -> None:
+    watch = await harness.add_watch()
+    stored = replace(watch, title="Existing title", updated_at=NOW + timedelta(seconds=1))
+    async with harness.database.connection() as conn, harness.database.transaction(conn):
+        await harness.watches.update(conn, stored)
+    harness.gateway.title = None
+    harness.gateway.performances = [make_performance()]
+    harness.gateway.maps[PERF_1] = centre_pair_map()
+
+    await harness.service.check(watch.watch_id, CheckTrigger.SCHEDULED)
+
+    snapshot = await harness.latest_snapshot(watch.watch_id)
+    assert snapshot is not None
+    assert [option.title for option in snapshot.options] == ["Existing title"]
+
+
 # ---------------------------------------------------------------------------
 # Typed failures
 # ---------------------------------------------------------------------------

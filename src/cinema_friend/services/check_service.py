@@ -168,7 +168,11 @@ class CheckService:
             return await self._persist_contract_error(watch, trigger, started_at, error)
         except BfiNetworkError as error:
             return await self._persist_network_error(watch, trigger, started_at, error)
-        options = rank_options(watch.criteria, tuple(zip(candidates, maps, strict=True)))
+        options = rank_options(
+            watch.criteria,
+            tuple(zip(candidates, maps, strict=True)),
+            title=listing.title or watch.title,
+        )
         return await self._persist_success(watch, trigger, started_at, listing, candidates, options)
 
     async def _load_watch(self, watch_id: UUID) -> Watch:

@@ -42,11 +42,39 @@ class Seat:
     x: float
     y: float
 
+    @property
+    def label(self) -> str:
+        """How a person names this seat: its row letter and seat number, e.g. ``L17``.
+
+        ``seat_id`` is the venue's opaque identifier (a GUID on a real BFI seat map) and
+        is stable but meaningless; this is what a user types into a watch and reads back
+        off a ticket. It is not unique on its own -- two sections can both number a row
+        L -- so it must never stand in for identity.
+        """
+        return f"{self.row}{self.column}"
+
 
 @dataclass(frozen=True, slots=True)
 class SeatBlock:
     row: str
     seats: tuple[Seat, ...]
+
+    @property
+    def label(self) -> str:
+        """The block's human-readable seat labels in seat order, e.g. ``L17-L18``."""
+        return "-".join(seat.label for seat in self.seats)
+
+    @property
+    def seat_ids(self) -> tuple[str, ...]:
+        """The block's stable venue seat identifiers, in the same order as ``seats``."""
+        return tuple(seat.seat_id for seat in self.seats)
+
+    @property
+    def categories(self) -> tuple[str, ...]:
+        """Distinct price-zone labels covering the block, in seat order."""
+        return tuple(
+            dict.fromkeys(seat.zone.label for seat in self.seats if seat.zone is not None)
+        )
 
 
 @dataclass(frozen=True, slots=True)

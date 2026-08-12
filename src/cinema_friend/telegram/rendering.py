@@ -3,6 +3,12 @@
 Nothing here calls Telegram or a repository. Domain values (:class:`SnapshotPage`,
 :class:`Watch`) go in, a :class:`RenderedMessage` comes out; Task 14 is the only place
 that hands one of these to a live bot.
+
+Two invariants shape the whole module. First, every message is assembled from whole,
+already-escaped lines and is only ever shortened by dropping a complete line, so no
+message can end mid-tag or mid-entity and be rejected by Telegram's HTML parser.
+Second, every time is rendered in ``Europe/London`` -- the cinema's clock -- so the
+message reads the same whatever timezone the host process happens to run in.
 """
 
 from __future__ import annotations
@@ -10,6 +16,8 @@ from __future__ import annotations
 import html
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
@@ -22,8 +30,19 @@ from cinema_friend.telegram.callbacks import encode_callback
 MAX_MESSAGE_CHARS = 4096
 MAX_OPTIONS_PER_PAGE = 10
 
-_MAX_SEAT_LABEL_DISPLAY = 40
+LONDON = ZoneInfo("Europe/London")
+_TIME_FORMAT = "%a %d %b %Y, %H:%M"
+_DATE_FORMAT = "%d %b %Y"
+_CLOCK_FORMAT = "%H:%M"
+
+_MAX_TITLE_CHARS = 80
+_MAX_SEAT_LABEL_CHARS = 60
+_MAX_CATEGORY_CHARS = 40
 _TRUNCATION_MARK = "…"
+
+_UNTITLED = "(untitled)"
+_NO_MATCH = "No matching seats were found for this check."
+_TOO_LONG = "Your watches are too long to display here."
 
 _STATUS_LABEL: dict[WatchStatus, str] = {
     WatchStatus.ACTIVE: "active",
@@ -44,14 +63,41 @@ class RenderedMessage:
     reply_markup: InlineKeyboardMarkup | None
 
 
-def _escape(text: str) -> str:
-    return html.escape(text, quote=False)
+def _clip(text: str, limit: int) -> str:
+    """Shorten *text* before it is escaped, never after.
 
-
-def _truncate(text: str, limit: int) -> str:
+    Clipping escaped markup could cut ``&amp;`` in half and leave Telegram parsing a
+    dangling entity, so every bound in this module is applied to the raw value and the
+    escape then runs over an already-short string.
+    """
     if len(text) <= limit:
         return text
     return text[: limit - len(_TRUNCATION_MARK)] + _TRUNCATION_MARK
+
+
+def _escape(text: str, limit: int) -> str:
+    return html.escape(_clip(text, limit), quote=False)
+
+
+def _london(moment: datetime) -> str:
+    return moment.astimezone(LONDON).strftime(_TIME_FORMAT)
+
+
+def _fit_lines(fixed: Sequence[str], items: Sequence[str], max_chars: int) -> int:
+    """Return how many of *items* fit alongside *fixed* within *max_chars*.
+
+    Items are whole rendered lines and are taken in order, so the answer is also the
+    number of leading items the caller may build buttons for -- keyboard and text can
+    never disagree about what was shown.
+    """
+    budget = sum(len(line) + 1 for line in fixed)
+    fitted = 0
+    for item in items:
+        budget += len(item) + 1
+        if budget > max_chars:
+            break
+        fitted += 1
+    return fitted
 
 
 def _view_rationale(raw_view_score: float) -> str:
@@ -65,10 +111,15 @@ def _view_rationale(raw_view_score: float) -> str:
 
 
 def _option_line(index: int, option: RankedOption) -> str:
-    when = _escape(option.performance.start.strftime("%a %d %b %Y, %H:%M"))
-    rationale = _view_rationale(option.rank_vector.raw_view_score)
-    seats = _escape(_truncate(option.seat_label, _MAX_SEAT_LABEL_DISPLAY))
-    line = f"{index}. <b>{when}</b> — {seats} — {rationale}"
+    when = _escape(option.performance.start.strftime(_TIME_FORMAT), _MAX_TITLE_CHARS)
+    seats = _escape(option.seat_label, _MAX_SEAT_LABEL_CHARS)
+    score = option.rank_vector.raw_view_score
+    line = f"{index}. <b>{when}</b> — {seats} — {_view_rationale(score)} ({score:.1f}/100)"
+    if option.seat_categories:
+        # Ranking already de-duplicates, but the domain type does not enforce it and a
+        # block spanning two zones must not read "Premium, Premium".
+        categories = ", ".join(dict.fromkeys(option.seat_categories))
+        line += f" — {_escape(categories, _MAX_CATEGORY_CHARS)}"
     if option.price_pence is not None:
         line += f" — £{option.price_pence / 100:.2f}"
     return line
@@ -90,39 +141,23 @@ def _seat_map_button(index: int, option: RankedOption) -> list[InlineKeyboardBut
     return [InlineKeyboardButton(text=f"Seat map {index}", url=url)]
 
 
-def render_result_page(snapshot_page: SnapshotPage) -> RenderedMessage:
-    """Render one page of a result snapshot as a numbered, linked option list.
+def _page_title(snapshot_page: SnapshotPage) -> str:
+    """The film name to head the page with.
 
-    Options beyond :data:`MAX_OPTIONS_PER_PAGE` are dropped defensively -- the
-    repository already caps a page at ten, but rendering does not trust that and
-    re-enforces its own limit so a future caller passing a larger page can never grow
-    the message past the 4096-character ceiling through this path alone. The final
-    text is also hard-truncated to that ceiling as a last-resort guarantee.
+    An option carries the title the listing used at check time, which is what the
+    snapshot actually recorded; the watch's own title is the fallback, and the only
+    title available at all when the snapshot found nothing.
     """
-    options = snapshot_page.options[:MAX_OPTIONS_PER_PAGE]
-    checked_at = _escape(snapshot_page.checked_at.astimezone().strftime("%a %d %b %Y, %H:%M"))
+    for option in snapshot_page.options:
+        if option.title:
+            return option.title
+    return snapshot_page.watch_title or "Ticket options"
 
-    lines = [
-        "<b>Ticket options</b>",
-        f"Checked: {checked_at}",
-        "",
-        *[_option_line(i, option) for i, option in enumerate(options, start=1)],
-        "",
-        (
-            f"Showing {len(options)} of {snapshot_page.total_options} option(s) across "
-            f"{snapshot_page.total_performances} performance(s) — "
-            f"page {snapshot_page.page}/{snapshot_page.total_pages}."
-        ),
-    ]
-    text = _truncate("\n".join(lines), MAX_MESSAGE_CHARS)
 
-    rows: list[list[InlineKeyboardButton]] = [
-        button for i, option in enumerate(options, start=1) if (button := _seat_map_button(i, option))
-    ]
-
-    nav_row: list[InlineKeyboardButton] = []
+def _pagination_row(snapshot_page: SnapshotPage) -> list[InlineKeyboardButton]:
+    row: list[InlineKeyboardButton] = []
     if snapshot_page.page > 1:
-        nav_row.append(
+        row.append(
             InlineKeyboardButton(
                 text="⬅ Previous",
                 callback_data=encode_callback(
@@ -131,7 +166,7 @@ def render_result_page(snapshot_page: SnapshotPage) -> RenderedMessage:
             )
         )
     if snapshot_page.page < snapshot_page.total_pages:
-        nav_row.append(
+        row.append(
             InlineKeyboardButton(
                 text="Next ➡",
                 callback_data=encode_callback(
@@ -139,17 +174,107 @@ def render_result_page(snapshot_page: SnapshotPage) -> RenderedMessage:
                 ),
             )
         )
-    if nav_row:
+    return row
+
+
+def render_result_page(
+    snapshot_page: SnapshotPage, *, max_chars: int = MAX_MESSAGE_CHARS
+) -> RenderedMessage:
+    """Render one page of a result snapshot as a numbered, linked option list.
+
+    Options beyond :data:`MAX_OPTIONS_PER_PAGE` are dropped defensively -- the
+    repository already caps a page at ten, but rendering does not trust that and
+    re-enforces its own limit. Whatever survives that cap is then fitted to
+    *max_chars* one whole line at a time, and only the options that were actually
+    written get a seat-map button, so the keyboard always describes the text beside it.
+
+    A snapshot with no options is a real answer, not an empty page, so it is rendered
+    as a plain "nothing matched" message under the watch's own title rather than as a
+    zero-length list with pagination.
+    """
+    title = _escape(_page_title(snapshot_page), _MAX_TITLE_CHARS)
+    checked_at = _escape(_london(snapshot_page.checked_at), _MAX_TITLE_CHARS)
+    header = [f"<b>{title}</b>", f"Checked: {checked_at} (London)"]
+
+    if not snapshot_page.options:
+        return RenderedMessage(
+            text="\n".join([*header, "", _NO_MATCH]),
+            parse_mode=ParseMode.HTML,
+            reply_markup=None,
+        )
+
+    options = snapshot_page.options[:MAX_OPTIONS_PER_PAGE]
+    option_lines = [_option_line(i, option) for i, option in enumerate(options, start=1)]
+
+    def footer(shown: int) -> str:
+        return (
+            f"Showing {shown} of {snapshot_page.total_options} option(s) across "
+            f"{snapshot_page.total_performances} performance(s) — "
+            f"page {snapshot_page.page}/{snapshot_page.total_pages}."
+        )
+
+    # The footer states how many options were shown, so it can only be sized once the
+    # count is known; the widest possible count reserves enough room for the real one.
+    fixed = [*header, "", "", footer(len(option_lines))]
+    shown = _fit_lines(fixed, option_lines, max_chars)
+
+    text = "\n".join([*header, "", *option_lines[:shown], "", footer(shown)])
+    rows: list[list[InlineKeyboardButton]] = [
+        button
+        for i, option in enumerate(options[:shown], start=1)
+        if (button := _seat_map_button(i, option))
+    ]
+    if nav_row := _pagination_row(snapshot_page):
         rows.append(nav_row)
 
     reply_markup = InlineKeyboardMarkup(rows) if rows else None
     return RenderedMessage(text=text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
 
 
-def _watch_line(index: int, watch: Watch) -> str:
-    title = _escape(watch.title) if watch.title else "(untitled)"
-    status = _STATUS_LABEL[watch.status]
-    return f"{index}. <b>{title}</b> — {status}"
+def _interval_summary(interval: timedelta) -> str:
+    minutes = max(1, int(interval.total_seconds() // 60))
+    hours, remainder = divmod(minutes, 60)
+    if hours and remainder:
+        return f"{hours}h {remainder}m"
+    if hours:
+        return f"{hours}h"
+    return f"{remainder}m"
+
+
+def _criteria_summary(watch: Watch) -> str:
+    """The watch's search window in one line: dates, daily times, quantity, cadence."""
+    criteria = watch.criteria
+    date_from = criteria.date_from.strftime(_DATE_FORMAT)
+    date_to = criteria.date_to.strftime(_DATE_FORMAT)
+    dates = date_from if date_from == date_to else f"{date_from} to {date_to}"
+    time_from = criteria.time_from.strftime(_CLOCK_FORMAT)
+    time_to = criteria.time_to.strftime(_CLOCK_FORMAT)
+    cadence = (
+        f"every {_interval_summary(criteria.interval)}"
+        if criteria.mode is WatchMode.RECURRING and criteria.interval is not None
+        else "one-off"
+    )
+    return f"{dates}, {time_from}-{time_to}, {criteria.quantity} seats, {cadence}"
+
+
+def _watch_block(index: int, watch: Watch) -> str:
+    """One watch as a title/status line plus its criteria and scheduling state.
+
+    Returned as a single string with embedded newlines so the budget check treats a
+    watch as indivisible: a watch is either shown whole or not at all.
+    """
+    title = _escape(watch.title, _MAX_TITLE_CHARS) if watch.title else _UNTITLED
+    lines = [
+        f"{index}. <b>{title}</b> — {_STATUS_LABEL[watch.status]}",
+        f"    {_escape(_criteria_summary(watch), _MAX_TITLE_CHARS * 2)}",
+    ]
+    next_check = _london(watch.next_check_at) if watch.next_check_at else "not scheduled"
+    lines.append(f"    Next check: {_escape(next_check, _MAX_TITLE_CHARS)} (London)")
+    if watch.last_check_at is not None:
+        lines.append(
+            f"    Last checked: {_escape(_london(watch.last_check_at), _MAX_TITLE_CHARS)} (London)"
+        )
+    return "\n".join(lines)
 
 
 def _watch_buttons(watch: Watch) -> list[InlineKeyboardButton]:
@@ -175,8 +300,14 @@ def _watch_buttons(watch: Watch) -> list[InlineKeyboardButton]:
     return buttons
 
 
-def render_watch_list(watches: Sequence[Watch]) -> RenderedMessage:
-    """Render an owner's watches as a numbered list with per-watch action buttons.
+def render_watch_list(
+    watches: Sequence[Watch], *, max_chars: int = MAX_MESSAGE_CHARS
+) -> RenderedMessage:
+    """Render an owner's watches with their criteria, schedule state, and actions.
+
+    Each watch is an indivisible block, so a list too long for one message loses whole
+    watches from the end rather than half of one. Buttons are built only for the
+    watches that fit, keeping one keyboard row per watch actually shown.
 
     Pause/resume buttons only appear for a ``RECURRING`` watch whose status makes the
     action legal (``ACTIVE``/``PAUSED``), matching :class:`WatchService`'s own
@@ -187,11 +318,14 @@ def render_watch_list(watches: Sequence[Watch]) -> RenderedMessage:
             text="You have no watches yet.", parse_mode=ParseMode.HTML, reply_markup=None
         )
 
-    text = _truncate(
-        "\n".join(_watch_line(i, watch) for i, watch in enumerate(watches, start=1)),
-        MAX_MESSAGE_CHARS,
-    )
-    rows = [_watch_buttons(watch) for watch in watches]
+    blocks = [_watch_block(i, watch) for i, watch in enumerate(watches, start=1)]
+    shown = _fit_lines((), blocks, max_chars)
+    if shown == 0:
+        return RenderedMessage(text=_TOO_LONG, parse_mode=ParseMode.HTML, reply_markup=None)
+
+    rows = [_watch_buttons(watch) for watch in watches[:shown]]
     return RenderedMessage(
-        text=text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows)
+        text="\n".join(blocks[:shown]),
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(rows),
     )

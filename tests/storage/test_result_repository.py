@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Callable, Coroutine
+from dataclasses import replace
 from datetime import timedelta
 from typing import Any
 from uuid import UUID
@@ -415,3 +416,67 @@ async def test_snapshot_page_rejects_an_unknown_snapshot(
     missing = UUID("00000000-0000-4000-8000-000000009999")
     with pytest.raises(InputError, match="snapshot"):
         await repo.snapshot_page(conn, missing, page=1)
+
+
+# ---------------------------------------------------------------------------
+# Option payload shape
+# ---------------------------------------------------------------------------
+
+
+async def test_stored_option_round_trips_label_ids_categories_and_title(
+    conn: aiosqlite.Connection, repo: ResultRepository, make_watch: MakeWatch
+) -> None:
+    watch = await make_watch()
+    stored = option(
+        "L17-L18",
+        seat_ids=("1FA0A9C8-1111-4000-8000-000000000017", "1FA0A9C8-2222-4000-8000-000000000018"),
+        seat_categories=("Premium", "Standard"),
+        title="Dog Stars",
+    )
+
+    snapshot = await _save_snapshot(repo, conn, watch, ranked=(stored,))
+    snapshot_back = await repo.latest_snapshot(conn, watch.watch_id)
+    assert snapshot_back is not None
+    (loaded,) = snapshot_back.options
+
+    assert loaded == stored
+    assert loaded.seat_label == "L17-L18"
+    assert loaded.seat_ids == stored.seat_ids
+    assert loaded.seat_categories == ("Premium", "Standard")
+    assert loaded.title == "Dog Stars"
+    assert loaded.rank_vector.seat_key == stored.rank_vector.seat_key
+    assert await option_keys_in(conn, snapshot.snapshot_id) == [stored.key]
+
+
+async def test_option_key_column_records_performance_id_and_seat_ids(
+    conn: aiosqlite.Connection, repo: ResultRepository, make_watch: MakeWatch
+) -> None:
+    watch = await make_watch()
+    stored = option("L17-L18", performance_id="p9", seat_ids=("guid-a", "guid-b"))
+
+    snapshot = await _save_snapshot(repo, conn, watch, ranked=(stored,))
+
+    assert await option_keys_in(conn, snapshot.snapshot_id) == ["p9:guid-a|guid-b"]
+
+
+async def test_snapshot_page_carries_the_persisted_watch_title(
+    conn: aiosqlite.Connection, repo: ResultRepository, make_watch: MakeWatch
+) -> None:
+    watch = await make_watch()
+    await WatchRepository().update(conn, replace(watch, title="Dog Stars"))
+    snapshot = await _save_snapshot(repo, conn, watch, ranked=())
+
+    page = await repo.snapshot_page(conn, snapshot.snapshot_id, page=1)
+
+    assert page.watch_title == "Dog Stars"
+
+
+async def test_snapshot_page_watch_title_is_none_when_the_watch_is_unnamed(
+    conn: aiosqlite.Connection, repo: ResultRepository, make_watch: MakeWatch
+) -> None:
+    watch = await make_watch()
+    snapshot = await _save_snapshot(repo, conn, watch, ranked=())
+
+    page = await repo.snapshot_page(conn, snapshot.snapshot_id, page=1)
+
+    assert page.watch_title is None

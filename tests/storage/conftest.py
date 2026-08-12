@@ -69,11 +69,16 @@ def option(
     preferred_time_distance_minutes: int = 0,
     price_pence: int | None = 1500,
     start_utc: datetime | None = None,
+    seat_ids: tuple[str, ...] | None = None,
+    seat_categories: tuple[str, ...] = ("Premium",),
+    title: str | None = "Dog Stars",
 ) -> RankedOption:
     start = start_utc or datetime(2026, 8, 26, 18, 0, tzinfo=UTC)
+    ids = seat_ids if seat_ids is not None else tuple(seat_label.split("-"))
     return RankedOption(
         performance=performance(performance_id, start_utc=start),
         seat_label=seat_label,
+        seat_ids=ids,
         rank_vector=RankVector(
             preferred_seat_overlap=preferred_seat_overlap,
             preferred_row_match=preferred_row_match,
@@ -81,9 +86,11 @@ def option(
             preferred_time_distance_minutes=preferred_time_distance_minutes,
             raw_view_score=raw_view_score,
             performance_start=start,
-            seat_label=seat_label,
+            seat_key="|".join(ids),
         ),
         price_pence=price_pence,
+        seat_categories=seat_categories,
+        title=title,
     )
 
 
