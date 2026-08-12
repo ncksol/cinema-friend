@@ -7,7 +7,7 @@ cadences and their failure modes have nothing to do with each other: due checks 
 minute, delivery every ten seconds, retention once a day. One of them stalling or
 throwing must not hold up the others.
 
-Two decisions are worth stating outright.
+Three decisions are worth stating outright.
 
 *A ``ConflictError`` is not a failure.* It means the watch changed while its check was
 in flight -- paused, edited, deleted -- and the check correctly threw its work away. The
@@ -15,6 +15,15 @@ run is abandoned, not failed: nothing is written, the schedule is left exactly w
 owner's action put it, and the watch is picked up again whenever that new schedule says
 so. Marking it failed would punish the user for editing their own watch, and retrying
 immediately would race the very change that caused the conflict.
+
+*An unexpected defect is still the watch's problem.* ``CheckService`` translates every
+anticipated BFI failure into a recorded outcome and lets anything else propagate, so a
+genuine bug is never disguised as a bad network day. That rule stays; what it leaves
+behind does not. A propagated defect writes nothing, so the watch stays due in the past
+and every following scan runs it again into the same fault. Here, and only here, the
+watch is moved: a recurring one to ``BACKOFF`` a quarter of an hour out, a one-off to
+``FAILED``, under the same re-read guard as everything else so a concurrent pause or
+delete wins.
 
 *Expiry belongs here.* A check has no reason to care that a watch's date range ran out;
 it would simply find nothing and reschedule, forever. The scan compares the watch's last
@@ -28,7 +37,7 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum
 from typing import Final, Protocol
 from uuid import UUID
@@ -36,7 +45,7 @@ from uuid import UUID
 from cinema_friend.clock import Clock
 from cinema_friend.domain.errors import ConflictError
 from cinema_friend.domain.results import CheckResult
-from cinema_friend.domain.state import CheckTrigger, WatchStatus
+from cinema_friend.domain.state import CheckTrigger, WatchMode, WatchStatus
 from cinema_friend.domain.time_window import LONDON
 from cinema_friend.domain.watch import Watch
 from cinema_friend.logging_config import correlation_scope
@@ -54,6 +63,14 @@ RETENTION_INTERVAL_SECONDS: Final = 24 * 60 * 60.0
 
 DEFAULT_MAX_CONCURRENT_CHECKS: Final = 2
 """Matches the transport's own host concurrency cap; more would only queue behind it."""
+
+_DEFECT_BACKOFF: Final = timedelta(minutes=15)
+"""How far out a recurring watch is pushed after a check failed unexpectedly.
+
+Mirrors the transport's first circuit delay and ``CheckService``'s own fallback backoff:
+the shortest interval anyone here has judged safe to retry a host after something went
+wrong.
+"""
 
 _TRIGGERS: Final = {
     WatchStatus.ACTIVE: CheckTrigger.SCHEDULED,
@@ -247,8 +264,70 @@ class Scheduler:
                         "check failed",
                         extra={"watch_id": str(watch.watch_id), "trigger": trigger.value},
                     )
-                    return _Outcome.FAILED
-        return _Outcome.CHECKED
+                else:
+                    return _Outcome.CHECKED
+            # Outside the semaphore: the check is over, and the slot belongs to the next
+            # watch rather than to this one's bookkeeping.
+            try:
+                await self._defer_after_defect(watch)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Nothing left to do about it here, and the scan's own count must still
+                # be the truth: one check failed, however its rescheduling went.
+                logger.exception(
+                    "could not reschedule the watch whose check failed",
+                    extra={"watch_id": str(watch.watch_id)},
+                )
+            return _Outcome.FAILED
+
+    async def _defer_after_defect(self, observed: Watch) -> bool:
+        """Move a watch whose check raised something nobody anticipated.
+
+        ``CheckService`` deliberately lets an unknown defect propagate rather than
+        laundering it into a tidy outcome row -- that rule stands, and this does not
+        touch it. But a propagated defect leaves the watch exactly where the scan found
+        it: still due, still in the past. Every later scan then picks it up, fails the
+        same way, and hammers the same fault once a minute for as long as the process
+        runs. Something has to move it, and the scheduler is the only thing left holding
+        it.
+
+        A recurring watch goes to ``BACKOFF`` with a next run a quarter of an hour out --
+        the same interval the transport treats as the shortest safe retry, since a defect
+        of unknown origin deserves at least as much room as a known one. A one-off has no
+        cadence to fall back on, so it is marked ``FAILED`` with no next run and waits for
+        its owner, which is exactly what a network failure already does to it.
+
+        The re-read under ``BEGIN IMMEDIATE`` is the same guard a check commits through:
+        the watch was listed on another connection, and an owner who paused, edited or
+        deleted it while the check was failing must win. A deleted row reads as ``None``
+        and compares unequal, so it is never resurrected.
+        """
+        now = self._deps.clock.now()
+        recurring = observed.criteria.mode is WatchMode.RECURRING
+        status = WatchStatus.BACKOFF if recurring else WatchStatus.FAILED
+        next_check_at = now + _DEFECT_BACKOFF if recurring else None
+        async with self._deps.database.connection() as conn, self._deps.database.transaction(conn):
+            current = await self._deps.watches.get(conn, observed.watch_id)
+            if current != observed:
+                logger.info(
+                    "reschedule skipped because its watch changed",
+                    extra={"watch_id": str(observed.watch_id)},
+                )
+                return False
+            await self._deps.watches.update(
+                conn,
+                replace(current, status=status, next_check_at=next_check_at, updated_at=now),
+            )
+        logger.warning(
+            "watch rescheduled after an unexpected check failure",
+            extra={
+                "watch_id": str(observed.watch_id),
+                "status": status.value,
+                "next_check_at": next_check_at.isoformat() if next_check_at else None,
+            },
+        )
+        return True
 
     async def _expire(self, observed: Watch, now: datetime) -> bool:
         """Retire a watch whose last day has passed, unless it changed since listing.

@@ -76,12 +76,23 @@ class FakeSession:
     def __init__(self, items: Sequence[QueuedItem]) -> None:
         self._items: list[QueuedItem] = list(items)
         self.calls: list[str] = []
+        self.kwargs: list[dict[str, object]] = []
         self.max_concurrent = 0
         self._concurrent = 0
         self.closed = False
 
+    @property
+    def timeouts(self) -> list[object]:
+        """The ``timeout`` argument every recorded ``get`` was called with.
+
+        A request the caller left untimed records ``None``, which is what makes an
+        omitted timeout assertable rather than invisible.
+        """
+        return [kwargs.get("timeout") for kwargs in self.kwargs]
+
     async def get(self, url: str, **_kwargs: object) -> FakeResponse:
         self.calls.append(url)
+        self.kwargs.append(dict(_kwargs))
         self._concurrent += 1
         self.max_concurrent = max(self.max_concurrent, self._concurrent)
         try:

@@ -11,9 +11,15 @@ import pytest
 
 from cinema_friend.bfi.gateway import AvailabilityDrift, BfiGateway
 from cinema_friend.bfi.urls import film_page_url, pagination_url
-from cinema_friend.domain.bfi import Performance
+from cinema_friend.domain.bfi import Performance, SeatStatus
 from cinema_friend.domain.errors import BfiContractError
-from tests.factories.bfi_html import make_article_html, performance_row, seat_map_html
+from tests.factories.bfi_html import (
+    ACCESS_NOTE,
+    ZONE_ID,
+    make_article_html,
+    performance_row,
+    seat_map_html,
+)
 from tests.fakes import FakeClock, FakeTransport, fetched_document
 
 SLUG = "dog-stars"
@@ -92,7 +98,15 @@ async def test_lists_every_paginated_performance_and_deduplicates():
     assert transport.calls == [FILM_URL, PAGE_2_URL]
 
 
-async def test_empty_second_page_contributes_no_performances():
+async def test_empty_second_page_is_a_contract_error():
+    """A later page that carries no rows at all is BFI's shape changing, not an answer.
+
+    The pagination chain is driven by ``total_pages`` from page 1, so a structurally
+    valid page 2 with an empty ``searchResults`` means the listing was truncated
+    somewhere between BFI and this parser. Accepting it silently returns a short list
+    that looks exactly like "the film has fewer performances", which is how a watch
+    quietly stops seeing the very screenings it was created for.
+    """
     page_1 = make_article_html(
         rows=[performance_row(id=PERF_1)],
         total_pages=2,
@@ -109,9 +123,51 @@ async def test_empty_second_page_contributes_no_performances():
         )
     )
 
+    with pytest.raises(BfiContractError, match="page 2"):
+        await gateway.list_performances(SLUG)
+
+
+async def test_empty_first_page_is_a_film_with_no_performances():
+    """Page 1 is the only page allowed to be empty: a film with nothing scheduled."""
+    page_1 = make_article_html(rows=[], total_pages=1, token=TOKEN, article_id=ARTICLE_ID)
+    gateway, transport, _ = make_gateway(
+        transport=FakeTransport({FILM_URL: fetched_document(page_1, url=FILM_URL)})
+    )
+
+    performances = await gateway.list_performances(SLUG)
+
+    assert list(performances) == []
+    assert transport.calls == [FILM_URL]
+
+
+async def test_a_later_page_of_only_non_performance_rows_is_not_empty():
+    """"Empty" means no rows on the wire, not "no rows this gateway cares about"."""
+    page_1 = make_article_html(
+        rows=[performance_row(id=PERF_1)],
+        total_pages=2,
+        token=TOKEN,
+        article_id=ARTICLE_ID,
+    )
+    page_2 = make_article_html(
+        rows=[performance_row(id=PERF_2, object_type="A")],
+        current_page=2,
+        total_pages=2,
+        token=TOKEN,
+        article_id=ARTICLE_ID,
+    )
+    gateway, _, _ = make_gateway(
+        transport=FakeTransport(
+            {
+                FILM_URL: fetched_document(page_1, url=FILM_URL),
+                PAGE_2_URL: fetched_document(page_2, url=PAGE_2_URL),
+            }
+        )
+    )
+
     performances = await gateway.list_performances(SLUG)
 
     assert [item.performance_id for item in performances] == [PERF_1]
+
 
 
 async def test_three_page_listing_fetches_every_page_in_order():
@@ -450,7 +506,7 @@ async def test_cancelling_one_reader_does_not_cancel_the_shared_fetch_for_a_sibl
 
 
 async def test_load_seat_map_returns_seat_map_matching_performance():
-    performance = make_performance(availability_num=1)
+    performance = make_performance(availability_num=2)
     html = seat_map_html(performance_id=PERF_1)
     gateway, _, _ = make_gateway(
         transport=FakeTransport(
@@ -461,7 +517,7 @@ async def test_load_seat_map_returns_seat_map_matching_performance():
     seat_map = await gateway.load_seat_map(performance)
 
     assert seat_map.performance_id == PERF_1
-    assert len(seat_map.seats) == 2
+    assert len(seat_map.seats) == 3
 
 
 async def test_positive_reported_availability_with_zero_parsed_available_is_contract_error():
@@ -484,9 +540,81 @@ async def test_positive_reported_availability_with_zero_parsed_available_is_cont
         await gateway.load_seat_map(performance)
 
 
+def near_sold_out_html(*, available_restricted: int = 2, sold: int = 3) -> str:
+    """A map with nothing left but accessible spaces: every raw-A seat is restricted.
+
+    The zone is an ordinary one, so the only thing marking those seats unofferable is
+    BFI's own ``data-tsmessage``.
+    """
+    restricted = "".join(
+        f'<circle id="wc-{index}" data-status="A" data-seat-section="BFI IMAX" '
+        f'data-seat-row="L" data-seat-seat="{index}" data-tsmessage="{ACCESS_NOTE}" '
+        f'cx="{index * 14}" cy="180"/>'
+        for index in range(1, available_restricted + 1)
+    )
+    taken = "".join(
+        f'<circle id="sold-{index}" data-status="S" data-seat-section="BFI IMAX" '
+        f'data-seat-row="M" data-seat-seat="{index}" cx="{index * 14}" cy="200"/>'
+        for index in range(1, sold + 1)
+    )
+    return f"""<html><script>
+getPerformanceEcommerceObject({{"item_id":"{PERF_1}"}})
+let priceZoneId = "{ZONE_ID}";
+priceZoneInfo[priceZoneId].label = "1 Standard";
+</script>
+<div class="zone-label">1 Standard</div>
+<div class="price-zone-price-text">- £22.00</div>
+<svg><g id="{ZONE_ID}">{restricted}{taken}</g></svg></html>"""
+
+
+async def test_a_map_whose_only_available_seats_are_restricted_is_not_a_contract_error():
+    """Near sold out, with the accessible spaces the last thing left: BFI still counts them.
+
+    ``availability_num`` counts raw ``data-status="A"``, restricted spaces included, so
+    the cross-source check has to count the same thing. Comparing BFI's number against
+    the seats this service would *offer* turns an ordinary late-in-the-run seat map into
+    a fabricated contract error, which pauses the watch and alerts its owner about a
+    site change that never happened.
+    """
+    performance = make_performance(availability_num=2)
+    html = near_sold_out_html()
+    gateway, _, _ = make_gateway(
+        transport=FakeTransport(
+            {performance.seat_map_url: fetched_document(html, url=performance.seat_map_url)}
+        )
+    )
+
+    seat_map = await gateway.load_seat_map(performance)
+
+    available = [seat for seat in seat_map.seats if seat.raw_status_code == "A"]
+    assert len(available) == 2
+    assert all(seat.status is SeatStatus.RESTRICTED for seat in available)
+
+
+async def test_zero_offerable_seats_is_reported_as_a_metric_not_a_failure(
+    caplog: pytest.LogCaptureFixture,
+):
+    performance = make_performance(availability_num=2)
+    gateway, _, _ = make_gateway(
+        transport=FakeTransport(
+            {
+                performance.seat_map_url: fetched_document(
+                    near_sold_out_html(), url=performance.seat_map_url
+                )
+            }
+        )
+    )
+
+    with caplog.at_level(logging.INFO, logger="cinema_friend.bfi.gateway"):
+        await gateway.load_seat_map(performance)
+
+    assert any("restricted" in record.getMessage().lower() for record in caplog.records)
+    assert not [record for record in caplog.records if record.levelno >= logging.WARNING]
+
+
 async def test_availability_drift_over_five_logs_but_does_not_raise(caplog: pytest.LogCaptureFixture):
     performance = make_performance(availability_num=10)
-    html = seat_map_html(performance_id=PERF_1)  # 1 available, 1 sold seat -> difference 9
+    html = seat_map_html(performance_id=PERF_1)  # 2 raw-A, 1 sold seat -> difference 8
     gateway, _, _ = make_gateway(
         transport=FakeTransport(
             {performance.seat_map_url: fetched_document(html, url=performance.seat_map_url)}
@@ -500,9 +628,33 @@ async def test_availability_drift_over_five_logs_but_does_not_raise(caplog: pyte
     assert any("drift" in record.message.lower() for record in caplog.records)
 
 
+async def test_drift_is_measured_against_raw_availability_not_offerable_seats(
+    caplog: pytest.LogCaptureFixture,
+):
+    """Six restricted-but-available seats are not six seats' worth of drift."""
+    restricted = "".join(
+        f'<circle id="wc-{index}" data-status="A" data-seat-section="BFI IMAX" '
+        f'data-seat-row="M" data-seat-seat="{index}" data-tsmessage="{ACCESS_NOTE}" '
+        f'cx="{index * 14}" cy="200"/>'
+        for index in range(1, 7)
+    )
+    performance = make_performance(availability_num=8)
+    html = seat_map_html(performance_id=PERF_1, extra_circles=restricted)
+    gateway, _, _ = make_gateway(
+        transport=FakeTransport(
+            {performance.seat_map_url: fetched_document(html, url=performance.seat_map_url)}
+        )
+    )
+
+    with caplog.at_level(logging.WARNING, logger="cinema_friend.bfi.gateway"):
+        await gateway.load_seat_map(performance)
+
+    assert not [record for record in caplog.records if record.levelno >= logging.WARNING]
+
+
 async def test_small_availability_drift_does_not_log():
-    performance = make_performance(availability_num=1)
-    html = seat_map_html(performance_id=PERF_1)  # 1 available seat -> difference 0
+    performance = make_performance(availability_num=2)
+    html = seat_map_html(performance_id=PERF_1)  # 2 raw-A seats -> difference 0
     gateway, _, _ = make_gateway(
         transport=FakeTransport(
             {performance.seat_map_url: fetched_document(html, url=performance.seat_map_url)}
@@ -512,6 +664,7 @@ async def test_small_availability_drift_does_not_log():
     seat_map = await gateway.load_seat_map(performance)
 
     assert seat_map.performance_id == PERF_1
+
 
 
 async def test_seat_map_identity_mismatch_propagates_contract_error():
@@ -536,7 +689,8 @@ async def test_load_seat_map_without_seat_map_url_raises_contract_error():
 
 
 def test_availability_drift_is_a_plain_dataclass():
-    drift = AvailabilityDrift(reported=5, parsed=3, difference=2)
+    drift = AvailabilityDrift(reported=5, parsed=3, difference=2, offerable=1)
     assert drift.reported == 5
     assert drift.parsed == 3
     assert drift.difference == 2
+    assert drift.offerable == 1

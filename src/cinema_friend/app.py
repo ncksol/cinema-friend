@@ -64,11 +64,15 @@ from cinema_friend.telegram.wizard import WizardDeps, recover_confirmations
 
 logger = logging.getLogger(__name__)
 
-SHUTDOWN_GRACE_SECONDS: Final = 30.0
+SHUTDOWN_GRACE_SECONDS: Final = 60.0
 """How long a check already in flight gets to finish before it is cancelled.
 
-Long enough for a slow BFI response plus its database write, short enough that an
-operator restarting the service does not conclude it has hung.
+Sized against the request budget it has to outlast, not picked round: one BFI hop is
+bounded at 45 seconds by ``bfi.transport.TOTAL_TIMEOUT_SECONDS``, and the check still
+has its database write to do after that. A shorter grace period cancels work that was
+about to succeed and leaves the check run unrecorded; 60 seconds covers the slow case
+while staying short enough that an operator restarting the service does not conclude it
+has hung.
 """
 
 

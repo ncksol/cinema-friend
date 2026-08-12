@@ -260,12 +260,17 @@ def make_scheduler(
     deliveries: FakeDeliveries,
     retention: FakeRetention,
 ) -> Callable[..., Scheduler]:
-    def _make(*, watches: WatchRepository | None = None, **overrides: Any) -> Scheduler:
+    def _make(
+        *,
+        watches: WatchRepository | None = None,
+        checks_runner: Any | None = None,
+        **overrides: Any,
+    ) -> Scheduler:
         return Scheduler(
             SchedulerDependencies(
                 database=database,
                 watches=watches if watches is not None else WatchRepository(),
-                checks=checks,
+                checks=checks_runner if checks_runner is not None else checks,
                 deliveries=deliveries,
                 retention=retention,
                 clock=clock,
@@ -661,6 +666,172 @@ async def test_one_failing_check_does_not_stop_the_others(
     assert scan.checked == 1
     assert {call[0] for call in checks.calls} == {broken.watch_id, healthy.watch_id}
     assert caplog.records
+
+
+# ---------------------------------------------------------------------------
+# Final fix wave: an unexpected defect must not strand the watch
+# ---------------------------------------------------------------------------
+
+
+class MutatingChecks:
+    """Applies a caller-supplied change to the stored watch, then raises.
+
+    This is the race the deferral has to lose: an owner pauses or deletes the watch
+    while its check is in flight, and the check then fails for an unrelated reason. The
+    mutation is applied on the database the scheduler is about to write to, so what the
+    deferral sees is exactly what a concurrent user action would have left there.
+    """
+
+    def __init__(
+        self,
+        database: Database,
+        mutate: Callable[[Database, UUID], Coroutine[Any, Any, None]],
+        error: BaseException,
+    ) -> None:
+        self._database = database
+        self._mutate = mutate
+        self._error = error
+        self.calls: list[tuple[UUID, CheckTrigger]] = []
+
+    async def check(self, watch_id: UUID, trigger: CheckTrigger) -> CheckResult:
+        self.calls.append((watch_id, trigger))
+        await self._mutate(self._database, watch_id)
+        raise self._error
+
+
+async def pause(database: Database, watch_id: UUID) -> None:
+    async with database.connection() as conn, database.transaction(conn):
+        repository = WatchRepository()
+        stored = await repository.get(conn, watch_id)
+        assert stored is not None
+        await repository.update(
+            conn,
+            replace(
+                stored,
+                status=WatchStatus.PAUSED,
+                next_check_at=None,
+                updated_at=NOW + timedelta(seconds=1),
+            ),
+        )
+
+
+async def remove(database: Database, watch_id: UUID) -> None:
+    async with database.connection() as conn, database.transaction(conn):
+        await WatchRepository().delete(conn, watch_id)
+
+
+async def test_an_unexpected_defect_backs_a_recurring_watch_off_by_fifteen_minutes(
+    scheduler: Scheduler,
+    checks: FakeChecks,
+    make_watch: Callable[..., Any],
+    database: Database,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A watch whose check blew up must still have a next run, or it never runs again.
+
+    ``CheckService`` deliberately lets an unknown defect propagate rather than
+    laundering it into a tidy outcome row -- but nothing had then moved the watch, so
+    its ``next_check_at`` stayed in the past and every later scan picked it up, failed
+    the same way, and hammered the same fault once a minute forever.
+    """
+    watch = await make_watch()
+    checks.errors[watch.watch_id] = RuntimeError("something nobody anticipated")
+
+    with caplog.at_level(logging.ERROR, logger=LOGGER_NAME):
+        scan = await scheduler.run_due_once()
+
+    assert scan.failed == 1
+    stored = await reload(database, watch.watch_id)
+    assert stored.status is WatchStatus.BACKOFF
+    assert stored.next_check_at == NOW + timedelta(minutes=15)
+    assert stored.updated_at == NOW
+    assert caplog.records
+
+
+async def test_an_unexpected_defect_fails_a_one_off_watch_with_no_next_run(
+    scheduler: Scheduler,
+    checks: FakeChecks,
+    make_watch: Callable[..., Any],
+    database: Database,
+) -> None:
+    """A one-off has no cadence to fall back on, so it stops and waits for its owner."""
+    watch = await make_watch(mode=WatchMode.ONE_OFF, interval=None)
+    checks.errors[watch.watch_id] = RuntimeError("something nobody anticipated")
+
+    scan = await scheduler.run_due_once()
+
+    assert scan.failed == 1
+    stored = await reload(database, watch.watch_id)
+    assert stored.status is WatchStatus.FAILED
+    assert stored.next_check_at is None
+
+
+async def test_a_deferred_watch_is_not_picked_up_again_by_the_next_scan(
+    scheduler: Scheduler,
+    checks: FakeChecks,
+    make_watch: Callable[..., Any],
+) -> None:
+    watch = await make_watch()
+    checks.errors[watch.watch_id] = RuntimeError("something nobody anticipated")
+
+    await scheduler.run_due_once()
+    await scheduler.run_due_once()
+
+    assert checks.calls == [(watch.watch_id, CheckTrigger.SCHEDULED)]
+
+
+async def test_a_conflict_still_leaves_the_watch_exactly_where_it_was(
+    scheduler: Scheduler,
+    checks: FakeChecks,
+    make_watch: Callable[..., Any],
+    database: Database,
+) -> None:
+    """The deferral is for defects only; an abandoned run writes nothing at all."""
+    watch = await make_watch()
+    checks.errors[watch.watch_id] = ConflictError("watch changed while its check was running")
+
+    scan = await scheduler.run_due_once()
+
+    assert scan.abandoned == 1
+    assert scan.failed == 0
+    stored = await reload(database, watch.watch_id)
+    assert stored == watch
+
+
+async def test_a_watch_paused_during_a_failing_check_keeps_the_owners_decision(
+    make_scheduler: Callable[..., Scheduler],
+    make_watch: Callable[..., Any],
+    database: Database,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The owner paused it; a failed check must not drag it back into a schedule."""
+    watch = await make_watch()
+    checks = MutatingChecks(database, pause, RuntimeError("something nobody anticipated"))
+    scheduler = make_scheduler(checks_runner=checks)
+
+    with caplog.at_level(logging.INFO, logger=LOGGER_NAME):
+        scan = await scheduler.run_due_once()
+
+    assert scan.failed == 1
+    stored = await reload(database, watch.watch_id)
+    assert stored.status is WatchStatus.PAUSED
+    assert stored.next_check_at is None
+
+
+async def test_a_watch_deleted_during_a_failing_check_is_not_resurrected(
+    make_scheduler: Callable[..., Scheduler],
+    make_watch: Callable[..., Any],
+    database: Database,
+) -> None:
+    watch = await make_watch()
+    checks = MutatingChecks(database, remove, RuntimeError("something nobody anticipated"))
+    scheduler = make_scheduler(checks_runner=checks)
+
+    scan = await scheduler.run_due_once()
+
+    assert scan.failed == 1
+    async with database.connection() as conn:
+        assert await WatchRepository().get(conn, watch.watch_id) is None
 
 
 async def test_a_cancelled_check_is_not_swallowed(

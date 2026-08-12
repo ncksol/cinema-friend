@@ -28,6 +28,14 @@ _DEFAULT_ROW: list[Any] = list(_REAL_ROWS[0])
 PERFORMANCE_ID: str = str(_DEFAULT_ROW[SEARCH_NAMES.index("id")])
 ZONE_ID = "3F5950DF-50B9-45EB-A78A-E0E518827835"
 
+ACCESS_NOTE = "NB: This is a space for wheelchair users and their companion"
+"""The wording BFI puts in ``data-tsmessage`` on an accessible space.
+
+Taken from the live seat map recorded in the design's verification table: eight seats
+on the verified performance carried such a message, every one of them wheelchair-space
+or companion wording.
+"""
+
 # The wire value of `options` that means "this performance has a reserved seating plan".
 RESERVED_SEATING_OPTIONS: list[str] = list(_DEFAULT_ROW[SEARCH_NAMES.index("options")])
 
@@ -140,6 +148,7 @@ def seat_map_html(
     zone_label: str = "1 Standard",
     price_text: str = "- £22.00",
     extra_circles: str = "",
+    access_note: str | None = ACCESS_NOTE,
 ) -> str:
     """Return a minimal seat-map HTML page suitable for ``parse_seat_map`` tests.
 
@@ -148,6 +157,10 @@ def seat_map_html(
     - One price zone whose GUID is *zone_id*, label is *zone_label*, and price is
       taken from *price_text* (``"- £22.00"`` format).
     - Two circles in the zone (seat-1 duplicated to exercise deduplication, seat-2).
+    - One ``data-status="A"`` seat in that same ordinary zone carrying *access_note*
+      in ``data-tsmessage``, which is how BFI marks a wheelchair space or its
+      companion seat. Passing ``access_note=None`` omits it, for the tests that need
+      a map with no access note at all.
     - An optional *extra_circles* snippet appended inside the zone ``<g>``.
     """
     return f"""<html><script>
@@ -164,8 +177,25 @@ priceZoneInfo[priceZoneId].label = "{zone_label}";
     data-seat-row="L" data-seat-seat="17" cx="340" cy="180"/>
   <circle id="seat-2" data-status="S" data-seat-section="BFI IMAX"
     data-seat-row="L" data-seat-seat="18" cx="354" cy="180"/>
+  {access_note_circle(access_note)}
   {extra_circles}
 </g></svg></html>"""
+
+
+def access_note_circle(note: str | None = ACCESS_NOTE, *, seat_id: str = "seat-wheelchair") -> str:
+    """Return one available seat carrying *note* in ``data-tsmessage``, or nothing.
+
+    The attribute is ``data-tsmessage`` because that is the one BFI serves. A fixture
+    that invented its own attribute name proved only that the parser agreed with the
+    fixture, while the live signal went unread.
+    """
+    if note is None:
+        return ""
+    return (
+        f'<circle id="{seat_id}" data-status="A" data-seat-section="BFI IMAX" '
+        f'data-seat-row="L" data-seat-seat="19" data-tsmessage="{note}" cx="368" cy="180"/>'
+    )
+
 
 
 def available_circles(count: int, *, first_index: int = 3) -> str:

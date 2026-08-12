@@ -1562,7 +1562,7 @@ catching `TimeoutError` to continue. A stop event terminates promptly.
 
 - [ ] **Step 3: Write lifecycle tests**
 
-Use fakes to assert startup order: migrate database, construct one `AsyncSession`, initialize/start Telegram, start workers. Assert shutdown stops new work, waits up to 30 seconds for active checks, stops/shuts down Telegram, closes transport, and closes resources even when one close step fails.
+Use fakes to assert startup order: migrate database, construct one `AsyncSession`, initialize/start Telegram, start workers. Assert shutdown stops new work, waits up to 60 seconds for active checks, stops/shuts down Telegram, closes transport, and closes resources even when one close step fails.
 
 - [ ] **Step 4: Implement explicit PTB async lifecycle**
 

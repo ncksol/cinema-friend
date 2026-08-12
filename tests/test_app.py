@@ -553,8 +553,14 @@ async def test_stop_waits_for_active_checks_only_up_to_the_grace_period(
     assert any("grace" in record.getMessage().lower() for record in caplog.records)
 
 
-def test_the_specified_grace_period_is_thirty_seconds() -> None:
-    assert SHUTDOWN_GRACE_SECONDS == 30.0
+def test_the_specified_grace_period_is_sixty_seconds() -> None:
+    """Sixty, not thirty: a check can be mid-fetch against a 45-second request budget.
+
+    The grace period has to outlast the slowest request the transport will still be
+    waiting on, plus the database write that follows it. Thirty seconds cut into that
+    budget and cancelled work that was about to succeed.
+    """
+    assert SHUTDOWN_GRACE_SECONDS == 60.0
 
 
 async def test_stop_closes_everything_even_when_one_step_fails(

@@ -125,8 +125,9 @@ The last line is the verdict. Exit codes:
 
 **Exit code 4 is the one that matters.** It means BFI changed the page and the service's
 reading of it is now wrong. The message says which check failed — a missing field, an
-unrecognised seat status, or a mismatch between the availability count BFI reports and the
-number of available seats in the seat map. Do not deploy against a drifted contract: a
+unrecognised seat status, an accessible space that no longer reads as restricted, or a
+mismatch between the availability count BFI reports and the number of available seats in
+the seat map. Do not deploy against a drifted contract: a
 parser that silently mis-reads a seat map is worse than no bot, because it will confidently
 tell you seats exist when they do not. The fix is a code change, not a configuration one.
 

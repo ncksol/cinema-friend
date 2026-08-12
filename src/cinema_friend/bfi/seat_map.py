@@ -31,6 +31,23 @@ _STATUS_MAP: dict[str, SeatStatus] = {
 
 _RESTRICTED_KEYWORDS = ("wheelchair", "companion", "assistant")
 
+#: The seat attributes an access or obstruction note can arrive in, in priority order.
+#: ``data-tsmessage`` is the one BFI actually serves -- an accessible space carries its
+#: "NB: This is a space for wheelchair users..." wording there, and nowhere else. The
+#: two behind it are kept only as tolerant fallbacks for a differently-rendered map;
+#: reading them *first* is what made the live signal invisible, because BFI sends
+#: neither, so every wheelchair space parsed as an ordinary available seat.
+_NOTE_ATTRIBUTES = ("data-tsmessage", "data-note", "title")
+
+
+def seat_note(circle: Any) -> str:
+    """Return the access/obstruction note on *circle*, or ``""`` when it carries none."""
+    for attribute in _NOTE_ATTRIBUTES:
+        note = circle.get(attribute)
+        if note:
+            return str(note)
+    return ""
+
 
 def is_restricted_access(zone_label: str | None, note: str) -> bool:
     """Return True if *zone_label* or *note* indicates a restricted-access seat."""
@@ -92,7 +109,7 @@ def parse_seat_map(html: str, expected_performance_id: str) -> SeatMap:
         section: str = circle.get("data-seat-section", "")
         row: str = circle.get("data-seat-row", "")
         seat_num_str: str = circle.get("data-seat-seat", "")
-        note: str = circle.get("data-note") or circle.get("title") or ""
+        note: str = seat_note(circle)
 
         if not section:
             raise BfiContractError(f"seat {seat_id!r}: missing data-seat-section")

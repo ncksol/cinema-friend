@@ -8,7 +8,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import Protocol, cast
+from typing import Final, Protocol, cast
 from urllib.parse import urljoin, urlsplit
 
 from curl_cffi.requests import AsyncSession
@@ -58,6 +58,28 @@ _SERVER_ERROR_DELAYS: tuple[float, ...] = (1.0, 3.0)
 _FORBIDDEN_DELAYS: tuple[float, ...] = (2.0, 4.0, 6.0)
 
 _MAX_REDIRECT_HOPS = 5
+
+CONNECT_TIMEOUT_SECONDS: Final = 10.0
+"""How long one hop may spend establishing its connection."""
+
+TOTAL_TIMEOUT_SECONDS: Final = 45.0
+"""How long one hop may take end to end, connection included."""
+
+REQUEST_TIMEOUT: Final = (CONNECT_TIMEOUT_SECONDS, TOTAL_TIMEOUT_SECONDS - CONNECT_TIMEOUT_SECONDS)
+"""The explicit budget passed to every outbound GET, in ``curl_cffi``'s own units.
+
+Verified against ``curl_cffi`` 0.16 (``requests/utils.py``): for a non-streamed request
+a ``(connect, read)`` tuple sets ``CONNECTTIMEOUT_MS = connect`` and
+``TIMEOUT_MS = connect + read``. The tuple below therefore *is* a 10-second connect and
+a 45-second whole-request budget, which is what the design specifies.
+
+It is passed per request rather than left to the session default (a bare 30 seconds,
+with no separate connection bound) because the deadline a check runs under is part of
+this transport's contract, not a property of whichever session it was handed: a session
+supplied by the application, or by a test, would otherwise silently change it. Without
+it, a hung socket parks a check forever, holds one of two concurrency slots, and keeps
+the scheduler's shutdown grace period waiting on work that will never finish.
+"""
 
 # How long a persisted HALF_OPEN record is trusted as "someone is actively
 # probing" before it is treated as abandoned (the process that claimed it
@@ -474,7 +496,7 @@ class BfiTransport:
                     if elapsed < self._min_spacing:
                         await self._clock.sleep(self._min_spacing - elapsed)
                 self._last_start_monotonic = self._clock.monotonic()
-            return await self._session.get(url, allow_redirects=False)
+            return await self._session.get(url, allow_redirects=False, timeout=REQUEST_TIMEOUT)
 
 
 def _build_document(url: str, response: HttpResponse) -> FetchedDocument:

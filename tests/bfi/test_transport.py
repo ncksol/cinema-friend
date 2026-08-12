@@ -10,6 +10,9 @@ import pytest
 
 from cinema_friend.bfi.transport import (
     _PROBE_LEASE_SECONDS,
+    CONNECT_TIMEOUT_SECONDS,
+    REQUEST_TIMEOUT,
+    TOTAL_TIMEOUT_SECONDS,
     BfiTransport,
     DocumentKind,
     FetchedDocument,
@@ -749,3 +752,48 @@ async def test_a_network_message_does_not_carry_the_query_of_its_cause():
         await transport.get(PAGE_TWO_URL, DocumentKind.ARTICLE)
 
     assert_safe(str(caught.value))
+
+
+# ---------------------------------------------------------------------------
+# Final fix wave: every request carries an explicit timeout budget
+# ---------------------------------------------------------------------------
+
+
+async def test_every_request_carries_the_explicit_timeout_budget():
+    """A request with no deadline is a watch that stops running and never says so.
+
+    `curl_cffi` 0.16 reads a ``(connect, read)`` tuple as CONNECTTIMEOUT_MS = connect
+    and TIMEOUT_MS = connect + read for a non-streamed request, so the tuple below is
+    the design's 10-second connect and 45-second whole-request budget.
+    """
+    session = FakeSession([response(200, ARTICLE)])
+    transport = make_transport(session=session)
+
+    await transport.get(FILM_URL, DocumentKind.SEAT_MAP)
+
+    assert session.timeouts == [REQUEST_TIMEOUT]
+    assert REQUEST_TIMEOUT[0] == CONNECT_TIMEOUT_SECONDS == 10.0
+    assert sum(REQUEST_TIMEOUT) == TOTAL_TIMEOUT_SECONDS == 45.0
+
+
+async def test_a_retried_request_carries_the_timeout_on_every_attempt():
+    session = FakeSession([response(503), response(503), response(200, ARTICLE)])
+    transport = make_transport(session=session, jitter_source=lambda: 0.0)
+
+    await transport.get(FILM_URL, DocumentKind.ARTICLE)
+
+    assert session.timeouts == [REQUEST_TIMEOUT] * 3
+
+
+async def test_a_redirect_hop_carries_the_timeout_too():
+    session = FakeSession(
+        [
+            response(302, headers={"location": FILM_URL}),
+            response(200, ARTICLE),
+        ]
+    )
+    transport = make_transport(session=session)
+
+    await transport.get(FILM_URL, DocumentKind.ARTICLE)
+
+    assert session.timeouts == [REQUEST_TIMEOUT] * 2

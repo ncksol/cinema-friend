@@ -28,8 +28,19 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_CACHE_SECONDS = 60.0
 
+_AVAILABLE_STATUS_CODE = "A"
+"""The raw ``data-status`` value BFI counts in ``availability_num``.
+
+The cross-source comparison is stated against this attribute rather than against
+:attr:`SeatStatus.AVAILABLE`, because the seat-map parser reclassifies an accessible
+space as ``RESTRICTED`` while BFI keeps counting it. Comparing BFI's number against
+the *offerable* seats manufactures a contract error out of an ordinary near-sold-out
+map -- which pauses the watch and alerts its owner about a site change that never
+happened.
+"""
+
 # Absolute drift between BFI's reported availability_num and the count of
-# seats this gateway parsed as AVAILABLE above which the mismatch is logged
+# seats this gateway parsed as raw-A above which the mismatch is logged
 # (but not treated as fatal -- BFI's own counter can legitimately lag the
 # seat-map SVG by a few seats under concurrent bookings).
 _DRIFT_LOG_THRESHOLD = 5
@@ -39,6 +50,12 @@ _DRIFT_LOG_THRESHOLD = 5
 class AvailabilityDrift:
     """Difference between BFI's reported ``availability_num`` and parsed seats.
 
+    ``parsed`` counts raw ``data-status="A"`` circles, which is what BFI's own counter
+    counts: an accessible space is included in ``availability_num`` even though this
+    service will never offer it. ``offerable`` is the narrower count of seats a watch
+    could actually be told about, carried alongside as a metric so a near-sold-out map
+    whose last seats are all wheelchair spaces reads as what it is instead of as drift.
+
     ``difference`` is ``reported - parsed``: positive when BFI reports more
     availability than the seat map shows, negative when the seat map shows
     more available seats than BFI's counter reports.
@@ -47,6 +64,7 @@ class AvailabilityDrift:
     reported: int
     parsed: int
     difference: int
+    offerable: int
 
 
 class DocumentTransport(Protocol):
@@ -94,8 +112,17 @@ class BfiGateway:
         Deduplicates rows by ``performance_id`` (an exact repeat, e.g. from
         overlapping pages, is collapsed to one entry) and raises
         :class:`BfiContractError` if two rows share an ID but disagree on
-        the parsed data, or if ``article_id``/``total_pages`` changes
-        between pages of the same listing.
+        the parsed data, if ``article_id``/``total_pages`` changes between
+        pages of the same listing, or if a page after the first carries no
+        rows at all.
+
+        An empty later page is a contract error rather than the end of the
+        listing. The chain length comes from page 1's ``total_pages``, so a
+        structurally valid page that yields nothing means the listing was
+        truncated somewhere between BFI and this parser -- and a truncated
+        listing is indistinguishable, downstream, from a film that simply
+        has fewer screenings. Page 1 is exempt: a film with nothing on sale
+        is the one legitimate way to see no rows.
         """
         url = film_page_url(slug)
         document = await self._fetch_document(url, DocumentKind.ARTICLE)
@@ -110,6 +137,11 @@ class BfiGateway:
             next_document = await self._fetch_document(page_url, DocumentKind.ARTICLE)
             page = parse_article_page(next_document.text)
             _validate_pagination_identity(first_page, page, page_number)
+            if not page.rows:
+                raise BfiContractError(
+                    f"page {page_number} of {first_page.total_pages} carried no rows; "
+                    "the listing is truncated"
+                )
             title = _merge_title(title, page.title, page_number)
             self._collect_page(page, performances)
 
@@ -121,8 +153,10 @@ class BfiGateway:
         Raises :class:`BfiContractError` if the seat map's embedded
         performance identity does not match *performance* (checked by
         :func:`~cinema_friend.bfi.seat_map.parse_seat_map`), or if BFI
-        reports positive availability while zero seats parse as available.
-        A larger, non-zero drift is logged but does not fail the read.
+        reports positive availability while the map carries no raw-``A``
+        seat at all. A larger, non-zero drift is logged but does not fail
+        the read, and a map whose available seats are all restricted is a
+        logged metric rather than any kind of failure.
         """
         if performance.seat_map_url is None:
             raise BfiContractError(
@@ -139,11 +173,19 @@ class BfiGateway:
             )
         if abs(drift.difference) > _DRIFT_LOG_THRESHOLD:
             logger.warning(
-                "availability drift for performance %s: reported=%d parsed=%d difference=%d",
+                "availability drift for performance %s: reported=%d parsed=%d "
+                "difference=%d offerable=%d",
                 performance.performance_id,
                 drift.reported,
                 drift.parsed,
                 drift.difference,
+                drift.offerable,
+            )
+        elif drift.parsed > 0 and drift.offerable == 0:
+            logger.info(
+                "every available seat for performance %s is restricted: parsed=%d offerable=0",
+                performance.performance_id,
+                drift.parsed,
             )
         return seat_map
 
@@ -230,6 +272,12 @@ def _merge_title(current: str | None, page_title: str | None, page_number: int) 
 
 
 def _availability_drift(performance: Performance, seat_map: SeatMap) -> AvailabilityDrift:
-    parsed = sum(1 for seat in seat_map.seats if seat.status is SeatStatus.AVAILABLE)
+    parsed = sum(1 for seat in seat_map.seats if seat.raw_status_code == _AVAILABLE_STATUS_CODE)
+    offerable = sum(1 for seat in seat_map.seats if seat.status is SeatStatus.AVAILABLE)
     reported = performance.availability_num
-    return AvailabilityDrift(reported=reported, parsed=parsed, difference=reported - parsed)
+    return AvailabilityDrift(
+        reported=reported,
+        parsed=parsed,
+        difference=reported - parsed,
+        offerable=offerable,
+    )

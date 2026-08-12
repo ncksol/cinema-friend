@@ -65,10 +65,12 @@ def clock() -> FakeClock:
 def eligible_row(**overrides: Any) -> list[Any]:
     """A row the smoke must accept: on sale, reserved seating, one seat available.
 
-    ``availability_num`` is 1 because the shared seat-map fixture carries exactly one
-    ``data-status="A"`` circle, and the contract the smoke enforces is equality.
+    ``availability_num`` is 2 because the shared seat-map fixture carries two
+    ``data-status="A"`` circles -- an ordinary seat and one accessible space -- and the
+    contract the smoke enforces is equality against the raw attribute, which is what
+    BFI's own counter counts.
     """
-    return performance_row(**{"sales_status": "S", "availability_num": "1", **overrides})
+    return performance_row(**{"sales_status": "S", "availability_num": "2", **overrides})
 
 
 def article_html(
@@ -275,7 +277,7 @@ async def test_requires_http_200() -> None:
 async def test_requires_exact_agreement_between_reported_and_parsed_availability() -> None:
     session = FakeSession(
         [
-            response(200, article_html([eligible_row(availability_num="2")])),
+            response(200, article_html([eligible_row(availability_num="3")])),
             response(200, seat_map_html()),
         ]
     )
@@ -310,10 +312,83 @@ async def test_requires_every_seat_status_code_to_be_recognised() -> None:
         await run_smoke(FILM_URL, profile="chrome", session=session, clock=clock())
 
 
+# ---------------------------------------------------------------------------
+# Final fix wave: the access-note signal is live-verified, not fixture-verified
+# ---------------------------------------------------------------------------
+
+
+async def test_requires_the_seat_map_to_carry_at_least_one_access_note() -> None:
+    """No note anywhere means the attribute stopped being read, or stopped being sent.
+
+    A BFI IMAX map always carries wheelchair spaces and their companion seats, and each
+    of them carries a ``data-tsmessage``. A run that finds none of them has either lost
+    the wire signal or is reading an attribute the site does not serve -- which is
+    exactly the defect that a fixture pinning an invented attribute could not detect.
+    """
+    session = FakeSession(
+        [
+            response(200, article_html([eligible_row(availability_num="1")])),
+            response(200, seat_map_html(access_note=None)),
+        ]
+    )
+
+    with pytest.raises(BfiContractError, match="access note"):
+        await run_smoke(FILM_URL, profile="chrome", session=session, clock=clock())
+
+
+async def test_requires_every_access_note_seat_to_parse_as_restricted() -> None:
+    """The note is what makes the seat unofferable; parsing it as available offers it."""
+    session = FakeSession(
+        [
+            response(200, article_html([eligible_row(availability_num="3")])),
+            response(
+                200,
+                seat_map_html(
+                    extra_circles=(
+                        '<circle id="seat-obstructed" data-status="A" '
+                        'data-seat-section="BFI IMAX" data-seat-row="M" data-seat-seat="4" '
+                        'data-tsmessage="This is a wheelchair space" cx="10" cy="20"/>'
+                    )
+                ),
+            ),
+        ]
+    )
+
+    report = await run_smoke(FILM_URL, profile="chrome", session=session, clock=clock())
+
+    assert report.access_note_seats == 2
+    assert report.restricted_seats == 2
+    assert report.offerable_seats == 1
+
+
+async def test_an_access_note_seat_left_offerable_is_a_contract_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Prove the check has teeth: with the note ignored, the smoke must fail.
+
+    ``is_restricted_access`` is the one place the note is turned into a status, so
+    neutering it is the smallest faithful stand-in for BFI renaming the attribute or the
+    parser reading the wrong one.
+    """
+    monkeypatch.setattr(
+        "cinema_friend.bfi.seat_map.is_restricted_access",
+        lambda zone_label, note: False,
+    )
+    session = FakeSession(
+        [
+            response(200, article_html()),
+            response(200, seat_map_html()),
+        ]
+    )
+
+    with pytest.raises(BfiContractError, match="RESTRICTED"):
+        await run_smoke(FILM_URL, profile="chrome", session=session, clock=clock())
+
+
 def test_contract_mismatch_exits_4() -> None:
     session = FakeSession(
         [
-            response(200, article_html([eligible_row(availability_num="2")])),
+            response(200, article_html([eligible_row(availability_num="3")])),
             response(200, seat_map_html()),
         ]
     )
@@ -362,9 +437,10 @@ def test_passing_contract_exits_0_and_reports_profile_and_counts(
     assert "article pages fetched: 1" in out
     assert "performances parsed: 1" in out
     assert "seat maps fetched: 1" in out
-    assert "seats parsed: 2" in out
-    assert "available seats: 1" in out
-    assert "reported availability: 1" in out
+    assert "seats parsed: 3" in out
+    assert "available seats: 2" in out
+    assert "offerable seats: 1" in out
+    assert "reported availability: 2" in out
     assert f"performance: {PERFORMANCE_ID}" in out
 
 
@@ -396,9 +472,11 @@ async def test_report_counts_seats_and_availability() -> None:
 
     assert report.profile == "chrome"
     assert report.slug == SLUG
-    assert report.seats_parsed == 2, "the duplicated outline/fill circle must collapse to one seat"
-    assert report.available_seats == 1
-    assert report.reported_availability == 1
+    assert report.seats_parsed == 3, "the duplicated outline/fill circle must collapse to one seat"
+    assert report.available_seats == 2
+    assert report.offerable_seats == 1, "the accessible space is available but not offerable"
+    assert report.access_note_seats == 1
+    assert report.reported_availability == 2
     assert report.price_zones == 1
     assert report.performance_id == PERFORMANCE_ID
 
@@ -413,7 +491,7 @@ def test_closes_the_session_on_success() -> None:
 def test_closes_the_session_when_the_contract_fails() -> None:
     session = FakeSession(
         [
-            response(200, article_html([eligible_row(availability_num="2")])),
+            response(200, article_html([eligible_row(availability_num="3")])),
             response(200, seat_map_html()),
         ]
     )
@@ -546,7 +624,7 @@ async def test_runs_end_to_end_against_the_captured_live_article_page() -> None:
                 200,
                 seat_map_html(
                     performance_id=performance.performance_id,
-                    extra_circles=available_circles(performance.availability_num - 1),
+                    extra_circles=available_circles(performance.availability_num - 2),
                 ),
             ),
         ]

@@ -8,12 +8,14 @@ question that can detect drift:
     one film page + its pagination chain + one seat map
 
 It reads exactly one performance's seat map, chosen as the first on-sale reserved
-performance with availability, and then asserts the one invariant that two independently
+performance with availability, and then asserts the invariants that two independently
 produced BFI documents must satisfy at the same instant: ``availability_num`` from the
-listing equals the number of ``data-status="A"`` seats in the seat map. Because the two
+listing equals the number of ``data-status="A"`` seats in the seat map, and every seat
+carrying an access note in ``data-tsmessage`` has parsed as restricted. Because the two
 reads happen seconds apart, the service tolerates small drift at runtime; here they are
 read back-to-back and the equality is exact, which makes this the cheapest available
-detector of a change in either parser.
+detector of a change in either parser. The access-note assertion is here for the same
+reason: a signal only fixtures ever check is a signal nobody is checking.
 
 What it deliberately does not do:
 
@@ -48,6 +50,7 @@ from pathlib import Path
 from typing import Final
 
 from cinema_friend.bfi.gateway import BfiGateway, DocumentTransport
+from cinema_friend.bfi.seat_map import is_restricted_access
 from cinema_friend.bfi.transport import (
     AsyncHttpSession,
     BfiTransport,
@@ -114,6 +117,8 @@ class SmokeReport:
     seats_parsed: int
     available_seats: int
     offerable_seats: int
+    access_note_seats: int
+    restricted_seats: int
     price_zones: int
     seat_statuses: tuple[tuple[str, int], ...]
     bytes_fetched: int
@@ -134,6 +139,8 @@ class SmokeReport:
             f"seats parsed: {self.seats_parsed}",
             f"available seats: {self.available_seats}",
             f"offerable seats: {self.offerable_seats}",
+            f"seats carrying an access note: {self.access_note_seats}",
+            f"restricted seats: {self.restricted_seats}",
             f"price zones: {self.price_zones}",
             f"seat statuses: {statuses}",
             f"bytes fetched: {self.bytes_fetched}",
@@ -285,6 +292,7 @@ async def run_smoke(
 
         recorder.require_all_ok()
         _require_complete_seats(seat_map)
+        _require_access_notes_restricted(seat_map)
         available = _count_available(seat_map)
         _require_exact_availability(performance, available)
         _require_bounded_reads(recorder)
@@ -303,6 +311,10 @@ async def run_smoke(
             available_seats=available,
             offerable_seats=sum(
                 1 for seat in seat_map.seats if seat.status is SeatStatus.AVAILABLE
+            ),
+            access_note_seats=sum(1 for seat in seat_map.seats if seat.note),
+            restricted_seats=sum(
+                1 for seat in seat_map.seats if seat.status is SeatStatus.RESTRICTED
             ),
             price_zones=len({seat.zone.zone_id for seat in seat_map.seats if seat.zone}),
             seat_statuses=_status_histogram(seat_map),
@@ -359,6 +371,36 @@ def _require_complete_seats(seat_map: SeatMap) -> None:
         if seat.status is SeatStatus.UNKNOWN:
             raise BfiContractError(
                 f"seat {seat.seat_id!r}: unrecognised status code {seat.raw_status_code!r}"
+            )
+
+
+def _require_access_notes_restricted(seat_map: SeatMap) -> None:
+    """Hold BFI's own access-note signal to what the service depends on it meaning.
+
+    Two things are checked, and the first is the point of the second. A BFI IMAX map
+    always contains wheelchair spaces and their companion seats, and every one of them
+    carries its wording in ``data-tsmessage`` -- eight of them on the performance this
+    contract was verified against. So a run that finds no note anywhere has not found a
+    map without accessible seating; it has lost the wire signal, either because BFI
+    renamed the attribute or because the parser is reading one the site never sends.
+    That is exactly how a fabricated attribute survived a green suite: with no live
+    assertion, an always-empty note is indistinguishable from a map with nothing to say.
+
+    Given a note is present, any seat whose note carries access or restriction wording
+    must have parsed as ``RESTRICTED``. It is the only thing keeping a wheelchair space
+    out of a suggestion sent to somebody who cannot use it.
+    """
+    noted = [seat for seat in seat_map.seats if seat.note]
+    if not noted:
+        raise BfiContractError(
+            f"no seat in a {len(seat_map.seats)}-seat map carried an access note; "
+            "the data-tsmessage signal is not being read"
+        )
+    for seat in noted:
+        if is_restricted_access(None, seat.note) and seat.status is not SeatStatus.RESTRICTED:
+            raise BfiContractError(
+                f"seat {seat.seat_id!r} carries an access note but parsed as "
+                f"{seat.status.name}, not RESTRICTED"
             )
 
 
