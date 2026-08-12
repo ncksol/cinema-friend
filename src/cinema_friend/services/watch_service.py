@@ -37,7 +37,9 @@ class WatchService:
         self._watches = watches
         self._clock = clock
 
-    async def create(self, owner_user_id: int, criteria: WatchCriteria) -> Watch:
+    async def create(
+        self, owner_user_id: int, criteria: WatchCriteria, *, watch_id: UUID | None = None
+    ) -> Watch:
         """Persist a new watch, storing the article's canonical URL/slug.
 
         The caller's ``source_url``/``slug`` may be any accepted BFI shape (or may
@@ -45,12 +47,18 @@ class WatchService:
         truth for what the article actually is, so its result -- not the caller's -- is
         what gets stored. The watch is scheduled for an immediate check; ``title`` stays
         ``None`` until that check's BFI parse names the film.
+
+        Passing ``watch_id`` makes the call idempotent: a caller that derives a stable
+        identity from a durable setup record can retry after a crash without risking a
+        second watch, because an existing row with that id is returned unchanged. An id
+        belonging to another owner raises the usual not-found error rather than
+        revealing that it exists.
         """
         article = parse_article_url(criteria.source_url)
         canonical_criteria = replace(criteria, source_url=article.canonical_url, slug=article.slug)
         now = self._clock.now()
         watch = Watch(
-            watch_id=uuid4(),
+            watch_id=watch_id if watch_id is not None else uuid4(),
             user_id=owner_user_id,
             criteria=canonical_criteria,
             status=WatchStatus.ACTIVE,
@@ -59,6 +67,12 @@ class WatchService:
             next_check_at=now,
         )
         async with self._database.connection() as conn, self._database.transaction(conn):
+            if watch_id is not None:
+                existing = await self._watches.get(conn, watch_id)
+                if existing is not None:
+                    if existing.user_id != owner_user_id:
+                        raise InputError(_NOT_FOUND)
+                    return existing
             await self._watches.create(conn, watch)
         return watch
 

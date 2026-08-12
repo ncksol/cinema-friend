@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, date, datetime, time, timedelta
+from zoneinfo import ZoneInfo
 
 from cinema_friend.domain.bfi import Performance, PriceZone, Seat, SeatBlock, SeatMap, SeatStatus
 from cinema_friend.domain.state import WatchMode
@@ -158,6 +159,29 @@ def maps_with_scores(
         (perf_b, _single_row_map(perf_b.performance_id, target_x=300.0 + (100.0 - score_b) * 5.0)),
         (perf_c, _single_row_map(perf_c.performance_id, target_x=300.0 + (100.0 - score_c) * 5.0)),
     )
+
+
+def test_preferred_time_distance_is_measured_from_the_utc_instant() -> None:
+    """A London-local preference must reach ranking as the instant it really names.
+
+    ``20:00`` on 27 August in London is ``19:00Z``; the performance starting at that
+    instant is the closest one, and would not be if the local reading were treated as
+    UTC.
+    """
+    preferred_utc = datetime(2026, 8, 27, 20, 0, tzinfo=ZoneInfo("Europe/London")).astimezone(UTC)
+    assert preferred_utc == datetime(2026, 8, 27, 19, 0, tzinfo=UTC)
+    criteria = criteria_with_preferred_time(preferred_utc_instant=preferred_utc)
+    at_preference = performance("A-PERF", datetime(2026, 8, 27, 19, 0, tzinfo=UTC))
+    an_hour_later = performance("B-PERF", datetime(2026, 8, 27, 20, 0, tzinfo=UTC))
+    maps = (
+        (at_preference, _single_row_map("A-PERF", target_x=305.0)),
+        (an_hour_later, _single_row_map("B-PERF", target_x=305.0)),
+    )
+
+    ranked = rank_options(criteria, maps)
+
+    assert [option.performance.performance_id for option in ranked] == ["A-PERF", "B-PERF"]
+    assert [option.rank_vector.preferred_time_distance_minutes for option in ranked] == [0, 60]
 
 
 def test_time_breaks_only_within_same_five_point_band() -> None:

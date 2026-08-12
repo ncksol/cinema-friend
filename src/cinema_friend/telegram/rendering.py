@@ -17,20 +17,19 @@ import html
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 
 from cinema_friend.domain.results import RankedOption, SnapshotPage
 from cinema_friend.domain.state import WatchMode, WatchStatus
+from cinema_friend.domain.time_window import LONDON
 from cinema_friend.domain.watch import Watch
 from cinema_friend.telegram.callbacks import encode_callback
 
 MAX_MESSAGE_CHARS = 4096
 MAX_OPTIONS_PER_PAGE = 10
 
-LONDON = ZoneInfo("Europe/London")
 _TIME_FORMAT = "%a %d %b %Y, %H:%M"
 _DATE_FORMAT = "%d %b %Y"
 _CLOCK_FORMAT = "%H:%M"

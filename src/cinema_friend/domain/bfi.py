@@ -7,9 +7,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from enum import Enum
-from zoneinfo import ZoneInfo
 
-_LONDON = ZoneInfo("Europe/London")
+from cinema_friend.domain.time_window import LONDON as _LONDON
 
 
 class SeatStatus(Enum):

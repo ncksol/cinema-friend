@@ -13,44 +13,63 @@ are advanced by :func:`handle_wizard_text`; button-driven states (``AWAIT_QUANTI
 draft completely unchanged and replies with the same message the parser raised, which
 already names the accepted shape.
 
-Confirmation is the one place a duplicate Telegram delivery could do real damage: two
-callbacks for the same button press must never create two watches. ``REVIEW`` cannot
-transition straight to a created watch and a deleted draft in one step, because
-:class:`~cinema_friend.services.watch_service.WatchService` and
-:class:`~cinema_friend.storage.draft_repository.DraftRepository` own separate
-connections and neither offers a caller-supplied identity to de-duplicate against.
-Instead, confirmation first *claims* the draft -- flipping its state from ``REVIEW`` to
-the internal ``CONFIRMING`` marker inside one ``BEGIN IMMEDIATE`` transaction. SQLite
-serialises that transaction against any concurrent attempt for the same user, so a
-second call -- a genuine concurrent duplicate, or a retry after a crash that left the
-claim in place but the watch not yet created -- always observes a state other than
-``REVIEW`` and returns the same idempotent "nothing to do" reply instead of creating a
-second watch.
+Confirmation is the one step with effects outside the draft table -- a watch row and a
+creation check -- so it is written as a saga rather than a single transition. A watch
+and its draft live behind separate connections and cannot be committed together, which
+leaves durable intermediate states no matter how the code is arranged; the saga's job
+is to make every one of them converge on the same outcome.
+
+Confirmation first *claims* the draft, flipping ``REVIEW`` to the internal
+``CONFIRMING`` marker inside one ``BEGIN IMMEDIATE`` transaction that also persists a
+``setup_id``. SQLite serialises that transaction, so a concurrent duplicate always
+loses the claim. The setup id then yields a deterministic ``watch_id`` (a UUID5 of it),
+which is what makes retrying safe: re-running :meth:`WatchService.create` after a crash
+lands on the same row instead of inserting a second watch. Each completed step records
+its :class:`ConfirmPhase` on the draft, so a resumed attempt skips work already done --
+notably it never re-runs a creation check that already ran.
+
+Three things end a claim. Success deletes the draft. A routine failure (network,
+persistence) compensates: the draft goes back to ``REVIEW``, keeping its phase markers,
+and the reply describes what actually happened -- a failure after the watch exists must
+not tell the user nothing was saved. A crash leaves the claim in place, and the claim
+carries a :data:`CLAIM_LEASE`: once it expires a retried Confirm resumes the saga, and
+:func:`recover_confirmations` does the same at startup without waiting for the user.
 """
 
 from __future__ import annotations
 
 import html
 import re
+import sqlite3
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from enum import Enum
 from typing import Any, Protocol
-from uuid import UUID
+from uuid import UUID, uuid4, uuid5
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 
 from cinema_friend.bfi.urls import parse_article_url
 from cinema_friend.clock import Clock
-from cinema_friend.domain.errors import InputError
+from cinema_friend.domain.errors import (
+    BfiChallengeError,
+    BfiContractError,
+    BfiNetworkError,
+    CircuitOpenError,
+    ConflictError,
+    DeliveryError,
+    InputError,
+    PersistenceError,
+)
 from cinema_friend.domain.results import CheckResult
 from cinema_friend.domain.state import CheckTrigger, WatchMode
+from cinema_friend.domain.time_window import LONDON, within_daily_window
 from cinema_friend.domain.watch import WatchCriteria
 from cinema_friend.services.watch_service import WatchService
 from cinema_friend.storage.database import Database
-from cinema_friend.storage.draft_repository import DraftRepository
+from cinema_friend.storage.draft_repository import ConversationDraft, DraftRepository
 from cinema_friend.telegram.rendering import RenderedMessage
 
 #: The known BFI row width; a same-row seat range or a bare seat number beyond this is
@@ -61,15 +80,38 @@ MAX_ROW_WIDTH = 40
 #: Matches :class:`WatchCriteria`'s own floor for a recurring watch's interval.
 MIN_INTERVAL_MINUTES = 15
 
+#: How long a confirmation claim is assumed to still be in flight. Past this, the
+#: claiming process is presumed dead and the saga may be resumed by anyone. It has to
+#: exceed the worst realistic time for one creation check, or a slow check would have
+#: its own work stolen; each completed phase refreshes the draft, renewing the lease.
+CLAIM_LEASE = timedelta(minutes=5)
+
+#: Namespace for deriving a watch id from a draft's ``setup_id``. Fixed forever: change
+#: it and in-flight confirmations would resume into a *second* watch.
+_WATCH_NAMESPACE = UUID("6f3f7a0e-2c56-4d5b-9b1a-0d5f9f5a1c77")
+
 _SKIP = "skip"
+
+
+class ConfirmPhase(str, Enum):
+    """How far a claimed confirmation got before it stopped.
+
+    Persisted on the draft after each step completes, so a resumed attempt can tell
+    "not done yet" from "already done" for every effect outside the draft table.
+    """
+
+    CLAIMED = "claimed"
+    WATCH_CREATED = "watch_created"
+    CHECK_STARTED = "check_started"
+    CHECK_DONE = "check_done"
 
 
 class WizardState(str, Enum):
     """One step of the guided watch-creation conversation.
 
-    ``CONFIRMING`` is never prompted to the user; it exists purely as the claimed,
-    in-flight marker between ``REVIEW`` and the draft's deletion once the watch is
-    created, so a duplicate confirmation can recognise "already being handled".
+    ``CONFIRMING`` is never prompted to the user; it is the claimed, in-flight marker
+    held for the duration of the confirmation saga, so a duplicate confirmation can
+    recognise an attempt already under way and a resumed one can find work left behind.
     """
 
     AWAIT_URL = "await_url"
@@ -241,8 +283,8 @@ def parse_interval(text: str) -> timedelta:
 
 
 _INSTANT_EXAMPLE = (
-    "send a preferred UTC date and time like 2026-08-27 20:00, within your date and "
-    "time range, or send 'skip'"
+    "send a preferred London date and time like 2026-08-27 20:00, within your date "
+    "and time range, or send 'skip'"
 )
 
 
@@ -253,12 +295,16 @@ def _is_skip(text: str) -> bool:
 def _parse_preferred_instant(text: str, payload: Mapping[str, Any]) -> datetime | None:
     """Parse the optional preferred instant, or ``None`` for an explicit skip.
 
-    Validated exactly the way :meth:`WatchCriteria.__post_init__` validates
-    ``preferred_utc_instant`` -- against the instant's own UTC date and time components,
-    not a timezone conversion of them -- so accepting input here can never be
-    overturned by that later, stricter check. Both the date and the time predicate must
-    hold; failing either raises the same message so the user always sees one concrete
-    accepted example.
+    The user types a wall clock, and the only wall clock in play is the cinema's, so
+    the text is read as ``Europe/London`` local time and validated against the local
+    date and daily window before being converted to UTC for storage. Reading it as UTC
+    instead would silently shift every summer preference by an hour, and would validate
+    against the wrong day for anything near midnight.
+
+    Validation mirrors :meth:`WatchCriteria.__post_init__` exactly -- same conversion,
+    same shared window predicate -- so accepting input here can never be overturned by
+    that later check. A time that does not exist locally (the spring-forward gap) is
+    rejected: silently sliding it an hour would be a different showing.
     """
     if _is_skip(text):
         return None
@@ -266,16 +312,18 @@ def _parse_preferred_instant(text: str, payload: Mapping[str, Any]) -> datetime 
         naive = datetime.strptime(text.strip(), "%Y-%m-%d %H:%M")  # noqa: DTZ007
     except ValueError as exc:
         raise InputError(_INSTANT_EXAMPLE) from exc
-    instant = naive.replace(tzinfo=UTC)
+    local = naive.replace(tzinfo=LONDON)
+    if local.astimezone(UTC).astimezone(LONDON).replace(tzinfo=None) != naive:
+        raise InputError(_INSTANT_EXAMPLE)
     date_from = date.fromisoformat(payload["date_from"])
     date_to = date.fromisoformat(payload["date_to"])
     time_from = time.fromisoformat(payload["time_from"])
     time_to = time.fromisoformat(payload["time_to"])
-    if not (date_from <= instant.date() <= date_to):
+    if not (date_from <= local.date() <= date_to):
         raise InputError(_INSTANT_EXAMPLE)
-    if not (time_from <= instant.timetz().replace(tzinfo=None) <= time_to):
+    if not within_daily_window(time_from, time_to, local.time()):
         raise InputError(_INSTANT_EXAMPLE)
-    return instant
+    return local.astimezone(UTC)
 
 
 def _parse_optional_selectors(text: str, *, kind: str) -> list[str]:
@@ -399,8 +447,8 @@ def _review_prompt(payload: Mapping[str, Any]) -> RenderedMessage:
     if criteria.excluded_seats:
         lines.append(f"Excluded seats: {', '.join(sorted(criteria.excluded_seats))}")
     if criteria.preferred_utc_instant is not None:
-        when = criteria.preferred_utc_instant.strftime("%Y-%m-%d %H:%M")
-        lines.append(f"Preferred time (UTC): {when}")
+        when = criteria.preferred_utc_instant.astimezone(LONDON).strftime("%Y-%m-%d %H:%M")
+        lines.append(f"Preferred time (London): {when}")
     lines.append(f"Mode: {'recurring' if criteria.mode is WatchMode.RECURRING else 'one-off'}")
     if criteria.interval is not None:
         lines.append(f"Recheck interval: {int(criteria.interval.total_seconds() // 60)} minutes")
@@ -542,9 +590,16 @@ def _apply_callback(
 # ---------------------------------------------------------------------------
 
 _NO_USER = "update carries no user"
-_ALREADY_HANDLED = (
-    "This watch has already been confirmed, or is still being created from an earlier "
-    "confirmation; there is nothing more to do."
+_IN_FLIGHT = (
+    "I'm still setting this watch up from your last tap. Give me a moment -- tap "
+    "Confirm again if nothing arrives."
+)
+_FAILED_BEFORE_CREATE = (
+    "Something went wrong and nothing was saved. Tap Confirm again to retry."
+)
+_FAILED_AFTER_CREATE = (
+    "Your watch is saved, but I couldn't finish setting it up. Tap Confirm again to "
+    "finish -- this will not create a second watch."
 )
 
 
@@ -627,8 +682,6 @@ async def handle_wizard_callback(update: Update, deps: WizardDeps) -> RenderedMe
     if data == _CANCEL:
         return await cancel(update, deps)
     if data == _CONFIRM:
-        if state not in (WizardState.REVIEW, WizardState.CONFIRMING):
-            return None
         return await _confirm(user_id, deps)
     if state not in _CALLBACK_STATES:
         return None
@@ -641,27 +694,122 @@ async def handle_wizard_callback(update: Update, deps: WizardDeps) -> RenderedMe
     return _prompt_for(next_state, payload)
 
 
-async def _confirm(user_id: int, deps: WizardDeps) -> RenderedMessage:
-    """Create the watch for a reviewed draft, exactly once even under a duplicate call.
+# ---------------------------------------------------------------------------
+# Confirmation saga
+# ---------------------------------------------------------------------------
 
-    See the module docstring for why the claim step below is the mechanism that makes
-    this safe: it is the one atomic operation available across the draft/watch
-    connection boundary, and everything after it (creating the watch, running the
-    creation check, deleting the draft) only ever runs for whichever caller won the
-    claim.
+
+#: Failures the saga compensates for: the process is fine, this attempt is not, so the
+#: claim is released and the user gets a truthful, retryable reply. Anything outside this
+#: set is treated as a crash -- it propagates, the claim stands, and recovery resumes it.
+_RECOVERABLE_FAILURES = (
+    sqlite3.Error,
+    InputError,
+    PersistenceError,
+    ConflictError,
+    BfiNetworkError,
+    BfiChallengeError,
+    BfiContractError,
+    CircuitOpenError,
+    DeliveryError,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveredConfirmation:
+    """One draft whose confirmation was resumed, and what its owner should be told."""
+
+    user_id: int
+    message: RenderedMessage
+
+
+def _watch_id_for(setup_id: str) -> UUID:
+    """Derive the watch identity a setup will always produce.
+
+    Deterministic on purpose: a retry after a crash that created the watch but never
+    got to record that fact must land on the same row, and only the durable setup id
+    can tell it which row that is.
+    """
+    return uuid5(_WATCH_NAMESPACE, setup_id)
+
+
+def _claim_is_live(draft: ConversationDraft, now: datetime) -> bool:
+    return now - draft.updated_at < CLAIM_LEASE
+
+
+async def _write_phase(
+    deps: WizardDeps, user_id: int, payload: dict[str, Any], phase: ConfirmPhase
+) -> None:
+    """Record how far the saga got, keeping the draft claimed and the lease renewed."""
+    payload["confirm_phase"] = phase.value
+    async with deps.database.connection() as conn, deps.database.transaction(conn):
+        await deps.drafts.upsert(
+            conn, user_id, WizardState.CONFIRMING.value, payload, deps.clock.now()
+        )
+
+
+async def _claim(
+    user_id: int, deps: WizardDeps, *, ignore_lease: bool = False
+) -> tuple[dict[str, Any], WatchCriteria] | RenderedMessage | None:
+    """Take exclusive ownership of a confirmable draft, or explain why we cannot.
+
+    Returns the claimed payload and its revalidated criteria on success, a reply to send
+    when the user should be told something, or ``None`` when this update is not ours.
+
+    The criteria are rebuilt *before* the claim is written: a payload that can no longer
+    produce a valid :class:`WatchCriteria` must leave the draft in ``REVIEW`` where the
+    user can still fix it, rather than being stranded in a claim that can never succeed.
     """
     now = deps.clock.now()
     async with deps.database.connection() as conn, deps.database.transaction(conn):
         draft = await deps.drafts.get(conn, user_id)
-        if draft is None or draft.state != WizardState.REVIEW.value:
-            return _retry_prompt(_ALREADY_HANDLED)
+        if draft is None:
+            return None
+        state = WizardState(draft.state)
+        if state is WizardState.CONFIRMING:
+            if not ignore_lease and _claim_is_live(draft, now):
+                return _retry_prompt(_IN_FLIGHT)
+        elif state is not WizardState.REVIEW:
+            return None
         payload = dict(draft.payload)
+        try:
+            criteria = _build_criteria(payload)
+        except InputError as exc:
+            return _retry_prompt(str(exc))
+        payload.setdefault("setup_id", str(uuid4()))
+        payload.setdefault("confirm_phase", ConfirmPhase.CLAIMED.value)
+        payload["confirm_attempts"] = int(payload.get("confirm_attempts", 0)) + 1
         await deps.drafts.upsert(conn, user_id, WizardState.CONFIRMING.value, payload, now)
+    return payload, criteria
 
-    criteria = _build_criteria(payload)
-    watch = await deps.watches.create(user_id, criteria)
-    await deps.checks.check(watch.watch_id, CheckTrigger.CREATION)
-    async with deps.database.connection() as conn:
+
+async def _run_saga(
+    user_id: int, deps: WizardDeps, payload: dict[str, Any], criteria: WatchCriteria
+) -> RenderedMessage:
+    """Drive a claimed confirmation to completion, resuming from its recorded phase.
+
+    Every step is either idempotent or guarded by the phase written once it finished,
+    so running this against any durable intermediate state converges on exactly one
+    watch, one creation check, and no draft.
+    """
+    phase = ConfirmPhase(payload["confirm_phase"])
+    watch_id = _watch_id_for(payload["setup_id"])
+    try:
+        if phase is ConfirmPhase.CLAIMED:
+            # Idempotent by watch_id: safe whether or not a previous attempt got here.
+            await deps.watches.create(user_id, criteria, watch_id=watch_id)
+            await _write_phase(deps, user_id, payload, ConfirmPhase.WATCH_CREATED)
+            phase = ConfirmPhase.WATCH_CREATED
+        if phase is ConfirmPhase.WATCH_CREATED:
+            # Marked before the call, not after: a check that may have already run must
+            # never run twice, and a check that never ran is covered by the scheduler,
+            # which the watch's immediate next_check_at already guarantees.
+            await _write_phase(deps, user_id, payload, ConfirmPhase.CHECK_STARTED)
+            await deps.checks.check(watch_id, CheckTrigger.CREATION)
+            await _write_phase(deps, user_id, payload, ConfirmPhase.CHECK_DONE)
+    except _RECOVERABLE_FAILURES:
+        return await _compensate(user_id, deps, payload)
+    async with deps.database.connection() as conn, deps.database.transaction(conn):
         await deps.drafts.delete(conn, user_id)
     return RenderedMessage(
         text=(
@@ -671,3 +819,72 @@ async def _confirm(user_id: int, deps: WizardDeps) -> RenderedMessage:
         parse_mode=ParseMode.HTML,
         reply_markup=None,
     )
+
+
+async def _release_to_review(
+    user_id: int, deps: WizardDeps, payload: dict[str, Any]
+) -> None:
+    """Put a claimed draft back where its owner can act on it, keeping phase markers."""
+    async with deps.database.connection() as conn, deps.database.transaction(conn):
+        await deps.drafts.upsert(
+            conn, user_id, WizardState.REVIEW.value, payload, deps.clock.now()
+        )
+
+
+async def _compensate(
+    user_id: int, deps: WizardDeps, payload: dict[str, Any]
+) -> RenderedMessage:
+    """Release the claim after a routine failure, leaving a retryable draft.
+
+    The phase markers survive, so the retry skips whatever already succeeded, and the
+    message is chosen from that same phase: telling a user nothing was saved when their
+    watch is already active would send them off to create a duplicate.
+    """
+    phase = ConfirmPhase(payload["confirm_phase"])
+    await _release_to_review(user_id, deps, payload)
+    if phase is ConfirmPhase.CLAIMED:
+        return _retry_prompt(_FAILED_BEFORE_CREATE)
+    return _retry_prompt(_FAILED_AFTER_CREATE)
+
+
+async def recover_confirmations(deps: WizardDeps) -> tuple[RecoveredConfirmation, ...]:
+    """Resume every confirmation left claimed by a process that died.
+
+    Call once at startup, before serving updates: it deliberately ignores
+    :data:`CLAIM_LEASE`, because nothing can still be in flight in a process that has
+    only just begun. Without it a crash mid-confirmation would leave the draft claimed
+    until the user happened to tap Confirm again, which is exactly the stranded state
+    the saga exists to remove. Returns what each affected user should be told.
+    """
+    async with deps.database.connection() as conn:
+        stale = await deps.drafts.list_by_state(conn, WizardState.CONFIRMING.value)
+    recovered: list[RecoveredConfirmation] = []
+    for draft in stale:
+        claimed = await _claim(draft.user_id, deps, ignore_lease=True)
+        if claimed is None:
+            continue
+        if isinstance(claimed, RenderedMessage):
+            # The lease is ignored here, so the only way to be refused is a payload that
+            # can no longer build criteria. Skipping it would re-strand the draft on
+            # every future restart; hand it back to the user in REVIEW instead.
+            await _release_to_review(draft.user_id, deps, dict(draft.payload))
+            recovered.append(RecoveredConfirmation(user_id=draft.user_id, message=claimed))
+            continue
+        payload, criteria = claimed
+        message = await _run_saga(draft.user_id, deps, payload, criteria)
+        recovered.append(RecoveredConfirmation(user_id=draft.user_id, message=message))
+    return tuple(recovered)
+
+
+async def _confirm(user_id: int, deps: WizardDeps) -> RenderedMessage | None:
+    """Create the watch for a reviewed draft, exactly once across duplicates and retries.
+
+    See the module docstring for the saga's shape. This entry point handles both a first
+    confirmation and a retry of one whose claim has outlived its lease; ``None`` means
+    the update was not this handler's to act on (no draft, or a draft on another step).
+    """
+    claimed = await _claim(user_id, deps)
+    if claimed is None or isinstance(claimed, RenderedMessage):
+        return claimed
+    payload, criteria = claimed
+    return await _run_saga(user_id, deps, payload, criteria)

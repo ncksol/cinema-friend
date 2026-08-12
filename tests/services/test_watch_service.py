@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
+from uuid import UUID
 
 import pytest
 
@@ -117,6 +118,42 @@ async def test_create_canonicalizes_the_source_url_and_slug(service: WatchServic
 async def test_create_rejects_a_non_bfi_source_url(service: WatchService) -> None:
     with pytest.raises(InputError):
         await service.create(11, criteria(source_url="https://example.com/dog-stars"))
+
+
+async def test_create_uses_a_caller_supplied_watch_id(service: WatchService) -> None:
+    """A caller that must survive its own crash needs to name the watch up front."""
+    watch_id = UUID("11111111-2222-4333-8444-555555555555")
+
+    watch = await service.create(11, criteria(), watch_id=watch_id)
+
+    assert watch.watch_id == watch_id
+    assert await service.get_owned(11, watch_id) == watch
+
+
+async def test_create_with_an_already_used_watch_id_returns_the_existing_watch(
+    service: WatchService,
+) -> None:
+    """Re-running a create after a crash must be a no-op, not a second watch."""
+    watch_id = UUID("11111111-2222-4333-8444-555555555555")
+    first = await service.create(11, criteria(), watch_id=watch_id)
+
+    second = await service.create(11, criteria(quantity=4), watch_id=watch_id)
+
+    assert second == first
+    assert second.criteria.quantity == 2
+    assert len(await service.list_for_owner(11)) == 1
+
+
+async def test_create_with_a_watch_id_owned_by_someone_else_is_not_found(
+    service: WatchService,
+) -> None:
+    watch_id = UUID("11111111-2222-4333-8444-555555555555")
+    await service.create(11, criteria(), watch_id=watch_id)
+
+    with pytest.raises(InputError):
+        await service.create(22, criteria(), watch_id=watch_id)
+
+    assert await service.list_for_owner(22) == ()
 
 
 # ---------------------------------------------------------------------------

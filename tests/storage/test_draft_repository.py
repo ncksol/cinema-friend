@@ -86,6 +86,28 @@ async def test_delete_missing_draft_is_a_no_op(
     await repo.delete(conn, 11)  # must not raise
 
 
+async def test_list_by_state_returns_only_matching_drafts_in_user_order(
+    conn: aiosqlite.Connection, repo: DraftRepository
+) -> None:
+    """Startup recovery needs to find every draft stuck mid-confirmation, by state."""
+    await repo.upsert(conn, 22, "confirming", {"setup_id": "b"}, _NOW)
+    await repo.upsert(conn, 11, "confirming", {"setup_id": "a"}, _NOW)
+    await repo.upsert(conn, 33, "review", {}, _NOW)
+
+    stuck = await repo.list_by_state(conn, "confirming")
+
+    assert [draft.user_id for draft in stuck] == [11, 22]
+    assert stuck[0].payload == {"setup_id": "a"}
+
+
+async def test_list_by_state_returns_empty_when_nothing_matches(
+    conn: aiosqlite.Connection, repo: DraftRepository
+) -> None:
+    await repo.upsert(conn, 11, "review", {}, _NOW)
+
+    assert await repo.list_by_state(conn, "confirming") == ()
+
+
 async def test_delete_expired_removes_drafts_older_than_24_hours(
     conn: aiosqlite.Connection, repo: DraftRepository
 ) -> None:

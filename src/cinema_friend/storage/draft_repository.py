@@ -50,6 +50,22 @@ class DraftRepository:
         row = await cursor.fetchone()
         return _row_to_draft(row) if row is not None else None
 
+    async def list_by_state(
+        self, conn: aiosqlite.Connection, state: str
+    ) -> tuple[ConversationDraft, ...]:
+        """Every draft currently in ``state``, oldest user first.
+
+        Startup recovery needs to find drafts left mid-flight by a process that died,
+        which is the one case where no user id is known up front.
+        """
+        cursor = await conn.execute(
+            "SELECT user_id, state, payload_json, updated_at FROM conversation_drafts "
+            "WHERE state = ? ORDER BY user_id",
+            (state,),
+        )
+        rows = await cursor.fetchall()
+        return tuple(_row_to_draft(row) for row in rows)
+
     async def upsert(
         self,
         conn: aiosqlite.Connection,

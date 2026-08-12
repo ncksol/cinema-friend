@@ -77,6 +77,60 @@ def test_preferred_utc_instant_rejects_non_utc():
         WatchCriteria(**_BASE, preferred_utc_instant=datetime(2026, 8, 27, 19, 0, tzinfo=paris))
 
 
+def test_preferred_instant_is_validated_against_its_london_local_time_in_bst():
+    """In August the instant's UTC clock reading is an hour behind the cinema's.
+
+    ``17:30Z`` is ``18:30`` in London and belongs inside an 18:00-23:00 window;
+    ``22:30Z`` is ``23:30`` in London and does not. Reading the UTC components
+    directly gets both backwards.
+    """
+    WatchCriteria(**_BASE, preferred_utc_instant=datetime(2026, 8, 27, 17, 30, tzinfo=UTC))
+    with pytest.raises(InputError, match="time"):
+        WatchCriteria(**_BASE, preferred_utc_instant=datetime(2026, 8, 27, 22, 30, tzinfo=UTC))
+
+
+def test_preferred_instant_is_validated_against_its_london_local_time_in_gmt():
+    """In January London is UTC, so the same reading validates unshifted."""
+    winter = {**_BASE, "date_from": date(2026, 1, 10), "date_to": date(2026, 1, 12)}
+    WatchCriteria(**winter, preferred_utc_instant=datetime(2026, 1, 10, 18, 30, tzinfo=UTC))
+    with pytest.raises(InputError, match="time"):
+        WatchCriteria(**winter, preferred_utc_instant=datetime(2026, 1, 10, 17, 30, tzinfo=UTC))
+
+
+def test_preferred_instant_date_range_uses_the_london_calendar_date():
+    """``2026-08-26T23:30Z`` already belongs to the 27th in London."""
+    window = {
+        **_BASE,
+        "time_from": time(22, 0),
+        "time_to": time(1, 0),
+        "date_from": date(2026, 8, 26),
+        "date_to": date(2026, 8, 27),
+    }
+    WatchCriteria(**window, preferred_utc_instant=datetime(2026, 8, 26, 23, 30, tzinfo=UTC))
+    with pytest.raises(InputError, match="date"):
+        WatchCriteria(
+            **{**window, "date_to": date(2026, 8, 26)},
+            preferred_utc_instant=datetime(2026, 8, 26, 23, 30, tzinfo=UTC),
+        )
+
+
+def test_preferred_instant_accepts_a_window_that_crosses_midnight():
+    """A wrapping window must not make every preferred instant unrepresentable."""
+    window = {
+        **_BASE,
+        "time_from": time(22, 0),
+        "time_to": time(1, 0),
+        "date_from": date(2026, 8, 26),
+        "date_to": date(2026, 8, 28),
+    }
+    # 23:30 and 00:30 London, both inside 22:00-01:00.
+    WatchCriteria(**window, preferred_utc_instant=datetime(2026, 8, 26, 22, 30, tzinfo=UTC))
+    WatchCriteria(**window, preferred_utc_instant=datetime(2026, 8, 26, 23, 30, tzinfo=UTC))
+    # 14:00 London falls in the window's daytime gap.
+    with pytest.raises(InputError, match="time"):
+        WatchCriteria(**window, preferred_utc_instant=datetime(2026, 8, 26, 13, 0, tzinfo=UTC))
+
+
 def test_watch_identity_is_a_uuid():
     """Watch IDs are client-generated UUIDs so a watch can be referenced before insert."""
     watch_id = uuid4()

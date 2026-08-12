@@ -65,6 +65,20 @@ def test_midnight_window_uses_performance_local_date() -> None:
     assert not performance_matches(criteria, performance_at("2026-08-27T14:00:00+01:00"))
 
 
+def test_midnight_window_boundaries_are_inclusive() -> None:
+    """Both ends of a wrapping window match, exactly as both ends of a plain one do."""
+    criteria = criteria_for(
+        date_from=date(2026, 8, 26),
+        date_to=date(2026, 8, 27),
+        time_from=time(22, 0),
+        time_to=time(1, 0),
+    )
+    assert performance_matches(criteria, performance_at("2026-08-26T22:00:00+01:00"))
+    assert performance_matches(criteria, performance_at("2026-08-27T01:00:00+01:00"))
+    assert not performance_matches(criteria, performance_at("2026-08-26T21:59:00+01:00"))
+    assert not performance_matches(criteria, performance_at("2026-08-27T01:01:00+01:00"))
+
+
 def test_date_outside_range_does_not_match() -> None:
     criteria = criteria_for(date_from=date(2026, 8, 26), date_to=date(2026, 8, 26))
     assert not performance_matches(criteria, performance_at("2026-08-27T18:00:00+01:00"))

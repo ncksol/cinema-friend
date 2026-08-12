@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from datetime import date, time
+from datetime import date
 
 from cinema_friend.domain.bfi import Performance
+from cinema_friend.domain.time_window import within_daily_window
 from cinema_friend.domain.watch import WatchCriteria
 
 _ON_SALE_BASE_CODES = frozenset({"S", "O", "R"})
@@ -12,14 +13,6 @@ _ON_SALE_BASE_CODES = frozenset({"S", "O", "R"})
 
 def _matches_date_window(criteria: WatchCriteria, local_date: date) -> bool:
     return criteria.date_from <= local_date <= criteria.date_to
-
-
-def _matches_time_window(criteria: WatchCriteria, local_time: time) -> bool:
-    if criteria.time_from <= criteria.time_to:
-        return criteria.time_from <= local_time <= criteria.time_to
-    # The window wraps past midnight (e.g. 22:00 to 01:00): a time matches if
-    # it falls in either the late-evening or early-morning half of the window.
-    return local_time >= criteria.time_from or local_time <= criteria.time_to
 
 
 def performance_matches(criteria: WatchCriteria, performance: Performance) -> bool:
@@ -37,6 +30,6 @@ def performance_matches(criteria: WatchCriteria, performance: Performance) -> bo
     if performance.availability_num < criteria.quantity:
         return False
     local_start = performance.start
-    return _matches_date_window(criteria, local_start.date()) and _matches_time_window(
-        criteria, local_start.time()
+    return _matches_date_window(criteria, local_start.date()) and within_daily_window(
+        criteria.time_from, criteria.time_to, local_start.time()
     )

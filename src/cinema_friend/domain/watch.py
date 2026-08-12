@@ -8,6 +8,7 @@ from uuid import UUID
 
 from cinema_friend.domain.errors import InputError
 from cinema_friend.domain.state import WatchMode, WatchStatus
+from cinema_friend.domain.time_window import LONDON, within_daily_window
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,11 +44,13 @@ class WatchCriteria:
             inst = self.preferred_utc_instant
             if inst.tzinfo is None or inst.utcoffset() != timedelta(0):
                 raise InputError("preferred_utc_instant must be a UTC-aware datetime")
-            inst_date = inst.date()
-            inst_time = inst.timetz().replace(tzinfo=None)
-            if not (self.date_from <= inst_date <= self.date_to):
+            # The date and time bounds are wall-clock facts about the cinema, and so is
+            # the user's preference; comparing UTC components against them is wrong by
+            # an hour for eight months of the year.
+            local = inst.astimezone(LONDON)
+            if not (self.date_from <= local.date() <= self.date_to):
                 raise InputError("preferred_utc_instant date is outside the watch date range")
-            if not (self.time_from <= inst_time <= self.time_to):
+            if not within_daily_window(self.time_from, self.time_to, local.time()):
                 raise InputError("preferred_utc_instant time is outside the watch time range")
 
 

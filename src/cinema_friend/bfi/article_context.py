@@ -9,13 +9,12 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
-from zoneinfo import ZoneInfo
 
 from cinema_friend.bfi.urls import seat_map_url as _seat_map_url
 from cinema_friend.domain.bfi import Performance
 from cinema_friend.domain.errors import BfiContractError
+from cinema_friend.domain.time_window import LONDON as _LONDON
 
-_LONDON = ZoneInfo("Europe/London")
 _START_FMT = "%A %d %B %Y %H:%M"
 
 # Matches ``var articleContext = { … };`` spanning multiple lines.
