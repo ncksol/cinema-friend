@@ -25,10 +25,18 @@ _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 
 # Cloudflare's interactive JS/managed challenge is served with HTTP 200, so it
 # must be detected from body content rather than status code alone.
+#
+# Every marker here must appear only in a body served *instead of* the page.
+# `cdn-cgi/challenge-platform` on its own does not qualify: an ordinary,
+# unchallenged BFI 200 embeds the platform's passive JSD probe at
+# `/cdn-cgi/challenge-platform/scripts/jsd/main.js`, so matching the bare prefix
+# classified every successful fetch as a challenge and tripped the host circuit
+# on the first request. The `/h/` path is the managed/orchestrate challenge
+# runtime, which is only ever fetched by an interstitial.
 _INTERSTITIAL_MARKERS = (
     "Just a moment...",
     "cf-browser-verification",
-    "cdn-cgi/challenge-platform",
+    "/cdn-cgi/challenge-platform/h/",
     "Enable JavaScript and cookies to continue",
 )
 

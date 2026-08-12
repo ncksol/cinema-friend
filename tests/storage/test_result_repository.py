@@ -24,6 +24,7 @@ from tests.storage.conftest import (
     option,
     option_keys_in,
     options,
+    performance,
 )
 
 MakeWatch = Callable[..., Coroutine[Any, Any, Watch]]
@@ -496,3 +497,31 @@ async def test_snapshot_page_watch_title_is_none_when_the_watch_is_unnamed(
     page = await repo.snapshot_page(conn, snapshot.snapshot_id, page=1)
 
     assert page.watch_title is None
+
+
+async def test_an_unpublished_availability_survives_the_payload_codec(
+    conn: aiosqlite.Connection, repo: ResultRepository, make_watch: MakeWatch
+) -> None:
+    """Whether BFI published a count is part of the snapshot, not a parse-time detail.
+
+    A restored option that lost ``availability_published`` would read as a genuine
+    "zero seats" rather than "count withheld", which is a different fact about the
+    performance.
+    """
+    watch = await make_watch()
+    unpublished = replace(
+        performance(),
+        availability_status_code="U",
+        availability_num=0,
+        availability_published=False,
+    )
+    ranked = (replace(option("L17-L18"), performance=unpublished),)
+
+    await _save_snapshot(repo, conn, watch, ranked=ranked)
+    latest = await repo.latest_snapshot(conn, watch.watch_id)
+
+    assert latest is not None
+    restored = latest.options[0].performance
+    assert restored.availability_published is False
+    assert restored.availability_num == 0
+    assert restored.reserved_seating is True

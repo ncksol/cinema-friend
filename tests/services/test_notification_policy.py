@@ -53,13 +53,12 @@ def ranked_option(
     return RankedOption(
         performance=Performance(
             performance_id=performance_id,
-            event_id="e1",
             start_utc=_START,
             sales_status_code="OPEN*",
-            availability_code="A",
+            availability_status_code="E",
             availability_num=50,
-            reserved_seating=True,
             seat_map_url="https://whatson.bfi.org.uk/imax/Online/mapSelect.asp?ID=p1",
+            options=("1", "2"),
         ),
         seat_label=seat_label,
         seat_ids=seat_ids,

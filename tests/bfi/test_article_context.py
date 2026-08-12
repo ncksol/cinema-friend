@@ -13,11 +13,78 @@ from cinema_friend.bfi.article_context import (
 )
 from cinema_friend.domain.errors import BfiContractError
 from tests.factories.bfi_html import (
-    REQUIRED_FIELDS,
+    SEARCH_NAMES,
     make_article_html,
     performance_mapping,
     performance_row,
+    real_article_html,
 )
+from tests.fixtures import (
+    FIXTURE_TOKEN,
+    article_context_row_mappings,
+    load_article_context,
+)
+
+# ---------------------------------------------------------------------------
+# The captured live page — the schema of record
+# ---------------------------------------------------------------------------
+
+
+def test_capture_carries_no_live_token() -> None:
+    """The committed capture must not contain the transient token it was served with."""
+    assert load_article_context()["sToken"] == FIXTURE_TOKEN
+
+
+def test_captured_search_names_are_the_wire_schema() -> None:
+    """The fields the parser reads are the fields BFI actually sends.
+
+    The previous schema was invented: ``performance_id``, ``event_id``,
+    ``availability_code`` and ``reserved_seating`` appear nowhere in a live page. This
+    test fails the moment any of them is reintroduced, and it reads the answer from the
+    capture rather than restating it.
+    """
+    names = set(SEARCH_NAMES)
+    assert {"id", "object_type", "start_date", "sales_status", "availability_status",
+            "availability_num", "options", "short_description", "name"} <= names
+    assert not names & {"performance_id", "event_id", "availability_code", "reserved_seating"}
+
+
+def test_parses_the_captured_live_page() -> None:
+    page = parse_article_page(real_article_html())
+    context = load_article_context()
+    assert page.article_id == context["articleId"]
+    assert page.s_token == FIXTURE_TOKEN
+    assert page.current_page == 1
+    assert page.total_pages == 2
+    assert len(page.rows) == len(context["searchResults"])
+
+
+def test_every_captured_row_maps_to_a_performance() -> None:
+    page = parse_article_page(real_article_html())
+    captured = article_context_row_mappings()
+    performances = [performance_from_row(row) for row in page.rows]
+
+    assert [p.performance_id for p in performances] == [row["id"] for row in captured]
+    assert [p.availability_num for p in performances] == [
+        int(row["availability_num"]) for row in captured
+    ]
+    assert [p.availability_status_code for p in performances] == [
+        row["availability_status"] for row in captured
+    ]
+    assert [p.sales_status_code for p in performances] == [row["sales_status"] for row in captured]
+    assert [p.title for p in performances] == [row["short_description"] for row in captured]
+    assert all(p.reserved_seating for p in performances)
+    assert all(p.availability_published for p in performances)
+    assert all(p.seat_map_url is not None and p.performance_id in p.seat_map_url
+               for p in performances)
+
+
+def test_listing_title_comes_from_the_rows_not_a_top_level_key() -> None:
+    """A live articleContext has no ``title`` key; the film's name is on every row."""
+    assert "title" not in load_article_context()
+    page = parse_article_page(real_article_html())
+    assert page.title == article_context_row_mappings()[0]["short_description"]
+
 
 # ---------------------------------------------------------------------------
 # Core round-trip
@@ -40,6 +107,108 @@ def test_missing_consumed_field_is_contract_error() -> None:
     row.pop("availability_num")
     with pytest.raises(BfiContractError, match="availability_num"):
         performance_from_row(row)
+
+
+# ---------------------------------------------------------------------------
+# Field mapping
+# ---------------------------------------------------------------------------
+
+
+def test_performance_id_comes_from_the_id_field() -> None:
+    row = performance_mapping(id="9A5DBB0A-2F02-4B15-9E4F-8D2E6E9E1D77")
+    assert performance_from_row(row).performance_id == "9A5DBB0A-2F02-4B15-9E4F-8D2E6E9E1D77"
+
+
+def test_availability_status_is_carried_verbatim() -> None:
+    row = performance_mapping(availability_status="L")
+    assert performance_from_row(row).availability_status_code == "L"
+
+
+def test_availability_status_base_strips_the_display_star() -> None:
+    row = performance_mapping(availability_status="U*")
+    performance = performance_from_row(row)
+    assert performance.availability_status_code == "U*"
+    assert performance.availability_status_base == "U"
+
+
+def test_reserved_seating_is_derived_from_option_code_2() -> None:
+    assert performance_from_row(performance_mapping(options=["1", "2"])).reserved_seating is True
+    assert performance_from_row(performance_mapping(options=["2"])).reserved_seating is True
+
+
+def test_absent_option_code_2_means_unreserved_seating() -> None:
+    assert performance_from_row(performance_mapping(options=["1"])).reserved_seating is False
+    assert performance_from_row(performance_mapping(options=[])).reserved_seating is False
+
+
+def test_title_prefers_short_description() -> None:
+    row = performance_mapping(short_description="The Dog Stars", name="thedog_e1_26aug26")
+    assert performance_from_row(row).title == "The Dog Stars"
+
+
+def test_title_falls_back_to_name_when_short_description_is_blank() -> None:
+    row = performance_mapping(short_description="", name="thedog_e1_26aug26")
+    assert performance_from_row(row).title == "thedog_e1_26aug26"
+
+
+def test_availability_num_is_a_numeric_string_on_the_wire() -> None:
+    assert performance_from_row(performance_mapping(availability_num="42")).availability_num == 42
+
+
+def test_non_numeric_availability_is_a_contract_error() -> None:
+    with pytest.raises(BfiContractError, match="availability_num"):
+        performance_from_row(performance_mapping(availability_num="many"))
+
+
+def test_availability_sent_as_a_json_number_is_a_contract_error() -> None:
+    """BFI sends every scalar as a string; a bare number is drift, not a convenience."""
+    with pytest.raises(BfiContractError, match="availability_num"):
+        performance_from_row(performance_mapping(availability_num=42))
+
+
+# ---------------------------------------------------------------------------
+# The unpublished-availability sentinel
+# ---------------------------------------------------------------------------
+
+
+def test_unpublished_sentinel_is_accepted_with_status_u() -> None:
+    """``availability_num = -1`` with status ``U`` means "count withheld", not "invalid".
+
+    Observed live. It is not a negative seat count and must not be read as one: the
+    count is simply not published, so the performance contributes no candidate seats.
+    """
+    row = performance_mapping(availability_status="U", availability_num="-1")
+    performance = performance_from_row(row)
+    assert performance.availability_published is False
+    assert performance.availability_num == 0
+    assert performance.availability_status_code == "U"
+
+
+def test_unpublished_sentinel_is_accepted_with_starred_status_u() -> None:
+    row = performance_mapping(availability_status="U*", availability_num="-1")
+    performance = performance_from_row(row)
+    assert performance.availability_published is False
+    assert performance.availability_num == 0
+
+
+def test_sentinel_with_any_other_status_is_a_contract_error() -> None:
+    """Only ``U`` licenses the sentinel; anywhere else ``-1`` is unexplained drift."""
+    row = performance_mapping(availability_status="E", availability_num="-1")
+    with pytest.raises(BfiContractError, match="availability_num"):
+        performance_from_row(row)
+
+
+def test_other_negative_availability_is_a_contract_error() -> None:
+    row = performance_mapping(availability_status="U", availability_num="-2")
+    with pytest.raises(BfiContractError, match="availability_num"):
+        performance_from_row(row)
+
+
+def test_a_published_zero_is_published() -> None:
+    row = performance_mapping(availability_status="U", availability_num="0")
+    performance = performance_from_row(row)
+    assert performance.availability_published is True
+    assert performance.availability_num == 0
 
 
 # ---------------------------------------------------------------------------
@@ -114,7 +283,7 @@ def test_duplicate_searchnames_raises_contract_error() -> None:
     # Craft HTML that embeds a searchNames list with a duplicate entry.
     import json
 
-    duped = list(REQUIRED_FIELDS) + [REQUIRED_FIELDS[0]]
+    duped = list(SEARCH_NAMES) + [SEARCH_NAMES[0]]
     ctx = {
         "searchNames": duped,
         "searchResults": [performance_row()],
@@ -132,7 +301,7 @@ def test_row_shorter_than_searchnames_raises_contract_error() -> None:
     import json
 
     ctx = {
-        "searchNames": list(REQUIRED_FIELDS),
+        "searchNames": list(SEARCH_NAMES),
         "searchResults": [performance_row()[:-1]],  # one value short
         "pagination": {"current_page": "1", "page_size": "5", "total_pages": "1"},
         "articleId": "2152D1E8-CFF7-419F-BE57-F51C1E490F24",
@@ -228,15 +397,8 @@ def test_malformed_start_date_raises_contract_error() -> None:
         performance_from_row(row)
 
 
-def test_negative_availability_raises_contract_error() -> None:
-    """Negative availability_num must raise BfiContractError, not be clamped."""
-    row = performance_mapping(availability_num=-1)
-    with pytest.raises(BfiContractError, match="availability_num"):
-        performance_from_row(row)
-
-
-def test_escaped_apostrophe_in_title_normalised() -> None:
-    """A JS-escaped apostrophe in a string value must survive round-trip as a plain apostrophe."""
-    html = make_article_html(rows=[performance_row()], title_with_apostrophe="O'Brien")
-    ctx = extract_article_context(html)
-    assert ctx.get("title") == "O'Brien"
+def test_escaped_apostrophe_in_a_row_value_is_normalised() -> None:
+    """A JS-escaped apostrophe in a string value must round-trip as a plain apostrophe."""
+    html = make_article_html(rows=[performance_row(short_description="O'Brien's Dog")])
+    page = parse_article_page(html)
+    assert performance_from_row(page.rows[0]).title == "O'Brien's Dog"

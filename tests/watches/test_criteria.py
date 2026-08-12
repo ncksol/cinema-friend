@@ -2,16 +2,16 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, date, datetime, time
 
-from cinema_friend.domain.bfi import Performance
+from cinema_friend.domain.bfi import RESERVED_SEATING_OPTION, Performance
 from cinema_friend.domain.state import WatchMode
 from cinema_friend.domain.watch import WatchCriteria
 from cinema_friend.watches.criteria import performance_matches
 
 SLUG = "dog-stars"
 PERF_ID = "2475959F-2B73-4EA6-AD26-AFA8AEB785FD"
-EVENT_ID = "E8A1B2C3-D4E5-F6A7-B8C9-D0E1F2A3B4C5"
 
 
 def criteria_for(
@@ -43,13 +43,12 @@ def performance_at(
 ) -> Performance:
     return Performance(
         performance_id=PERF_ID,
-        event_id=EVENT_ID,
         start_utc=datetime.fromisoformat(iso_instant).astimezone(UTC),
         sales_status_code=sales_status_code,
-        availability_code="A",
+        availability_status_code="E",
         availability_num=availability_num,
-        reserved_seating=reserved_seating,
         seat_map_url="https://whatson.bfi.org.uk/imax/Online/mapSelect.asp",
+        options=(RESERVED_SEATING_OPTION,) if reserved_seating else (),
     )
 
 
@@ -139,3 +138,30 @@ def test_preferred_utc_instant_does_not_affect_matching() -> None:
         preferred_utc_instant=datetime(2026, 8, 26, 17, 0, tzinfo=UTC),
     )
     assert performance_matches(criteria, performance_at("2026-08-26T18:00:00+01:00"))
+
+
+# ---------------------------------------------------------------------------
+# Fix round 2 -- unpublished availability
+# ---------------------------------------------------------------------------
+
+
+def test_an_unpublished_count_never_satisfies_a_quantity() -> None:
+    """A withheld count is not evidence of seats, so no quantity can be met by it.
+
+    The parser normalises BFI's ``-1`` sentinel to zero, so this holds for the smallest
+    request the domain allows without ``performance_matches`` needing its own special
+    case.
+    """
+    performance = replace(
+        performance_at("2026-08-26T18:15:00+01:00"),
+        availability_num=0,
+        availability_published=False,
+        availability_status_code="U",
+    )
+    assert not performance_matches(criteria_for(quantity=1), performance)
+
+
+def test_a_published_count_of_one_satisfies_a_request_for_one() -> None:
+    """The eligibility test is ``>= quantity``, so an exact match is enough."""
+    performance = performance_at("2026-08-26T18:15:00+01:00", availability_num=1)
+    assert performance_matches(criteria_for(quantity=1), performance)

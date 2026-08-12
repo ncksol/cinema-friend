@@ -187,13 +187,12 @@ def _option(index: int) -> RankedOption:
     seat_ids = (f"seat-{index}a", f"seat-{index}b")
     performance = Performance(
         performance_id=f"perf-{index}",
-        event_id="event-1",
         start_utc=start,
         sales_status_code="OPEN*",
-        availability_code="A",
+        availability_status_code="E",
         availability_num=50,
-        reserved_seating=True,
         seat_map_url="https://whatson.bfi.org.uk/imax/Online/mapSelect.asp?ID=1",
+        options=("1", "2"),
     )
     return RankedOption(
         performance=performance,

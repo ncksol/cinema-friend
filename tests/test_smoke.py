@@ -25,6 +25,7 @@ from typing import Any
 
 import pytest
 
+from cinema_friend.bfi.article_context import performance_from_row
 from cinema_friend.bfi.urls import film_page_url, pagination_url, seat_map_url
 from cinema_friend.domain.errors import BfiContractError, InputError
 from cinema_friend.smoke import (
@@ -38,11 +39,14 @@ from cinema_friend.smoke import (
 )
 from tests.factories.bfi_html import (
     PERFORMANCE_ID,
+    available_circles,
     make_article_html,
     performance_row,
+    real_article_html,
     seat_map_html,
 )
 from tests.fakes import FakeClock, FakeNetworkError, FakeSession, response
+from tests.fixtures import article_context_row_mappings
 
 SLUG = "dog-stars"
 FILM_URL = (
@@ -64,7 +68,7 @@ def eligible_row(**overrides: Any) -> list[Any]:
     ``availability_num`` is 1 because the shared seat-map fixture carries exactly one
     ``data-status="A"`` circle, and the contract the smoke enforces is equality.
     """
-    return performance_row(**{"sales_status": "S", "availability_num": 1, **overrides})
+    return performance_row(**{"sales_status": "S", "availability_num": "1", **overrides})
 
 
 def article_html(
@@ -148,7 +152,7 @@ async def test_fetches_page_one_every_pagination_page_and_exactly_one_seat_map()
             response(
                 200,
                 article_html(
-                    [performance_row(performance_id=OTHER_PERFORMANCE_ID, sales_status="C")],
+                    [performance_row(id=OTHER_PERFORMANCE_ID, sales_status="C")],
                     current_page=2,
                     total_pages=3,
                 ),
@@ -158,7 +162,7 @@ async def test_fetches_page_one_every_pagination_page_and_exactly_one_seat_map()
                 article_html(
                     [
                         performance_row(
-                            performance_id="11111111-2222-3333-4444-555555555555",
+                            id="11111111-2222-3333-4444-555555555555",
                             sales_status="C",
                         )
                     ],
@@ -191,26 +195,26 @@ async def test_chooses_the_first_on_sale_reserved_performance_with_availability(
                 article_html(
                     [
                         performance_row(
-                            performance_id="00000000-0000-4000-8000-000000000001",
+                            id="00000000-0000-4000-8000-000000000001",
                             sales_status="C",
-                            availability_num=200,
+                            availability_num="200",
                         ),
                         performance_row(
-                            performance_id="00000000-0000-4000-8000-000000000002",
+                            id="00000000-0000-4000-8000-000000000002",
                             sales_status="S",
-                            availability_num=0,
+                            availability_num="0",
                         ),
                         performance_row(
-                            performance_id="00000000-0000-4000-8000-000000000003",
+                            id="00000000-0000-4000-8000-000000000003",
                             sales_status="S",
-                            availability_num=5,
-                            reserved_seating=False,
+                            availability_num="5",
+                            options=[],
                         ),
                         eligible_row(),
                         performance_row(
-                            performance_id="00000000-0000-4000-8000-000000000005",
+                            id="00000000-0000-4000-8000-000000000005",
                             sales_status="S",
-                            availability_num=9,
+                            availability_num="9",
                         ),
                     ]
                 ),
@@ -232,7 +236,7 @@ async def test_no_eligible_performance_is_an_input_failure() -> None:
         [
             response(
                 200,
-                article_html([performance_row(sales_status="C", availability_num=0)]),
+                article_html([performance_row(sales_status="C", availability_num="0")]),
             )
         ]
     )
@@ -245,7 +249,7 @@ async def test_no_eligible_performance_is_an_input_failure() -> None:
 
 def test_no_eligible_performance_exits_2() -> None:
     session = FakeSession(
-        [response(200, article_html([performance_row(sales_status="C", availability_num=0)]))]
+        [response(200, article_html([performance_row(sales_status="C", availability_num="0")]))]
     )
 
     assert main([FILM_URL], session=session, clock=clock()) == EXIT_INPUT
@@ -271,7 +275,7 @@ async def test_requires_http_200() -> None:
 async def test_requires_exact_agreement_between_reported_and_parsed_availability() -> None:
     session = FakeSession(
         [
-            response(200, article_html([eligible_row(availability_num=2)])),
+            response(200, article_html([eligible_row(availability_num="2")])),
             response(200, seat_map_html()),
         ]
     )
@@ -309,7 +313,7 @@ async def test_requires_every_seat_status_code_to_be_recognised() -> None:
 def test_contract_mismatch_exits_4() -> None:
     session = FakeSession(
         [
-            response(200, article_html([eligible_row(availability_num=2)])),
+            response(200, article_html([eligible_row(availability_num="2")])),
             response(200, seat_map_html()),
         ]
     )
@@ -409,7 +413,7 @@ def test_closes_the_session_on_success() -> None:
 def test_closes_the_session_when_the_contract_fails() -> None:
     session = FakeSession(
         [
-            response(200, article_html([eligible_row(availability_num=2)])),
+            response(200, article_html([eligible_row(availability_num="2")])),
             response(200, seat_map_html()),
         ]
     )
@@ -517,3 +521,71 @@ def test_a_contract_failure_reports_without_the_pagination_token(
         assert main([FILM_URL], session=session, clock=clock()) == EXIT_CONTRACT
 
     assert_token_free(capsys, caplog)
+
+
+# ---------------------------------------------------------------------------
+# Fix round 2 -- the smoke runs against the captured live page
+# ---------------------------------------------------------------------------
+
+
+async def test_runs_end_to_end_against_the_captured_live_article_page() -> None:
+    """The smoke must clear the real BFI page, not just a hand-authored one.
+
+    This is the regression that the invented schema would have failed: the fixture is a
+    verbatim capture of a live ``articleContext``, so the parser can only satisfy it by
+    reading BFI's own field names. The seat map is generated to carry exactly as many
+    available seats as the captured row reports, which is the equality the smoke exists
+    to check.
+    """
+    performance = performance_from_row(article_context_row_mappings()[0])
+    session = FakeSession(
+        [
+            response(200, real_article_html()),
+            response(200, real_article_html(current_page=2)),
+            response(
+                200,
+                seat_map_html(
+                    performance_id=performance.performance_id,
+                    extra_circles=available_circles(performance.availability_num - 1),
+                ),
+            ),
+        ]
+    )
+
+    report = await run_smoke(FILM_URL, profile="chrome", session=session, clock=clock())
+
+    assert report.performance_id == performance.performance_id
+    assert report.reported_availability == performance.availability_num
+    assert report.available_seats == performance.availability_num
+    assert report.article_pages == 2
+    assert report.seat_maps == 1
+
+
+async def test_an_unpublished_count_is_never_chosen_as_eligible() -> None:
+    """``availability_num=-1`` means "not saying", so it offers nothing to check.
+
+    The row is on sale and reserved-seating, so only the count keeps it out. If the
+    sentinel were ever carried through as ``-1`` rather than normalised to zero, an
+    ``!= 0`` style check would pick this row and the smoke would then compare -1 against
+    a real seat count.
+    """
+    session = FakeSession(
+        [
+            response(
+                200,
+                article_html(
+                    [
+                        performance_row(
+                            id=OTHER_PERFORMANCE_ID,
+                            sales_status="S",
+                            availability_status="U",
+                            availability_num="-1",
+                        )
+                    ]
+                ),
+            )
+        ]
+    )
+
+    with pytest.raises(InputError, match="no on-sale reserved performance"):
+        await run_smoke(FILM_URL, profile="chrome", session=session, clock=clock())

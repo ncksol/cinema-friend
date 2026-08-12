@@ -48,13 +48,12 @@ def test_rank_vector_final_tiebreak_is_the_stable_seat_key():
 
 _PERF = Performance(
     performance_id="p1",
-    event_id="e1",
     start_utc=datetime(2026, 8, 26, 18, 0, tzinfo=UTC),
     sales_status_code="OPEN",
-    availability_code="A",
+    availability_status_code="E",
     availability_num=50,
-    reserved_seating=True,
     seat_map_url="https://example.com/map",
+    options=("1", "2"),
 )
 
 _SEAT = Seat(

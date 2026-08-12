@@ -81,6 +81,7 @@ PERF_2 = "3586A6AF-3C84-4FA7-BE37-B0B9BFC8960E"
 
 # The performance window every default criteria accepts: 2026-08-08 14:00 Europe/London.
 START_UTC = datetime(2026, 8, 8, 13, 0, tzinfo=UTC)
+ROW_START_DATE = "Saturday 08 August 2026 14:00"  # START_UTC in Europe/London
 
 _ZONE = PriceZone(zone_id="z1", label="1 Standard", price=None)
 
@@ -93,14 +94,12 @@ _ZONE = PriceZone(zone_id="z1", label="1 Standard", price=None)
 def make_performance(performance_id: str = PERF_1, **overrides: object) -> Performance:
     defaults: dict[str, object] = {
         "performance_id": performance_id,
-        "event_id": "E8A1B2C3-D4E5-F6A7-B8C9-D0E1F2A3B4C5",
         "start_utc": START_UTC,
         "sales_status_code": "S",
-        "availability_code": "A",
+        "availability_status_code": "E",
         "availability_num": 40,
-        "reserved_seating": True,
         "seat_map_url": seat_map_url(performance_id),
-        "options": (),
+        "options": ("1", "2"),
     }
     defaults.update(overrides)
     return Performance(**defaults)  # type: ignore[arg-type]
@@ -440,7 +439,7 @@ async def test_full_pagination_is_consumed_through_the_gateway(tmp_path: Path) -
         {
             SOURCE_URL: fetched_document(
                 make_article_html(
-                    rows=[performance_row(performance_id=PERF_1, sales_status="S")],
+                    rows=[performance_row(id=PERF_1, sales_status="S", start_date=ROW_START_DATE)],
                     current_page=1,
                     total_pages=2,
                     token=TOKEN,
@@ -449,7 +448,7 @@ async def test_full_pagination_is_consumed_through_the_gateway(tmp_path: Path) -
             ),
             page_2_url: fetched_document(
                 make_article_html(
-                    rows=[performance_row(performance_id=PERF_2, sales_status="S")],
+                    rows=[performance_row(id=PERF_2, sales_status="S", start_date=ROW_START_DATE)],
                     current_page=2,
                     total_pages=2,
                     token=TOKEN,
@@ -496,7 +495,7 @@ async def test_ineligible_performances_never_reach_a_seat_map_fetch(harness: Har
         make_performance("00000000-0000-4000-8000-000000000001", start_utc=START_UTC.replace(day=9)),
         make_performance("00000000-0000-4000-8000-000000000002", start_utc=START_UTC.replace(hour=9)),
         make_performance("00000000-0000-4000-8000-000000000003", sales_status_code="C"),
-        make_performance("00000000-0000-4000-8000-000000000004", reserved_seating=False),
+        make_performance("00000000-0000-4000-8000-000000000004", options=()),
         make_performance("00000000-0000-4000-8000-000000000005", availability_num=1),
         make_performance(PERF_1),
     ]

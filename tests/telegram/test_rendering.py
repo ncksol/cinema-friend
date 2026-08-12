@@ -41,13 +41,12 @@ def _performance(
 ) -> Performance:
     return Performance(
         performance_id=performance_id,
-        event_id="event-1",
         start_utc=start_utc,
         sales_status_code="S",
-        availability_code="E",
+        availability_status_code="E",
         availability_num=42,
-        reserved_seating=True,
         seat_map_url=seat_map_url,
+        options=("1", "2"),
     )
 
 

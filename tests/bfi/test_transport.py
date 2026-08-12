@@ -23,6 +23,7 @@ from cinema_friend.bfi.urls import (
 from cinema_friend.config import Settings
 from cinema_friend.domain.errors import BfiChallengeError, BfiNetworkError, CircuitOpenError
 from cinema_friend.domain.results import CircuitState, HostCircuit
+from tests.factories.bfi_html import MANAGED_CHALLENGE_HTML, PASSIVE_JSD_SCRIPT
 from tests.fakes import (
     FakeClock,
     FakeNetworkError,
@@ -91,6 +92,43 @@ async def test_interstitial_200_opens_circuit_without_immediate_retry():
     with pytest.raises(BfiChallengeError):
         await transport.get(FILM_URL, DocumentKind.ARTICLE)
     assert len(session.calls) == 1
+
+
+async def test_managed_challenge_body_200_is_a_challenge():
+    """The orchestrate interstitial BFI serves *instead of* a page is still a challenge."""
+    session = FakeSession([response(200, MANAGED_CHALLENGE_HTML)])
+    transport = make_transport(session=session)
+    with pytest.raises(BfiChallengeError):
+        await transport.get(FILM_URL, DocumentKind.ARTICLE)
+    assert (await transport.circuit_store.load(BFI_HOST)).state is CircuitState.OPEN
+
+
+async def test_passive_jsd_probe_on_a_real_200_page_is_not_a_challenge():
+    """A served page carrying Cloudflare's passive JSD script is a success, not a challenge.
+
+    Every ordinary BFI 200 embeds ``/cdn-cgi/challenge-platform/scripts/jsd/main.js``.
+    Matching the bare ``cdn-cgi/challenge-platform`` substring therefore classified every
+    successful fetch as a challenge, tripped the host circuit on the first request, and
+    made the site look permanently blocked while it was answering normally.
+    """
+    body = PASSIVE_JSD_SCRIPT + ARTICLE
+    session = FakeSession([response(200, body)])
+    transport = make_transport(session=session)
+    document = await transport.get(FILM_URL, DocumentKind.ARTICLE)
+    assert document.status_code == 200
+    assert document.text == body
+    assert len(session.calls) == 1
+    assert (await transport.circuit_store.load(BFI_HOST)).state is CircuitState.CLOSED
+
+
+async def test_passive_jsd_probe_does_not_mask_an_authoritative_cf_mitigated_header():
+    """``cf-mitigated`` stays authoritative even on a 200 that also carries the probe."""
+    session = FakeSession(
+        [response(200, PASSIVE_JSD_SCRIPT + ARTICLE, headers={"cf-mitigated": "challenge"})]
+    )
+    transport = make_transport(session=session)
+    with pytest.raises(BfiChallengeError):
+        await transport.get(FILM_URL, DocumentKind.ARTICLE)
 
 
 async def test_challenge_sets_next_probe_fifteen_minutes_out():

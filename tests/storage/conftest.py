@@ -48,14 +48,13 @@ def criteria(**overrides: object) -> WatchCriteria:
 def performance(performance_id: str = "p1", *, start_utc: datetime | None = None) -> Performance:
     return Performance(
         performance_id=performance_id,
-        event_id="e1",
         start_utc=start_utc or datetime(2026, 8, 26, 18, 0, tzinfo=UTC),
         sales_status_code="OPEN*",
-        availability_code="A",
+        availability_status_code="E",
         availability_num=50,
-        reserved_seating=True,
+        title="The Dog Stars",
         seat_map_url="https://whatson.bfi.org.uk/imax/Online/mapSelect.asp?ID=p1",
-        options=("opt-a",),
+        options=("1", "2"),
     )
 
 

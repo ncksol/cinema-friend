@@ -44,12 +44,12 @@ def _encode_option(option: RankedOption) -> str:
     payload = {
         "performance": {
             "performance_id": performance.performance_id,
-            "event_id": performance.event_id,
             "start_utc": encode_datetime(performance.start_utc),
             "sales_status_code": performance.sales_status_code,
-            "availability_code": performance.availability_code,
+            "availability_status_code": performance.availability_status_code,
             "availability_num": performance.availability_num,
-            "reserved_seating": performance.reserved_seating,
+            "availability_published": performance.availability_published,
+            "title": performance.title,
             "seat_map_url": performance.seat_map_url,
             "options": list(performance.options),
         },
@@ -78,12 +78,12 @@ def _decode_option(data: str) -> RankedOption:
     return RankedOption(
         performance=Performance(
             performance_id=performance["performance_id"],
-            event_id=performance["event_id"],
             start_utc=decode_datetime(performance["start_utc"]),
             sales_status_code=performance["sales_status_code"],
-            availability_code=performance["availability_code"],
+            availability_status_code=performance["availability_status_code"],
             availability_num=performance["availability_num"],
-            reserved_seating=performance["reserved_seating"],
+            availability_published=performance["availability_published"],
+            title=performance["title"],
             seat_map_url=performance["seat_map_url"],
             options=tuple(performance["options"]),
         ),

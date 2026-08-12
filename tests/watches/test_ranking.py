@@ -126,13 +126,12 @@ def criteria_with_preferred_time(
 def performance(performance_id: str, start_utc: datetime) -> Performance:
     return Performance(
         performance_id=performance_id,
-        event_id="E8A1B2C3-D4E5-F6A7-B8C9-D0E1F2A3B4C5",
         start_utc=start_utc,
         sales_status_code="S",
-        availability_code="A",
+        availability_status_code="E",
         availability_num=50,
-        reserved_seating=True,
         seat_map_url="https://whatson.bfi.org.uk/imax/Online/mapSelect.asp",
+        options=("1", "2"),
     )
 
 

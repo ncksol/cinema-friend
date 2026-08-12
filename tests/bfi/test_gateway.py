@@ -39,17 +39,15 @@ def make_gateway(
 def make_performance(**overrides: object) -> Performance:
     defaults: dict[str, object] = {
         "performance_id": PERF_1,
-        "event_id": "E8A1B2C3-D4E5-F6A7-B8C9-D0E1F2A3B4C5",
         "start_utc": datetime(2026, 8, 8, 13, 0, tzinfo=UTC),
         "sales_status_code": "OPEN",
-        "availability_code": "A",
+        "availability_status_code": "E",
         "availability_num": 1,
-        "reserved_seating": True,
         "seat_map_url": (
             "https://whatson.bfi.org.uk/imax/Online/mapSelect.asp"
             "?BOparam::WSmap::loadMap::performance_ids=2475959F-2B73-4EA6-AD26-AFA8AEB785FD"
         ),
-        "options": (),
+        "options": ("1", "2"),
     }
     defaults.update(overrides)
     return Performance(**defaults)  # type: ignore[arg-type]
@@ -62,23 +60,21 @@ def make_performance(**overrides: object) -> Performance:
 
 async def test_lists_every_paginated_performance_and_deduplicates():
     page_1 = make_article_html(
-        rows=[performance_row(performance_id=PERF_1), performance_row(performance_id=PERF_2)],
+        rows=[performance_row(id=PERF_1), performance_row(id=PERF_2)],
         current_page=1,
         total_pages=2,
         token=TOKEN,
         article_id=ARTICLE_ID,
-        title_with_apostrophe="Dog Stars",
     )
     page_2 = make_article_html(
         rows=[
-            performance_row(performance_id=PERF_2),  # exact duplicate: deduplicated
-            performance_row(performance_id=PERF_3),
+            performance_row(id=PERF_2),  # exact duplicate: deduplicated
+            performance_row(id=PERF_3),
         ],
         current_page=2,
         total_pages=2,
         token=TOKEN,
         article_id=ARTICLE_ID,
-        title_with_apostrophe="Dog Stars",
     )
     gateway, transport, _ = make_gateway(
         transport=FakeTransport(
@@ -91,14 +87,14 @@ async def test_lists_every_paginated_performance_and_deduplicates():
 
     performances = await gateway.list_performances(SLUG)
 
-    assert performances.title == "Dog Stars"
+    assert performances.title == "The Dog Stars"
     assert [item.performance_id for item in performances] == [PERF_1, PERF_2, PERF_3]
     assert transport.calls == [FILM_URL, PAGE_2_URL]
 
 
 async def test_empty_second_page_contributes_no_performances():
     page_1 = make_article_html(
-        rows=[performance_row(performance_id=PERF_1)],
+        rows=[performance_row(id=PERF_1)],
         total_pages=2,
         token=TOKEN,
         article_id=ARTICLE_ID,
@@ -120,20 +116,20 @@ async def test_empty_second_page_contributes_no_performances():
 
 async def test_three_page_listing_fetches_every_page_in_order():
     page_1 = make_article_html(
-        rows=[performance_row(performance_id=PERF_1)],
+        rows=[performance_row(id=PERF_1)],
         total_pages=3,
         token=TOKEN,
         article_id=ARTICLE_ID,
     )
     page_2 = make_article_html(
-        rows=[performance_row(performance_id=PERF_2)],
+        rows=[performance_row(id=PERF_2)],
         current_page=2,
         total_pages=3,
         token=TOKEN,
         article_id=ARTICLE_ID,
     )
     page_3 = make_article_html(
-        rows=[performance_row(performance_id=PERF_3)],
+        rows=[performance_row(id=PERF_3)],
         current_page=3,
         total_pages=3,
         token=TOKEN,
@@ -157,13 +153,13 @@ async def test_three_page_listing_fetches_every_page_in_order():
 
 async def test_changing_total_pages_across_pages_is_contract_error():
     page_1 = make_article_html(
-        rows=[performance_row(performance_id=PERF_1)],
+        rows=[performance_row(id=PERF_1)],
         total_pages=2,
         token=TOKEN,
         article_id=ARTICLE_ID,
     )
     page_2 = make_article_html(
-        rows=[performance_row(performance_id=PERF_2)],
+        rows=[performance_row(id=PERF_2)],
         current_page=2,
         total_pages=3,  # changed mid-pagination
         token=TOKEN,
@@ -185,13 +181,13 @@ async def test_changing_total_pages_across_pages_is_contract_error():
 async def test_changing_article_id_across_pages_is_contract_error():
     other_article_id = "3152D1E8-CFF7-419F-BE57-F51C1E490F24"
     page_1 = make_article_html(
-        rows=[performance_row(performance_id=PERF_1)],
+        rows=[performance_row(id=PERF_1)],
         total_pages=2,
         token=TOKEN,
         article_id=ARTICLE_ID,
     )
     page_2 = make_article_html(
-        rows=[performance_row(performance_id=PERF_2)],
+        rows=[performance_row(id=PERF_2)],
         current_page=2,
         total_pages=2,
         token=TOKEN,
@@ -212,19 +208,17 @@ async def test_changing_article_id_across_pages_is_contract_error():
 
 async def test_conflicting_page_titles_are_contract_error():
     page_1 = make_article_html(
-        rows=[performance_row(performance_id=PERF_1)],
+        rows=[performance_row(id=PERF_1, short_description="Dog Stars")],
         total_pages=2,
         token=TOKEN,
         article_id=ARTICLE_ID,
-        title_with_apostrophe="Dog Stars",
     )
     page_2 = make_article_html(
-        rows=[performance_row(performance_id=PERF_2)],
+        rows=[performance_row(id=PERF_2, short_description="Different Film")],
         current_page=2,
         total_pages=2,
         token=TOKEN,
         article_id=ARTICLE_ID,
-        title_with_apostrophe="Different Film",
     )
     gateway, _, _ = make_gateway(
         transport=FakeTransport(
@@ -241,13 +235,13 @@ async def test_conflicting_page_titles_are_contract_error():
 
 async def test_duplicate_id_with_conflicting_data_is_contract_error():
     page_1 = make_article_html(
-        rows=[performance_row(performance_id=PERF_1, availability_num=5)],
+        rows=[performance_row(id=PERF_1, availability_num="5")],
         total_pages=2,
         token=TOKEN,
         article_id=ARTICLE_ID,
     )
     page_2 = make_article_html(
-        rows=[performance_row(performance_id=PERF_1, availability_num=6)],
+        rows=[performance_row(id=PERF_1, availability_num="6")],
         current_page=2,
         total_pages=2,
         token=TOKEN,
@@ -268,7 +262,7 @@ async def test_duplicate_id_with_conflicting_data_is_contract_error():
 
 async def test_invalid_row_field_propagates_as_contract_error():
     page_1 = make_article_html(
-        rows=[performance_row(performance_id=PERF_1, start_date="not a date")],
+        rows=[performance_row(id=PERF_1, start_date="not a date")],
         total_pages=1,
         token=TOKEN,
         article_id=ARTICLE_ID,
@@ -284,8 +278,8 @@ async def test_invalid_row_field_propagates_as_contract_error():
 async def test_non_performance_rows_are_skipped():
     page_1 = make_article_html(
         rows=[
-            performance_row(performance_id=PERF_1, object_type="D"),
-            performance_row(performance_id=PERF_2),
+            performance_row(id=PERF_1, object_type="D"),
+            performance_row(id=PERF_2),
         ],
         total_pages=1,
         token=TOKEN,
@@ -307,7 +301,7 @@ async def test_non_performance_rows_are_skipped():
 
 async def test_concurrent_equal_reads_share_one_request():
     page_1 = make_article_html(
-        rows=[performance_row(performance_id=PERF_1)],
+        rows=[performance_row(id=PERF_1)],
         total_pages=1,
         token=TOKEN,
         article_id=ARTICLE_ID,
@@ -327,7 +321,7 @@ async def test_concurrent_equal_reads_share_one_request():
 
 async def test_cache_reuses_document_within_ttl_window():
     page_1 = make_article_html(
-        rows=[performance_row(performance_id=PERF_1)],
+        rows=[performance_row(id=PERF_1)],
         total_pages=1,
         token=TOKEN,
         article_id=ARTICLE_ID,
@@ -346,7 +340,7 @@ async def test_cache_reuses_document_within_ttl_window():
 
 async def test_cache_expires_after_ttl():
     page_1 = make_article_html(
-        rows=[performance_row(performance_id=PERF_1)],
+        rows=[performance_row(id=PERF_1)],
         total_pages=1,
         token=TOKEN,
         article_id=ARTICLE_ID,
@@ -367,7 +361,7 @@ async def test_cache_expires_after_ttl():
 
 async def test_failed_fetch_is_not_cached_and_inflight_is_cleaned_up():
     page_1 = make_article_html(
-        rows=[performance_row(performance_id=PERF_1)],
+        rows=[performance_row(id=PERF_1)],
         total_pages=1,
         token=TOKEN,
         article_id=ARTICLE_ID,
@@ -389,7 +383,7 @@ async def test_failed_fetch_is_not_cached_and_inflight_is_cleaned_up():
 async def test_concurrent_reads_where_first_fails_do_not_poison_the_second():
     """One caller's cancellation/failure must not corrupt in-flight bookkeeping for a sibling."""
     page_1 = make_article_html(
-        rows=[performance_row(performance_id=PERF_1)],
+        rows=[performance_row(id=PERF_1)],
         total_pages=1,
         token=TOKEN,
         article_id=ARTICLE_ID,
@@ -417,7 +411,7 @@ async def test_cancelling_one_reader_does_not_cancel_the_shared_fetch_for_a_sibl
     out from under an uncancelled sibling relying on the same fetch.
     """
     page_1 = make_article_html(
-        rows=[performance_row(performance_id=PERF_1)],
+        rows=[performance_row(id=PERF_1)],
         total_pages=1,
         token=TOKEN,
         article_id=ARTICLE_ID,
