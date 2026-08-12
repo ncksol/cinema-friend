@@ -39,6 +39,7 @@ from cinema_friend.domain.results import CheckResult
 from cinema_friend.domain.state import CheckTrigger, WatchStatus
 from cinema_friend.domain.time_window import LONDON
 from cinema_friend.domain.watch import Watch
+from cinema_friend.logging_config import correlation_scope
 from cinema_friend.storage.database import Database
 from cinema_friend.storage.retention import RetentionCounts
 from cinema_friend.storage.watch_repository import WatchRepository
@@ -227,25 +228,26 @@ class Scheduler:
     async def _run_check(self, watch: Watch) -> _Outcome:
         """Run one check, translating its failure mode into an outcome for the scan."""
         trigger = _TRIGGERS[watch.status]
-        async with self._checks_in_flight:
-            try:
-                await self._deps.checks.check(watch.watch_id, trigger)
-            except ConflictError:
-                # The watch moved under the check. Whoever moved it owns its schedule
-                # now, so there is nothing to record and nothing to retry.
-                logger.info(
-                    "check abandoned because its watch changed",
-                    extra={"watch_id": str(watch.watch_id), "trigger": trigger.value},
-                )
-                return _Outcome.ABANDONED
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception(
-                    "check failed",
-                    extra={"watch_id": str(watch.watch_id), "trigger": trigger.value},
-                )
-                return _Outcome.FAILED
+        with correlation_scope(str(watch.watch_id)):
+            async with self._checks_in_flight:
+                try:
+                    await self._deps.checks.check(watch.watch_id, trigger)
+                except ConflictError:
+                    # The watch moved under the check. Whoever moved it owns its schedule
+                    # now, so there is nothing to record and nothing to retry.
+                    logger.info(
+                        "check abandoned because its watch changed",
+                        extra={"watch_id": str(watch.watch_id), "trigger": trigger.value},
+                    )
+                    return _Outcome.ABANDONED
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception(
+                        "check failed",
+                        extra={"watch_id": str(watch.watch_id), "trigger": trigger.value},
+                    )
+                    return _Outcome.FAILED
         return _Outcome.CHECKED
 
     async def _expire(self, observed: Watch, now: datetime) -> bool:

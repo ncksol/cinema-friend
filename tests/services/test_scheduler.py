@@ -21,6 +21,8 @@ Three properties matter most here:
 from __future__ import annotations
 
 import asyncio
+import io
+import json
 import logging
 from collections.abc import Callable, Coroutine
 from dataclasses import replace
@@ -37,6 +39,7 @@ from cinema_friend.domain.errors import ConflictError, PersistenceError
 from cinema_friend.domain.results import CheckResult
 from cinema_friend.domain.state import CheckOutcome, CheckTrigger, WatchMode, WatchStatus
 from cinema_friend.domain.watch import Watch, WatchCriteria
+from cinema_friend.logging_config import configure_logging, current_correlation_id
 from cinema_friend.services.scheduler import (
     DELIVERY_INTERVAL_SECONDS,
     DUE_INTERVAL_SECONDS,
@@ -157,6 +160,48 @@ class FakeRetention:
     async def run(self, now: datetime) -> RetentionCounts:
         self.calls.append(now)
         return RetentionCounts(snapshots_deleted=1, check_runs_deleted=2, drafts_deleted=3)
+
+
+class CorrelatedChecks:
+    def __init__(self, *, logger_name: str = LOGGER_NAME) -> None:
+        self.logger = logging.getLogger(logger_name)
+        self.calls: list[tuple[UUID, CheckTrigger]] = []
+        self.release = asyncio.Event()
+        self.started = asyncio.Event()
+        self.active = 0
+        self.max_active = 0
+        self.error: BaseException | None = None
+
+    async def check(self, watch_id: UUID, trigger: CheckTrigger) -> CheckResult:
+        self.calls.append((watch_id, trigger))
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        self.started.set()
+        try:
+            self.logger.info(
+                "check started",
+                extra={"watch_id": str(watch_id), "trigger": trigger.value},
+            )
+            assert current_correlation_id() == str(watch_id)
+            await self.release.wait()
+            if self.error is not None:
+                raise self.error
+            self.logger.info(
+                "check finished",
+                extra={"watch_id": str(watch_id), "trigger": trigger.value},
+            )
+            return CheckResult(
+                check_run_id=uuid4(),
+                watch_id=watch_id,
+                trigger=trigger,
+                outcome=CheckOutcome.SUCCESS,
+                snapshot_id=uuid4(),
+                performance_count=1,
+                option_count=1,
+                error_detail=None,
+            )
+        finally:
+            self.active -= 1
 
 
 class StaleListingRepository(WatchRepository):
@@ -286,6 +331,10 @@ async def reload(database: Database, watch_id: UUID) -> Watch:
     return stored
 
 
+def parse_records(stream: io.StringIO) -> list[dict[str, object]]:
+    return [json.loads(line) for line in stream.getvalue().splitlines() if line]
+
+
 # ---------------------------------------------------------------------------
 # Due selection
 # ---------------------------------------------------------------------------
@@ -368,6 +417,77 @@ async def test_due_scan_bounds_how_many_checks_run_at_once(
     await asyncio.wait_for(task, timeout=2)
     assert checks.max_active == 2
     assert len(checks.calls) == 5
+
+
+async def test_due_scan_tags_concurrent_check_logs_and_resets_outside_scope(
+    make_watch: Callable[..., Any],
+    database: Database,
+    clock: FakeClock,
+    deliveries: FakeDeliveries,
+    retention: FakeRetention,
+) -> None:
+    first = await make_watch()
+    second = await make_watch()
+    stream = io.StringIO()
+    root = logging.getLogger()
+    original_handlers = list(root.handlers)
+    original_level = root.level
+    try:
+        configure_logging("INFO", stream=stream)
+        checks = CorrelatedChecks()
+        scheduler = Scheduler(
+            SchedulerDependencies(
+                database=database,
+                watches=WatchRepository(),
+                checks=checks,
+                deliveries=deliveries,
+                retention=retention,
+                clock=clock,
+            ),
+            max_concurrent_checks=2,
+        )
+
+        task = asyncio.create_task(scheduler.run_due_once())
+        await until(lambda: len(checks.calls) == 2)
+        checks.release.set()
+        await asyncio.wait_for(task, timeout=2)
+
+        logging.getLogger(LOGGER_NAME).info("outside scope")
+        payloads = parse_records(stream)
+        scoped = [
+            payload
+            for payload in payloads
+            if payload["event"] in {"check started", "check finished"}
+        ]
+        assert {payload["watch_id"] for payload in scoped} == {
+            str(first.watch_id),
+            str(second.watch_id),
+        }
+        assert {
+            payload["correlation_id"]
+            for payload in scoped
+        } == {
+            str(first.watch_id),
+            str(second.watch_id),
+        }
+        assert all(payload["correlation_id"] == payload["watch_id"] for payload in scoped)
+        assert not any(
+            payload["event"] == "outside scope" and "correlation_id" in payload
+            for payload in payloads
+        )
+        assert not any(
+            payload["event"] == "due scan completed" and "correlation_id" in payload
+            for payload in payloads
+        )
+    finally:
+        for handler in list(root.handlers):
+            if handler not in original_handlers:
+                root.removeHandler(handler)
+                handler.close()
+        for handler in original_handlers:
+            if handler not in root.handlers:
+                root.addHandler(handler)
+        root.setLevel(original_level)
 
 
 # ---------------------------------------------------------------------------
@@ -480,6 +600,48 @@ async def test_conflict_is_an_abandoned_run_not_a_failure(
     assert stored.next_check_at == watch.next_check_at
     assert any("abandoned" in record.getMessage().lower() for record in caplog.records)
     assert not [record for record in caplog.records if record.levelno >= logging.ERROR]
+
+
+@pytest.mark.parametrize(
+    "error, expected",
+    [
+        (ConflictError("watch changed while its check was running"), "ABANDONED"),
+        (PersistenceError("disk went away"), "FAILED"),
+        (asyncio.CancelledError(), "CANCELLED"),
+    ],
+)
+async def test_run_check_opens_and_clears_the_correlation_scope_for_all_outcomes(
+    database: Database,
+    clock: FakeClock,
+    deliveries: FakeDeliveries,
+    retention: FakeRetention,
+    make_watch: Callable[..., Any],
+    error: BaseException,
+    expected: str,
+) -> None:
+    watch = await make_watch()
+    checks = CorrelatedChecks()
+    checks.error = error
+    checks.release.set()
+    scheduler = Scheduler(
+        SchedulerDependencies(
+            database=database,
+            watches=WatchRepository(),
+            checks=checks,
+            deliveries=deliveries,
+            retention=retention,
+            clock=clock,
+        )
+    )
+
+    if isinstance(error, asyncio.CancelledError):
+        with pytest.raises(asyncio.CancelledError):
+            await scheduler._run_check(watch)
+    else:
+        outcome = await scheduler._run_check(watch)
+        assert outcome.name == expected
+
+    assert current_correlation_id() is None
 
 
 async def test_one_failing_check_does_not_stop_the_others(
