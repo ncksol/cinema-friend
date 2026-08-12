@@ -597,6 +597,10 @@ _IN_FLIGHT = (
 _FAILED_BEFORE_CREATE = (
     "Something went wrong and nothing was saved. Tap Confirm again to retry."
 )
+_CANCELLED_MID_CONFIRM = (
+    "Setup cancelled. That confirmation never finished, so a watch may already have "
+    "been created -- send /watches to check."
+)
 _FAILED_AFTER_CREATE = (
     "Your watch is saved, but I couldn't finish setting it up. Tap Confirm again to "
     "finish -- this will not create a second watch."
@@ -623,8 +627,28 @@ async def start_new(update: Update, deps: WizardDeps) -> RenderedMessage:
 
 
 async def cancel(update: Update, deps: WizardDeps) -> RenderedMessage:
-    """Discard this user's in-progress draft. Deleting a missing draft is a no-op."""
+    """Discard this user's in-progress draft, unless a confirmation is still running.
+
+    A draft in ``CONFIRMING`` is a claimed saga, not an idle form: deleting it would
+    strand a watch that may already exist and would let the same confirmation run twice.
+    A live claim is therefore refused with the same in-progress wording the Confirm
+    button gives. Once the lease has expired the draft is cancellable again, but the
+    reply says so honestly -- the saga may have got far enough to create the watch, and
+    only ``/watches`` can settle that.
+
+    Deleting a missing draft stays a no-op.
+    """
     user_id = _require_user(update)
+    async with deps.database.connection() as conn:
+        draft = await deps.drafts.get(conn, user_id)
+    if draft is not None and draft.state == WizardState.CONFIRMING.value:
+        if _claim_is_live(draft, deps.clock.now()):
+            return RenderedMessage(text=_IN_FLIGHT, parse_mode=ParseMode.HTML, reply_markup=None)
+        async with deps.database.connection() as conn:
+            await deps.drafts.delete(conn, user_id)
+        return RenderedMessage(
+            text=_CANCELLED_MID_CONFIRM, parse_mode=ParseMode.HTML, reply_markup=None
+        )
     async with deps.database.connection() as conn:
         await deps.drafts.delete(conn, user_id)
     return RenderedMessage(

@@ -15,7 +15,10 @@ from cinema_friend.domain.errors import InputError
 
 _VERSION = "v1"
 _RESULT_PAGE_ACTION = "page"
-WATCH_ACTIONS = frozenset({"pause", "resume", "delete"})
+#: Every action a watch keyboard may carry. ``delete`` only *offers* a deletion;
+#: ``delete_confirm`` and ``keep`` are the two answers to that offer, so an accidental
+#: tap on a stale keyboard can never destroy a watch on its own.
+WATCH_ACTIONS = frozenset({"pause", "resume", "delete", "delete_confirm", "keep"})
 MAX_CALLBACK_BYTES = 64
 
 _MALFORMED = "malformed callback data"

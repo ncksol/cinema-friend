@@ -418,6 +418,22 @@ async def test_snapshot_page_rejects_an_unknown_snapshot(
         await repo.snapshot_page(conn, missing, page=1)
 
 
+async def test_snapshot_watch_id_names_the_owning_watch(
+    conn: aiosqlite.Connection, repo: ResultRepository, make_watch: MakeWatch
+) -> None:
+    watch = await make_watch()
+    snapshot = await _save_snapshot(repo, conn, watch, ranked=options(2))
+    assert await repo.snapshot_watch_id(conn, snapshot.snapshot_id) == watch.watch_id
+
+
+async def test_snapshot_watch_id_is_none_for_a_snapshot_that_is_gone(
+    conn: aiosqlite.Connection, repo: ResultRepository
+) -> None:
+    """A pruned snapshot and a forged id are indistinguishable, on purpose."""
+    missing = UUID("00000000-0000-4000-8000-000000009999")
+    assert await repo.snapshot_watch_id(conn, missing) is None
+
+
 # ---------------------------------------------------------------------------
 # Option payload shape
 # ---------------------------------------------------------------------------

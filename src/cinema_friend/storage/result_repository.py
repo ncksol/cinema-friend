@@ -253,6 +253,22 @@ class ResultRepository:
             options=await self._options(conn, snapshot_id),
         )
 
+    async def snapshot_watch_id(
+        self, conn: aiosqlite.Connection, snapshot_id: UUID
+    ) -> UUID | None:
+        """Return the watch a snapshot belongs to, or ``None`` if it no longer exists.
+
+        A callback carries only a snapshot id, but authorizing it needs the owning
+        watch. Returning ``None`` for an unknown snapshot rather than raising keeps
+        "pruned" and "forged" indistinguishable to the caller, which is what lets a
+        handler answer both with the same message.
+        """
+        cursor = await conn.execute(
+            "SELECT watch_id FROM result_snapshots WHERE id = ?", (str(snapshot_id),)
+        )
+        row = await cursor.fetchone()
+        return None if row is None else UUID(row["watch_id"])
+
     async def snapshot_page(
         self,
         conn: aiosqlite.Connection,
