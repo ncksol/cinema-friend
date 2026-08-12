@@ -532,8 +532,8 @@ def single_seat_map_html(raw_status: str, *, performance_id: str = PERF_1) -> st
     )
 
 
-@pytest.mark.parametrize("raw_status", ["S", "O", "U"])
-async def test_zero_parsed_available_with_explicable_statuses_is_not_a_contract_error(
+@pytest.mark.parametrize("raw_status", ["S", "O"])
+async def test_zero_parsed_available_with_a_taken_seat_is_not_a_contract_error(
     raw_status: str, caplog: pytest.LogCaptureFixture
 ):
     """Losing the last seats between the two reads is an ordinary sell-out, not a site change.
@@ -558,6 +558,35 @@ async def test_zero_parsed_available_with_explicable_statuses_is_not_a_contract_
 
     assert len(seat_map.seats) == 1
     assert any("sold out" in record.message.lower() for record in caplog.records)
+
+
+async def test_zero_parsed_available_with_no_taken_seat_warns_without_failing_the_read(
+    caplog: pytest.LogCaptureFixture,
+):
+    """A map with nothing free and nothing taken cannot mean "just sold out" -- but nor is
+    it evidence the site changed.
+
+    Every seat reading ``U`` is not a sell-out: a sell-out leaves the seats somebody took.
+    It is worth an operator's attention, so it logs at warning level. It is still not a
+    ``BfiContractError``, because that pauses the watch and tells its owner the page
+    changed shape -- a claim this evidence does not support, and one that costs a manual
+    resume to undo. Left running, the watch re-reads once the document cache expires.
+    """
+    performance = make_performance(availability_num=3)
+    html = single_seat_map_html("U")
+    gateway, _, _ = make_gateway(
+        transport=FakeTransport(
+            {performance.seat_map_url: fetched_document(html, url=performance.seat_map_url)}
+        )
+    )
+
+    with caplog.at_level(logging.INFO):
+        seat_map = await gateway.load_seat_map(performance)
+
+    assert len(seat_map.seats) == 1
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("no available, sold or held seat" in record.message for record in warnings)
+    assert not any("sold out" in record.message.lower() for record in caplog.records)
 
 
 async def test_zero_parsed_available_with_unrecognised_status_is_a_contract_error():

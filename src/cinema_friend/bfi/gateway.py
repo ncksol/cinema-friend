@@ -14,7 +14,7 @@ import asyncio
 import functools
 import logging
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Final, Protocol
 
 from cinema_friend.bfi.article_context import ArticlePage, parse_article_page, performance_from_row
 from cinema_friend.bfi.seat_map import KNOWN_STATUS_CODES, parse_seat_map
@@ -37,6 +37,15 @@ space as ``RESTRICTED`` while BFI keeps counting it. Comparing BFI's number agai
 the *offerable* seats manufactures a contract error out of an ordinary near-sold-out
 map -- which pauses the watch and alerts its owner about a site change that never
 happened.
+"""
+
+_TAKEN_STATUS_CODES: Final[frozenset[str]] = frozenset({"S", "O"})
+"""Raw ``data-status`` codes that evidence a seat having been taken from sale.
+
+``S`` is bought and ``O`` is held in another customer's basket. One of them has to
+appear for a map with no free seat to mean "sold out since the listing was read". A
+map carrying neither cannot be explained that way however readable it is, so it is
+logged as a warning rather than passed off as an ordinary sell-out.
 """
 
 # Absolute drift between BFI's reported availability_num and the count of
@@ -155,14 +164,17 @@ class BfiGateway:
         :func:`~cinema_friend.bfi.seat_map.parse_seat_map`), or if BFI
         reports positive availability while the map carries no raw-``A``
         seat *and* some seat carries a status code this parser does not
-        recognise. A map with no raw-``A`` seat whose seats are all
-        explicable is an ordinary sell-out, not a site change: the listing
-        and the map are two documents read up to a cache lifetime apart,
-        and the last free seats can be bought -- or merely taken into
-        another customer's basket as ``O`` -- in between. A larger,
-        non-zero drift is logged but does not fail the read, and a map
-        whose available seats are all restricted is a logged metric rather
-        than any kind of failure.
+        recognise. Zero raw-``A`` seats is not on its own a site change:
+        the listing and the map are two documents read up to a cache
+        lifetime apart, and the last free seats can be bought (``S``) or
+        merely taken into another customer's basket (``O``) in between.
+        A map that carries no ``A``, ``S`` or ``O`` seat at all cannot
+        mean "just sold out" either, so it is logged at warning level --
+        but it still does not fail the read, because stopping a watch
+        says the site changed, and this evidence does not show that. A
+        larger, non-zero drift is logged but does not fail the read, and
+        a map whose available seats are all restricted is a logged metric
+        rather than any kind of failure.
         """
         if performance.seat_map_url is None:
             raise BfiContractError(
@@ -173,13 +185,8 @@ class BfiGateway:
         drift = _availability_drift(performance, seat_map)
 
         if drift.parsed == 0 and performance.availability_num > 0:
-            unrecognised = sorted(
-                {
-                    seat.raw_status_code
-                    for seat in seat_map.seats
-                    if seat.raw_status_code not in KNOWN_STATUS_CODES
-                }
-            )
+            codes = {seat.raw_status_code for seat in seat_map.seats}
+            unrecognised = sorted(codes - KNOWN_STATUS_CODES)
             if unrecognised:
                 raise BfiContractError(
                     f"performance {performance.performance_id!r} reports "
@@ -187,12 +194,21 @@ class BfiGateway:
                     f"seats parsed, and the map carries unrecognised status codes "
                     f"{unrecognised}"
                 )
-            logger.info(
-                "performance %s sold out between its listing and its seat map: "
-                "reported=%d parsed=0",
-                performance.performance_id,
-                drift.reported,
-            )
+            if codes.isdisjoint(_TAKEN_STATUS_CODES):
+                logger.warning(
+                    "performance %s reports availability_num=%d but its seat map carries "
+                    "no available, sold or held seat: %s",
+                    performance.performance_id,
+                    drift.reported,
+                    sorted(codes),
+                )
+            else:
+                logger.info(
+                    "performance %s sold out between its listing and its seat map: "
+                    "reported=%d parsed=0",
+                    performance.performance_id,
+                    drift.reported,
+                )
         if abs(drift.difference) > _DRIFT_LOG_THRESHOLD:
             logger.warning(
                 "availability drift for performance %s: reported=%d parsed=%d "

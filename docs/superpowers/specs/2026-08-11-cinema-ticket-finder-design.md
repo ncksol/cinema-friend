@@ -455,7 +455,9 @@ The gateway allows at most two in-flight BFI requests and starts requests at lea
 The gateway cross-checks the count of `A` seats against the `availability_num` reported for the same performance on the film page. The two documents are fetched seconds apart and real bookings occur in between, so an exact match is not required:
 
 - A difference of more than five seats is logged as a contract-drift signal for the smoke test to investigate. The check does not fail.
-- A seat map that yields zero parsed seats, or zero available seats while `availability_num` is positive, is a parser-contract error. It is never reported as no availability.
+- A seat map that yields zero parsed seats is a parser-contract error.
+- Zero *available* seats while `availability_num` is positive is not, by itself, a parser-contract error. The two documents are read up to a cache lifetime apart, so the last free seats can be bought (`S`) or taken into another customer's basket (`O`) in between; failing there would pause the watch and alert its owner about a change that never happened, on precisely the nearly-sold-out screening they most want watched. It is a contract error only when some seat carries a `data-status` the parser does not recognise, which is what a changed page looks like.
+- A map carrying no `A`, `S` or `O` seat at all cannot mean "just sold out" either, since a sell-out leaves the seats somebody took. That is logged as a warning for the smoke test to investigate, but the read still succeeds: stopping a watch asserts the site changed, and this evidence does not show that.
 
 ### Adjacency
 
