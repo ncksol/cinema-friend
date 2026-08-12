@@ -845,6 +845,30 @@ async def test_a_cancelled_check_is_not_swallowed(
         await scheduler.run_due_once()
 
 
+async def test_a_cancelled_check_leaves_the_watch_exactly_where_it_was(
+    scheduler: Scheduler,
+    checks: FakeChecks,
+    make_watch: Callable[..., Any],
+    database: Database,
+) -> None:
+    """Being shut down mid-check must cost a repeated check, not a lost one.
+
+    ``app.SHUTDOWN_GRACE_SECONDS`` is deliberately too short to cover a slow check, and
+    that is only safe because of this: a cancelled check writes nothing and leaves its
+    watch due in the past, so the next process to start picks it up and runs it again.
+    If cancellation ever went down the defect path instead, an ordinary restart would
+    silently move a watch to BACKOFF -- or a one-off to FAILED.
+    """
+    watch = await make_watch()
+    checks.errors[watch.watch_id] = asyncio.CancelledError()
+
+    with pytest.raises(asyncio.CancelledError):
+        await scheduler.run_due_once()
+
+    stored = await reload(database, watch.watch_id)
+    assert stored == watch
+
+
 # ---------------------------------------------------------------------------
 # Delivery and retention
 # ---------------------------------------------------------------------------

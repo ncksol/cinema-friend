@@ -554,11 +554,12 @@ async def test_stop_waits_for_active_checks_only_up_to_the_grace_period(
 
 
 def test_the_specified_grace_period_is_sixty_seconds() -> None:
-    """Sixty, not thirty: a check can be mid-fetch against a 45-second request budget.
+    """Sixty, not thirty: one request attempt on its own is bounded at 45 seconds.
 
-    The grace period has to outlast the slowest request the transport will still be
-    waiting on, plus the database write that follows it. Thirty seconds cut into that
-    budget and cancelled work that was about to succeed.
+    The grace period does not cover a whole check and is not meant to -- see
+    ``SHUTDOWN_GRACE_SECONDS`` for why no value could -- but it should outlast a single
+    in-flight request and the commit that may follow it. Thirty seconds cut into that
+    and cancelled work that was about to succeed.
     """
     assert SHUTDOWN_GRACE_SECONDS == 60.0
 

@@ -65,14 +65,25 @@ from cinema_friend.telegram.wizard import WizardDeps, recover_confirmations
 logger = logging.getLogger(__name__)
 
 SHUTDOWN_GRACE_SECONDS: Final = 60.0
-"""How long a check already in flight gets to finish before it is cancelled.
+"""How long shutdown waits for the scheduler to wind down before cancelling it.
 
-Sized against the request budget it has to outlast, not picked round: one BFI hop is
-bounded at 45 seconds by ``bfi.transport.TOTAL_TIMEOUT_SECONDS``, and the check still
-has its database write to do after that. A shorter grace period cancels work that was
-about to succeed and leaves the check run unrecorded; 60 seconds covers the slow case
-while staying short enough that an operator restarting the service does not conclude it
-has hung.
+It is not sized to cover a whole check, because no value here could:
+``bfi.transport.TOTAL_TIMEOUT_SECONDS`` bounds one HTTP *attempt* at 45 seconds, and a
+check is many attempts. Each ``get`` retries that attempt on a network error, a 5xx or a
+403, and follows up to six redirect hops; one check fetches the film page, every
+pagination page, and a seat map per candidate performance. A slow check runs for minutes.
+
+What the grace buys is the ordinary case: a check with only its commit left to do, and a
+fair chance for one in-flight request to return. Exceeding it costs nothing that needs
+repairing. The transaction unwinds on cancellation like any other ``BaseException``, so
+no half-written run is left behind, and the scheduler leaves the watch exactly as the
+scan found it -- still due, in the past -- so the next process to start runs it again.
+Cancelling costs a repeated check, not a lost one.
+
+Sixty is therefore a ceiling on waiting rather than a budget anything is spent against:
+shutdown returns as soon as the scheduler is idle, so the wait is only ever paid by a
+restart that lands mid-check, and it stops well short of the point where an operator
+would conclude the service has hung.
 """
 
 
