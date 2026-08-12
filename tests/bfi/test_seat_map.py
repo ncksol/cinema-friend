@@ -6,7 +6,12 @@ from decimal import Decimal
 
 import pytest
 
-from cinema_friend.bfi.seat_map import is_restricted_access, parse_seat_map
+from cinema_friend.bfi.seat_map import (
+    KNOWN_STATUS_CODES,
+    TAKEN_STATUS_CODES,
+    is_restricted_access,
+    parse_seat_map,
+)
 from cinema_friend.domain.bfi import SeatStatus
 from cinema_friend.domain.errors import BfiContractError
 from tests.factories.bfi_html import ACCESS_NOTE, PERFORMANCE_ID, ZONE_ID, seat_map_html
@@ -370,3 +375,27 @@ getPerformanceEcommerceObject({{"item_id":"{PERFORMANCE_ID}"}})
 </g></svg></html>"""
     with pytest.raises(BfiContractError, match="section"):
         parse_seat_map(html, PERFORMANCE_ID)
+
+
+def test_every_taken_status_code_parses_as_taken_from_sale():
+    """The exported set must stay derived from the parser, not restated beside it.
+
+    A caller uses ``TAKEN_STATUS_CODES`` to decide whether a map with nothing free sold
+    out or never had seats to sell. If BFI adds a code and it is entered in the status
+    map -- the natural place, since that is what stops it parsing as ``UNKNOWN`` -- a
+    second hand-written list of letters elsewhere would silently disagree, and a real
+    sell-out written in the new code would be reported as a map with nothing taken.
+    """
+    assert TAKEN_STATUS_CODES <= KNOWN_STATUS_CODES
+
+    for code in KNOWN_STATUS_CODES:
+        html = f"""<html><script>
+getPerformanceEcommerceObject({{"item_id":"{PERFORMANCE_ID}"}})
+</script>
+<svg><g id="{ZONE_ID}">
+  <circle id="seat-1" data-status="{code}" data-seat-section="BFI IMAX"
+    data-seat-row="A" data-seat-seat="1" cx="10" cy="10"/>
+</g></svg></html>"""
+        (seat,) = parse_seat_map(html, PERFORMANCE_ID).seats
+        taken = seat.status in {SeatStatus.SOLD, SeatStatus.CONTENDED}
+        assert taken == (code in TAKEN_STATUS_CODES), code

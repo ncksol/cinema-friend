@@ -14,10 +14,10 @@ import asyncio
 import functools
 import logging
 from dataclasses import dataclass
-from typing import Final, Protocol
+from typing import Protocol
 
 from cinema_friend.bfi.article_context import ArticlePage, parse_article_page, performance_from_row
-from cinema_friend.bfi.seat_map import KNOWN_STATUS_CODES, parse_seat_map
+from cinema_friend.bfi.seat_map import KNOWN_STATUS_CODES, TAKEN_STATUS_CODES, parse_seat_map
 from cinema_friend.bfi.transport import DocumentKind, FetchedDocument
 from cinema_friend.bfi.urls import film_page_url, pagination_url
 from cinema_friend.clock import Clock
@@ -37,15 +37,6 @@ space as ``RESTRICTED`` while BFI keeps counting it. Comparing BFI's number agai
 the *offerable* seats manufactures a contract error out of an ordinary near-sold-out
 map -- which pauses the watch and alerts its owner about a site change that never
 happened.
-"""
-
-_TAKEN_STATUS_CODES: Final[frozenset[str]] = frozenset({"S", "O"})
-"""Raw ``data-status`` codes that evidence a seat having been taken from sale.
-
-``S`` is bought and ``O`` is held in another customer's basket. One of them has to
-appear for a map with no free seat to mean "sold out since the listing was read". A
-map carrying neither cannot be explained that way however readable it is, so it is
-logged as a warning rather than passed off as an ordinary sell-out.
 """
 
 # Absolute drift between BFI's reported availability_num and the count of
@@ -194,7 +185,7 @@ class BfiGateway:
                     f"seats parsed, and the map carries unrecognised status codes "
                     f"{unrecognised}"
                 )
-            if codes.isdisjoint(_TAKEN_STATUS_CODES):
+            if codes.isdisjoint(TAKEN_STATUS_CODES):
                 logger.warning(
                     "performance %s reports availability_num=%d but its seat map carries "
                     "no available, sold or held seat: %s",

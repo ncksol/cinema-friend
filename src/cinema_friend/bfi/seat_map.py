@@ -37,6 +37,23 @@ a map whose seats are all explicable -- and which therefore says what it means w
 shows nothing available -- from one written in a vocabulary this parser no longer reads.
 """
 
+TAKEN_STATUS_CODES: Final[frozenset[str]] = frozenset(
+    code
+    for code, status in _STATUS_MAP.items()
+    if status in {SeatStatus.SOLD, SeatStatus.CONTENDED}
+)
+"""The raw ``data-status`` codes that mean a seat has been taken from sale.
+
+Bought (:attr:`SeatStatus.SOLD`) or held in another customer's basket
+(:attr:`SeatStatus.CONTENDED`). Derived from :data:`_STATUS_MAP` rather than restated,
+so a code added there to parse as sold or contended counts as taken everywhere at once
+-- a second hand-written list of letters would quietly disagree with this one the first
+time BFI adds a code.
+
+Callers use it to tell a map that sold out from one that never had seats to sell: a
+sell-out leaves behind the seats somebody took.
+"""
+
 _RESTRICTED_KEYWORDS = ("wheelchair", "companion", "assistant")
 
 #: The seat attributes an access or obstruction note can arrive in, in priority order.
