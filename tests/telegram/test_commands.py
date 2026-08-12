@@ -45,9 +45,16 @@ from cinema_friend.storage.draft_repository import DraftRepository
 from cinema_friend.storage.notification_repository import NotificationRepository
 from cinema_friend.storage.result_repository import ResultRepository
 from cinema_friend.storage.watch_repository import WatchRepository
-from cinema_friend.telegram.bot import DeliveryRun, DeliveryWorker
+from cinema_friend.telegram.bot import (
+    DeliveryAttempt,
+    DeliveryAttemptOutcome,
+    DeliveryRun,
+    DeliveryWorker,
+)
 from cinema_friend.telegram.callbacks import encode_callback
 from cinema_friend.telegram.commands import (
+    RESULTS_GONE,
+    STALE_ACTION,
     CommandDeps,
     handle_callback,
     handle_cancel,
@@ -134,12 +141,28 @@ class _RaisingChecks:
 
 
 class _RecordingDispatcher:
-    def __init__(self) -> None:
+    def __init__(self, run: DeliveryRun | None = None) -> None:
         self.runs = 0
+        self._run = run if run is not None else DeliveryRun()
 
     async def run_once(self) -> DeliveryRun:
         self.runs += 1
-        return DeliveryRun()
+        return self._run
+
+
+def _sent_run(*, watch_id: UUID | None, user_id: int = USER_ID) -> DeliveryRun:
+    """A run in which exactly one delivery was sent, for the given watch and user."""
+    return DeliveryRun(
+        attempts=(
+            DeliveryAttempt(
+                delivery_id=uuid4(),
+                idempotency_key=f"results:{watch_id}",
+                recipient_user_id=user_id,
+                watch_id=watch_id,
+                outcome=DeliveryAttemptOutcome.SENT,
+            ),
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -728,6 +751,112 @@ async def test_check_flushes_deliveries_once(harness: Harness) -> None:
     )
     await handle_check(_text_update("/check 1"), deps)
     assert dispatcher.runs == 1
+
+
+def _with_dispatcher(harness: Harness, dispatcher: Any) -> CommandDeps:
+    return CommandDeps(
+        wizard=harness.deps.wizard,
+        results=harness.results,
+        deliveries=dispatcher,
+        allowed_user_ids=harness.deps.allowed_user_ids,
+    )
+
+
+async def test_check_stays_quiet_when_its_own_delivery_was_the_one_sent(
+    harness: Harness,
+) -> None:
+    watch = await _seed_watch(harness)
+    deps = _with_dispatcher(harness, _RecordingDispatcher(_sent_run(watch_id=watch.watch_id)))
+
+    assert await handle_check(_text_update("/check 1"), deps) is None
+
+
+async def test_check_still_answers_when_someone_elses_delivery_was_sent(
+    harness: Harness,
+) -> None:
+    await _seed_watch(harness)
+    other = await _seed_watch(harness, suffix=2, owner=OTHER_USER_ID, title="Theirs")
+    deps = _with_dispatcher(
+        harness,
+        _RecordingDispatcher(_sent_run(watch_id=other.watch_id, user_id=OTHER_USER_ID)),
+    )
+
+    message = await handle_check(_text_update("/check 1"), deps)
+
+    assert message is not None
+    assert "Theirs" not in message.text
+
+
+async def test_check_still_answers_when_a_host_alert_was_the_only_thing_sent(
+    harness: Harness,
+) -> None:
+    await _seed_watch(harness)
+    deps = _with_dispatcher(harness, _RecordingDispatcher(_sent_run(watch_id=None)))
+
+    assert await handle_check(_text_update("/check 1"), deps) is not None
+
+
+async def test_check_still_answers_when_its_own_delivery_was_only_retried(
+    harness: Harness,
+) -> None:
+    watch = await _seed_watch(harness)
+    run = DeliveryRun(
+        attempts=(
+            DeliveryAttempt(
+                delivery_id=uuid4(),
+                idempotency_key="results:1",
+                recipient_user_id=USER_ID,
+                watch_id=watch.watch_id,
+                outcome=DeliveryAttemptOutcome.RETRIED,
+            ),
+        )
+    )
+    deps = _with_dispatcher(harness, _RecordingDispatcher(run))
+
+    assert await handle_check(_text_update("/check 1"), deps) is not None
+
+
+async def test_check_on_a_watch_deleted_mid_flight_answers_safely(harness: Harness) -> None:
+    await _seed_watch(harness)
+    deps = harness.with_checks(_RaisingChecks(InputError("unknown watch")))
+
+    message = await handle_check(_text_update("/check 1"), deps)
+
+    assert message is not None
+    assert message.text == STALE_ACTION
+
+
+async def test_pause_on_a_watch_deleted_mid_flight_answers_safely(harness: Harness) -> None:
+    watch = await _seed_watch(harness)
+    original = harness.watches.pause
+
+    async def racing_pause(user_id: int, watch_id: UUID) -> Any:
+        await harness.watches.delete(USER_ID, watch.watch_id)
+        return await original(user_id, watch_id)
+
+    harness.watches.pause = racing_pause  # type: ignore[method-assign]
+
+    message = await handle_pause(_text_update("/pause 1"), harness.deps)
+
+    assert message.text == STALE_ACTION
+
+
+async def test_a_page_callback_survives_a_repository_input_error(harness: Harness) -> None:
+    watch = await _seed_watch(harness)
+    snapshot_id = await _seed_snapshot(harness, watch, 3)
+
+    async def failing_lookup(conn: Any, requested: UUID) -> UUID | None:
+        raise InputError(f"snapshot {requested} is malformed")
+
+    harness.results.snapshot_watch_id = failing_lookup  # type: ignore[method-assign]
+
+    message = await handle_callback(
+        _callback_update(encode_callback("page", snapshot_id, 2)), harness.deps
+    )
+
+    assert message is not None
+    assert message.text == RESULTS_GONE
+    assert str(snapshot_id) not in message.text
 
 
 # ---------------------------------------------------------------------------

@@ -67,8 +67,12 @@ HELP_TEXT = (
 )
 
 _NO_WATCHES = "You have no watches yet. Send /new to create one."
-_STALE_ACTION = "That no longer applies — send /watches for the current list."
-_RESULTS_GONE = "Those results are no longer available. Send /check for fresh availability."
+#: The one answer to everything that no longer describes reality: a duplicate tap, a
+#: watch deleted mid-command, a forged callback. It names nothing, so it cannot confirm
+#: that any particular watch ever existed.
+STALE_ACTION = "That no longer applies — send /watches for the current list."
+#: The same idea for a result page: pruned, out of range, and not-yours are one answer.
+RESULTS_GONE = "Those results are no longer available. Send /check for fresh availability."
 _UNKNOWN_TEXT = "I didn't understand that. Send /help to see what I can do."
 _SUPERSEDED = (
     "That watch changed while I was checking it, so I stopped. "
@@ -107,10 +111,14 @@ _OUTCOME_REPLY: dict[CheckOutcome, str] = {
 
 
 class DeliveryOutcome(Protocol):
-    """What one delivery sweep achieved. Read-only so a frozen result satisfies it."""
+    """What one delivery sweep achieved, addressable per delivery.
 
-    @property
-    def sent(self) -> int: ...
+    A bare count of sends is not enough to decide whether a caller's own message went
+    out: the queue is shared, so another user's successful delivery would otherwise be
+    read as this caller's answer.
+    """
+
+    def sent_for(self, *, watch_id: UUID, recipient_user_id: int) -> bool: ...
 
 
 class DeliveryDispatcher(Protocol):
@@ -265,7 +273,7 @@ async def handle_pause(update: Update, deps: CommandDeps) -> RenderedMessage:
     try:
         await deps.watches.pause(user_id, resolved.watch_id)
     except InputError:
-        return _plain(_STALE_ACTION)
+        return _plain(STALE_ACTION)
     return await _watch_list(deps, user_id)
 
 
@@ -281,7 +289,7 @@ async def handle_resume(update: Update, deps: CommandDeps) -> RenderedMessage:
     try:
         await deps.watches.resume(user_id, resolved.watch_id)
     except InputError:
-        return _plain(_STALE_ACTION)
+        return _plain(STALE_ACTION)
     return await _watch_list(deps, user_id)
 
 
@@ -301,8 +309,10 @@ async def handle_check(update: Update, deps: CommandDeps) -> RenderedMessage | N
     a live schedule. A ``PAUSED`` one-off is *not* refused -- that is how a watch
     stopped by a parser change gets another go.
 
-    The reply is suppressed when the flush actually sent something, because that message
-    is the answer; every other case gets a truthful summary rather than silence.
+    The reply is suppressed only when the flush sent *this* watch's message to *this*
+    caller. The queue is shared, so a global "something was sent" test would let another
+    user's delivery swallow this caller's acknowledgement -- and would hide a retried or
+    failed delivery behind a stranger's success.
     """
     user_id = _authorize(update, deps)
     resolved = await _resolve_watch(update, deps, user_id, "/check")
@@ -314,8 +324,13 @@ async def handle_check(update: Update, deps: CommandDeps) -> RenderedMessage | N
         result: CheckResult = await deps.checks.check(resolved.watch_id, CheckTrigger.MANUAL)
     except ConflictError:
         return _plain(_SUPERSEDED)
+    except InputError:
+        # The watch was deleted between listing it and checking it. The caller is
+        # allowed to be here, so they get the same benign note a stale button gets
+        # rather than the silence an authorization failure earns.
+        return _plain(STALE_ACTION)
     run = await deps.deliveries.run_once()
-    if run.sent > 0:
+    if run.sent_for(watch_id=resolved.watch_id, recipient_user_id=user_id):
         return None
     return _plain(_OUTCOME_REPLY.get(result.outcome, _OUTCOME_REPLY[CheckOutcome.SUCCESS]))
 
@@ -344,24 +359,25 @@ async def _handle_watch_action(
     except InputError:
         # A stale keyboard, a second tap, or someone else's watch id: all of them mean
         # "this button no longer describes reality", and none of them may reveal which.
-        return _plain(_STALE_ACTION)
+        return _plain(STALE_ACTION)
     return await _watch_list(deps, user_id)
 
 
 async def _handle_result_page(
     action: ResultPageAction, deps: CommandDeps, user_id: int
 ) -> RenderedMessage:
-    async with deps.database.connection() as conn:
-        watch_id: UUID | None = await deps.results.snapshot_watch_id(conn, action.snapshot_id)
-    if watch_id is None:
-        return _plain(_RESULTS_GONE)
     try:
+        async with deps.database.connection() as conn:
+            watch_id: UUID | None = await deps.results.snapshot_watch_id(conn, action.snapshot_id)
+        if watch_id is None:
+            return _plain(RESULTS_GONE)
         await deps.watches.get_owned(user_id, watch_id)
         async with deps.database.connection() as conn:
             page = await deps.results.snapshot_page(conn, action.snapshot_id, action.page)
     except InputError:
-        # Pruned, out of range, or not the caller's snapshot -- one answer for all three.
-        return _plain(_RESULTS_GONE)
+        # Pruned, unreadable, out of range, or not the caller's snapshot -- one answer
+        # for all of them, so a harvested callback payload cannot tell them apart.
+        return _plain(RESULTS_GONE)
     return render_result_page(page)
 
 
@@ -380,7 +396,7 @@ async def handle_callback(update: Update, deps: CommandDeps) -> RenderedMessage 
     try:
         action = decode_callback(data)
     except InputError:
-        return _plain(_STALE_ACTION)
+        return _plain(STALE_ACTION)
     if isinstance(action, ResultPageAction):
         return await _handle_result_page(action, deps, user_id)
     if action.action == "keep":

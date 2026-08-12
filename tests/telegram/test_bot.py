@@ -14,6 +14,7 @@ delivery in the queue for the lifetime of the process.
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
@@ -22,12 +23,13 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
-from telegram import Chat, Message, Update, User
-from telegram.error import BadRequest, Forbidden, RetryAfter, TimedOut
+from telegram import CallbackQuery, Chat, Message, Update, User
+from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError, TimedOut
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler
 
 from cinema_friend.config import Settings
 from cinema_friend.domain.bfi import Performance
+from cinema_friend.domain.errors import InputError
 from cinema_friend.domain.results import (
     CheckResult,
     DeliveryStatus,
@@ -43,12 +45,14 @@ from cinema_friend.storage.draft_repository import DraftRepository
 from cinema_friend.storage.notification_repository import NotificationRepository
 from cinema_friend.storage.result_repository import ResultRepository
 from cinema_friend.storage.watch_repository import WatchRepository
+from cinema_friend.telegram.auth import DENIAL_TEXT
 from cinema_friend.telegram.bot import (
     RETRY_DELAYS,
     BotDependencies,
     DeliveryWorker,
     build_telegram_application,
 )
+from cinema_friend.telegram.commands import STALE_ACTION
 from cinema_friend.telegram.rendering import MAX_MESSAGE_CHARS
 from tests.fakes import FakeClock
 
@@ -58,10 +62,11 @@ WATCH_ID = UUID("00000000-0000-4000-8000-000000000001")
 
 
 class _Bot:
-    """Records sends; raises whatever is queued in ``errors`` first."""
+    """Records sends and callback answers; raises whatever is queued in ``errors`` first."""
 
     def __init__(self) -> None:
         self.sent: list[dict[str, Any]] = []
+        self.answered: list[str] = []
         self.errors: list[BaseException] = []
         self.delay = 0.0
 
@@ -85,6 +90,10 @@ class _Bot:
             }
         )
         return object()
+
+    async def answer_callback_query(self, callback_query_id: str) -> bool:
+        self.answered.append(callback_query_id)
+        return True
 
 
 class _Checks:
@@ -614,6 +623,178 @@ async def test_run_once_reports_every_outcome(harness: Harness) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Per-delivery isolation
+#
+# One bad row must never decide what happens to the rows behind it. The queue is
+# ordered by due time, so a delivery that raises something the worker has no rule for
+# sits permanently at the head of every later sweep unless it is contained here.
+# ---------------------------------------------------------------------------
+
+
+async def test_an_unknown_telegram_error_is_retried_rather_than_failed(harness: Harness) -> None:
+    watch = await _seed_watch(harness)
+    snapshot_id, _ = await _seed_snapshot(harness, watch.watch_id, 2)
+    delivery_id = await _queue(harness, _results_payload(snapshot_id))
+    harness.bot.errors = [TelegramError("something new in the API")]
+
+    run = await harness.worker.run_once()
+
+    assert run.retried == 1
+    assert run.failed == 0
+    row = await _delivery_row(harness, delivery_id)
+    assert row["status"] == DeliveryStatus.PENDING.value
+    assert row["attempt_count"] == 1
+    assert row["next_attempt_at"].startswith((NOW + RETRY_DELAYS[0]).isoformat()[:16])
+    async with harness.database.connection() as conn:
+        assert await harness.notifications.known_keys(conn, watch.watch_id) == frozenset()
+
+
+async def test_a_poison_telegram_row_does_not_block_the_rows_behind_it(harness: Harness) -> None:
+    watch = await _seed_watch(harness)
+    snapshot_id, _ = await _seed_snapshot(harness, watch.watch_id, 2)
+    poison = await _queue(
+        harness, _results_payload(snapshot_id), key="poison", when=NOW - timedelta(minutes=1)
+    )
+    later = await _queue(harness, _results_payload(snapshot_id), key="later", when=NOW)
+    harness.bot.errors = [TelegramError("boom")]
+
+    run = await harness.worker.run_once()
+
+    assert len(harness.bot.sent) == 1
+    assert run.sent_ids == frozenset({later})
+    assert run.retried_ids == frozenset({poison})
+    assert (await _delivery_row(harness, later))["status"] == DeliveryStatus.SENT.value
+    assert (await _delivery_row(harness, poison))["status"] == DeliveryStatus.PENDING.value
+
+
+async def test_a_mark_delivered_failure_leaves_the_row_pending_and_lets_the_sweep_finish(
+    harness: Harness,
+) -> None:
+    watch = await _seed_watch(harness)
+    snapshot_id, keys = await _seed_snapshot(harness, watch.watch_id, 2)
+    poison = await _queue(
+        harness, _results_payload(snapshot_id), key="poison", when=NOW - timedelta(minutes=1)
+    )
+    later = await _queue(harness, _results_payload(snapshot_id), key="later", when=NOW)
+    original = harness.notifications.mark_delivered
+
+    async def failing_mark(conn: Any, delivery_id: UUID, *args: Any, **kwargs: Any) -> None:
+        if delivery_id == poison:
+            raise sqlite3.OperationalError("database is locked")
+        await original(conn, delivery_id, *args, **kwargs)
+
+    harness.notifications.mark_delivered = failing_mark  # type: ignore[method-assign]
+
+    run = await harness.worker.run_once()
+
+    # The poisoned message reached the user; only the bookkeeping failed, so the row
+    # stays pending and is retried at-least-once rather than being lost.
+    assert len(harness.bot.sent) == 2
+    assert run.attempted == 2
+    assert (await _delivery_row(harness, poison))["status"] == DeliveryStatus.PENDING.value
+    assert (await _delivery_row(harness, later))["status"] == DeliveryStatus.SENT.value
+    async with harness.database.connection() as conn:
+        assert await harness.notifications.known_keys(conn, watch.watch_id) == frozenset(keys)
+
+
+async def test_a_failed_mark_backs_the_row_off_instead_of_hot_looping(harness: Harness) -> None:
+    watch = await _seed_watch(harness)
+    snapshot_id, _ = await _seed_snapshot(harness, watch.watch_id, 1)
+    delivery_id = await _queue(harness, _results_payload(snapshot_id))
+
+    async def failing_mark(*args: Any, **kwargs: Any) -> None:
+        raise sqlite3.OperationalError("database is locked")
+
+    harness.notifications.mark_delivered = failing_mark  # type: ignore[method-assign]
+
+    await harness.worker.run_once()
+
+    row = await _delivery_row(harness, delivery_id)
+    assert row["status"] == DeliveryStatus.PENDING.value
+    assert row["next_attempt_at"].startswith((NOW + RETRY_DELAYS[0]).isoformat()[:16])
+
+
+async def test_a_render_failure_does_not_block_the_rows_behind_it(harness: Harness) -> None:
+    watch = await _seed_watch(harness)
+    snapshot_id, _ = await _seed_snapshot(harness, watch.watch_id, 2)
+    poison = await _queue(
+        harness, _results_payload(snapshot_id), key="poison", when=NOW - timedelta(minutes=1)
+    )
+    later = await _queue(harness, _results_payload(snapshot_id), key="later", when=NOW)
+    original = harness.results.snapshot_page
+    seen: list[UUID] = []
+
+    async def failing_page(conn: Any, *args: Any, **kwargs: Any) -> Any:
+        seen.append(poison)
+        if len(seen) == 1:
+            raise sqlite3.OperationalError("no such table: result_options")
+        return await original(conn, *args, **kwargs)
+
+    harness.results.snapshot_page = failing_page  # type: ignore[method-assign]
+
+    await harness.worker.run_once()
+
+    assert len(harness.bot.sent) == 1
+    assert (await _delivery_row(harness, later))["status"] == DeliveryStatus.SENT.value
+    assert (await _delivery_row(harness, poison))["status"] == DeliveryStatus.PENDING.value
+
+
+async def test_cancellation_is_never_swallowed_by_the_sweep(harness: Harness) -> None:
+    watch = await _seed_watch(harness)
+    snapshot_id, _ = await _seed_snapshot(harness, watch.watch_id, 1)
+    delivery_id = await _queue(harness, _results_payload(snapshot_id))
+    harness.bot.errors = [asyncio.CancelledError()]
+
+    with pytest.raises(asyncio.CancelledError):
+        await harness.worker.run_once()
+
+    assert (await _delivery_row(harness, delivery_id))["status"] == DeliveryStatus.PENDING.value
+
+
+# ---------------------------------------------------------------------------
+# Run identity
+#
+# ``/check`` decides whether to speak from what this run did to *its* delivery, so a
+# run has to say which rows it touched rather than only how many.
+# ---------------------------------------------------------------------------
+
+
+async def test_a_run_names_the_deliveries_it_sent_retried_and_failed(harness: Harness) -> None:
+    watch = await _seed_watch(harness)
+    snapshot_id, _ = await _seed_snapshot(harness, watch.watch_id, 1)
+    retried = await _queue(
+        harness, _results_payload(snapshot_id), key="a", when=NOW - timedelta(minutes=3)
+    )
+    failed = await _queue(
+        harness, _results_payload(snapshot_id), key="b", when=NOW - timedelta(minutes=2)
+    )
+    sent = await _queue(
+        harness, _results_payload(snapshot_id), key="c", when=NOW - timedelta(minutes=1)
+    )
+    harness.bot.errors = [TimedOut(), Forbidden("blocked")]
+
+    run = await harness.worker.run_once()
+
+    assert run.sent_ids == frozenset({sent})
+    assert run.retried_ids == frozenset({retried})
+    assert run.failed_ids == frozenset({failed})
+    assert run.sent_keys == frozenset({"c"})
+
+
+async def test_a_run_only_claims_a_send_for_the_watch_that_got_one(harness: Harness) -> None:
+    mine = await _seed_watch(harness)
+    theirs = await _seed_watch(harness, watch_id=UUID("00000000-0000-4000-8000-000000000002"))
+    snapshot_id, _ = await _seed_snapshot(harness, theirs.watch_id, 1)
+    await _queue(harness, _results_payload(snapshot_id, watch_id=theirs.watch_id))
+
+    run = await harness.worker.run_once()
+
+    assert run.sent_for(watch_id=theirs.watch_id, recipient_user_id=USER_ID) is True
+    assert run.sent_for(watch_id=mine.watch_id, recipient_user_id=USER_ID) is False
+    assert run.sent_for(watch_id=theirs.watch_id, recipient_user_id=USER_ID + 1) is False
+
+
+# ---------------------------------------------------------------------------
 # Application wiring
 # ---------------------------------------------------------------------------
 
@@ -711,6 +892,34 @@ def _command_update(text: str, *, user_id: int) -> Update:
     return Update(update_id=1, message=message)
 
 
+def _callback_update(data: str, *, user_id: int) -> Update:
+    user = User(id=user_id, first_name="Test", is_bot=False)
+    chat = Chat(id=user_id, type="private")
+    message = Message(message_id=1, date=NOW, chat=chat, from_user=user, text="x")
+    query = CallbackQuery(
+        id="1", from_user=user, chat_instance="chat-instance", data=data, message=message
+    )
+    return Update(update_id=1, callback_query=query)
+
+
+def _callback_handler(
+    application: Application[Any, Any, Any, Any, Any, Any], pattern: str
+) -> CallbackQueryHandler[Any, Any]:
+    for handler in _registered(application):
+        if (
+            isinstance(handler, CallbackQueryHandler)
+            and handler.pattern is not None
+            and handler.pattern.pattern == pattern
+        ):
+            return handler
+    raise AssertionError(f"no callback handler for {pattern}")
+
+
+async def _watch_row(harness: Harness, watch_id: UUID) -> object | None:
+    async with harness.database.connection() as conn:
+        return await harness.watch_repository.get(conn, watch_id)
+
+
 async def test_a_routed_command_sends_its_reply_to_the_chat(
     harness: Harness, tmp_path: Path
 ) -> None:
@@ -724,13 +933,93 @@ async def test_a_routed_command_sends_its_reply_to_the_chat(
     assert bot.sent[0]["chat_id"] == USER_ID
 
 
-async def test_a_routed_command_answers_an_unlisted_user_with_silence(
+async def test_a_routed_command_denies_an_unlisted_user_generically(
     harness: Harness, tmp_path: Path
 ) -> None:
+    watch = await _seed_watch(harness)
     application = build_telegram_application(_settings(tmp_path), _dependencies(harness))
     handler = _handler_for(application, "watches")
     bot = _Bot()
 
     await handler.callback(_command_update("/watches", user_id=999), SimpleNamespace(bot=bot))
 
-    assert bot.sent == []
+    assert len(bot.sent) == 1
+    text = bot.sent[0]["text"]
+    assert text == DENIAL_TEXT
+    assert str(watch.watch_id) not in text
+    assert "Dog Stars" not in text
+    assert "/watches" not in text
+
+
+async def test_every_denial_is_the_same_single_response(harness: Harness, tmp_path: Path) -> None:
+    await _seed_watch(harness)
+    application = build_telegram_application(_settings(tmp_path), _dependencies(harness))
+    bot = _Bot()
+    context = SimpleNamespace(bot=bot)
+
+    for command in ("watches", "check", "pause", "resume", "delete", "new", "help"):
+        handler = _handler_for(application, command)
+        await handler.callback(_command_update(f"/{command} 1", user_id=999), context)
+    await _callback_handler(application, "^v1:").callback(
+        _callback_update(f"v1:pause:{WATCH_ID}", user_id=999), context
+    )
+    await _callback_handler(application, "^wizard:").callback(
+        _callback_update("wizard:qty:2", user_id=999), context
+    )
+
+    assert {message["text"] for message in bot.sent} == {DENIAL_TEXT}
+    assert len(bot.sent) == 9
+
+
+async def test_a_routed_callback_denies_before_answering_the_query(
+    harness: Harness, tmp_path: Path
+) -> None:
+    watch = await _seed_watch(harness)
+    application = build_telegram_application(_settings(tmp_path), _dependencies(harness))
+    handler = _callback_handler(application, "^v1:")
+    bot = _Bot()
+
+    await handler.callback(
+        _callback_update(f"v1:delete_confirm:{watch.watch_id}", user_id=999),
+        SimpleNamespace(bot=bot),
+    )
+
+    assert bot.answered == []
+    assert [message["text"] for message in bot.sent] == [DENIAL_TEXT]
+    assert await _watch_row(harness, watch.watch_id) is not None
+
+
+async def test_a_routed_callback_answers_the_query_for_an_allowed_user(
+    harness: Harness, tmp_path: Path
+) -> None:
+    watch = await _seed_watch(harness)
+    application = build_telegram_application(_settings(tmp_path), _dependencies(harness))
+    handler = _callback_handler(application, "^v1:")
+    bot = _Bot()
+
+    await handler.callback(
+        _callback_update(f"v1:pause:{watch.watch_id}", user_id=USER_ID),
+        SimpleNamespace(bot=bot),
+    )
+
+    assert bot.answered == ["1"]
+    assert len(bot.sent) == 1
+
+
+async def test_an_operational_failure_gets_guidance_rather_than_silence(
+    harness: Harness, tmp_path: Path
+) -> None:
+    application = build_telegram_application(_settings(tmp_path), _dependencies(harness))
+    handler = _handler_for(application, "watches")
+    bot = _Bot()
+
+    async def failing_list(user_id: int) -> Any:
+        raise InputError("watch 3 vanished mid-read")
+
+    harness.watches.list_for_owner = failing_list  # type: ignore[method-assign]
+
+    await handler.callback(_command_update("/watches", user_id=USER_ID), SimpleNamespace(bot=bot))
+
+    assert len(bot.sent) == 1
+    assert bot.sent[0]["text"] == STALE_ACTION
+    assert "vanished" not in bot.sent[0]["text"]

@@ -7,6 +7,18 @@ class InputError(ValueError):
     """Raised when caller-supplied input fails validation."""
 
 
+class AuthorizationError(InputError):
+    """Raised when a caller is not permitted to interact with the service at all.
+
+    Narrower than :class:`InputError` on purpose. Both are caller-fault rejections, but
+    only this one means "you may not be here": it is the only error that may be answered
+    with the generic denial and with no detail whatsoever. Everything else an authorized
+    caller can provoke -- a stale button, a deleted watch, a malformed page -- is
+    ordinary bad input and must still receive usable guidance, so a router that cannot
+    tell the two apart either leaks state to strangers or leaves real users in silence.
+    """
+
+
 class BfiNetworkError(OSError):
     """Raised on network-level failures when contacting BFI."""
 

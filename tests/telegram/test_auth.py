@@ -15,7 +15,7 @@ from uuid import uuid4
 import pytest
 from telegram import CallbackQuery, Chat, Message, Update, User
 
-from cinema_friend.domain.errors import InputError
+from cinema_friend.domain.errors import AuthorizationError, InputError
 from cinema_friend.domain.state import WatchMode
 from cinema_friend.domain.watch import WatchCriteria
 from cinema_friend.services.watch_service import WatchService
@@ -108,6 +108,34 @@ def test_authorized_user_id_denial_is_identical_for_missing_and_disallowed_users
 
     assert missing_error is not None
     assert missing_error == disallowed_error
+
+
+def test_an_allow_list_denial_is_distinguishable_from_ordinary_bad_input() -> None:
+    """The router must be able to tell "you may not be here" from "that didn't work".
+
+    Both are input-level rejections, so ``AuthorizationError`` stays an ``InputError``;
+    only the narrower type may produce the generic denial and the resulting silence
+    about everything else.
+    """
+    with pytest.raises(AuthorizationError):
+        authorized_user_id(_update_with_user(99), _ALLOWED)
+    assert issubclass(AuthorizationError, InputError)
+
+
+async def test_an_ownership_denial_is_not_an_allow_list_denial(
+    watch_service: WatchService,
+) -> None:
+    """A watch someone else owns is a stale reference, not an unauthorized caller.
+
+    Treating it as an allow-list denial would answer an allow-listed user with the
+    generic refusal and hide their own list from them.
+    """
+    watch = await watch_service.create(11, _criteria())
+
+    with pytest.raises(InputError) as raised:
+        await require_owned_watch(_update_with_user(22), watch_service, watch.watch_id)
+
+    assert not isinstance(raised.value, AuthorizationError)
 
 
 # ---------------------------------------------------------------------------

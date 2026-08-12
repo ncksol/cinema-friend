@@ -23,12 +23,20 @@ import logging
 from collections.abc import Awaitable, Callable, Coroutine, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from enum import Enum
 from typing import Any, Protocol
 from uuid import UUID
 
 from telegram import InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
-from telegram.error import BadRequest, Forbidden, InvalidToken, NetworkError, RetryAfter
+from telegram.error import (
+    BadRequest,
+    Forbidden,
+    InvalidToken,
+    NetworkError,
+    RetryAfter,
+    TelegramError,
+)
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -41,14 +49,16 @@ from telegram.ext import (
 
 from cinema_friend.clock import Clock
 from cinema_friend.config import Settings
-from cinema_friend.domain.errors import InputError
+from cinema_friend.domain.errors import AuthorizationError, InputError
 from cinema_friend.domain.results import NotificationDelivery, RankVector
 from cinema_friend.services.watch_service import WatchService
 from cinema_friend.storage.database import Database
 from cinema_friend.storage.draft_repository import DraftRepository
 from cinema_friend.storage.notification_repository import NotificationRepository
 from cinema_friend.storage.result_repository import ResultRepository
+from cinema_friend.telegram.auth import DENIAL_TEXT, authorized_user_id
 from cinema_friend.telegram.commands import (
+    STALE_ACTION,
     CommandDeps,
     handle_callback,
     handle_cancel,
@@ -103,14 +113,98 @@ class MessageSender(Protocol):
     ) -> object: ...
 
 
+class DeliveryAttemptOutcome(Enum):
+    """The three things a sweep can do to one row.
+
+    ``SENT`` means the message reached Telegram, which is the fact a waiting caller
+    cares about; whether the bookkeeping that follows it succeeded is recorded
+    separately on :attr:`DeliveryAttempt.recorded`.
+    """
+
+    SENT = "sent"
+    RETRIED = "retried"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True, slots=True)
+class DeliveryAttempt:
+    """What happened to one delivery in one sweep.
+
+    Carries identity, not just a tally: a caller that flushed the queue to get *its own*
+    message out has to be able to ask whether *its* row went, rather than whether
+    anything at all went. Without this a busy queue would let one user's successful
+    delivery silence another user's failed one.
+    """
+
+    delivery_id: UUID
+    idempotency_key: str
+    recipient_user_id: int
+    watch_id: UUID | None
+    outcome: DeliveryAttemptOutcome
+    recorded: bool = True
+
+
 @dataclass(frozen=True, slots=True)
 class DeliveryRun:
-    """What one sweep of the queue achieved."""
+    """What one sweep of the queue achieved, delivery by delivery."""
 
-    attempted: int = 0
-    sent: int = 0
-    retried: int = 0
-    failed: int = 0
+    attempts: tuple[DeliveryAttempt, ...] = ()
+
+    @property
+    def attempted(self) -> int:
+        return len(self.attempts)
+
+    @property
+    def sent(self) -> int:
+        return len(self.sent_ids)
+
+    @property
+    def retried(self) -> int:
+        return len(self.retried_ids)
+
+    @property
+    def failed(self) -> int:
+        return len(self.failed_ids)
+
+    @property
+    def sent_ids(self) -> frozenset[UUID]:
+        return self._ids(DeliveryAttemptOutcome.SENT)
+
+    @property
+    def retried_ids(self) -> frozenset[UUID]:
+        return self._ids(DeliveryAttemptOutcome.RETRIED)
+
+    @property
+    def failed_ids(self) -> frozenset[UUID]:
+        return self._ids(DeliveryAttemptOutcome.FAILED)
+
+    @property
+    def sent_keys(self) -> frozenset[str]:
+        """The idempotency keys that were sent, for callers that know the key not the id."""
+        return frozenset(
+            attempt.idempotency_key
+            for attempt in self.attempts
+            if attempt.outcome is DeliveryAttemptOutcome.SENT
+        )
+
+    def sent_for(self, *, watch_id: UUID, recipient_user_id: int) -> bool:
+        """Whether this run sent a message about *watch_id* to *recipient_user_id*.
+
+        Both halves matter. A host-wide alert carries no watch id and must never be
+        mistaken for a watch's results; another user's delivery must never be mistaken
+        for this caller's.
+        """
+        return any(
+            attempt.outcome is DeliveryAttemptOutcome.SENT
+            and attempt.watch_id == watch_id
+            and attempt.recipient_user_id == recipient_user_id
+            for attempt in self.attempts
+        )
+
+    def _ids(self, outcome: DeliveryAttemptOutcome) -> frozenset[UUID]:
+        return frozenset(
+            attempt.delivery_id for attempt in self.attempts if attempt.outcome is outcome
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,52 +280,102 @@ class DeliveryWorker:
         self._lock = asyncio.Lock()
 
     async def run_once(self) -> DeliveryRun:
-        """Attempt every delivery that is due now and report what happened."""
+        """Attempt every delivery that is due now and report what happened to each.
+
+        Every row is isolated. A delivery that raises something with no rule attached to
+        it -- an unrecognised Telegram error, a database that went away mid-render -- is
+        logged, left retryable, and stepped over, because the queue is ordered by due
+        time: an exception that escaped this loop would abort the sweep at the oldest
+        row and would abort every future sweep at exactly the same place, permanently
+        blocking every message queued behind it.
+
+        ``BaseException`` is deliberately not caught. Cancellation and interpreter exit
+        are not delivery problems and must keep unwinding.
+        """
         async with self._lock:
             now = self._clock.now()
             async with self._database.connection() as conn:
                 due = await self._notifications.due_deliveries(conn, now)
-            attempted = sent = retried = failed = 0
+            attempts: list[DeliveryAttempt] = []
             for delivery in due:
-                attempted += 1
-                renderable = await self._render(delivery)
-                if renderable is None:
-                    _LOGGER.error(
-                        "unknown notification kind %r for delivery %s; failing it",
-                        delivery.payload.kind,
+                try:
+                    attempts.append(await self._attempt(delivery, now))
+                except Exception:
+                    _LOGGER.exception(
+                        "unhandled failure for delivery %s; leaving it retryable",
                         delivery.delivery_id,
                     )
-                    await self._fail(delivery, now)
-                    failed += 1
-                    continue
-                try:
-                    await self._send(delivery, renderable)
-                except (Forbidden, BadRequest, InvalidToken) as error:
-                    _LOGGER.error(
-                        "permanent delivery failure for %s: %s", delivery.delivery_id, error
-                    )
-                    await self._fail(delivery, now)
-                    failed += 1
-                except RetryAfter as error:
-                    await self._retry(delivery, now, floor=_retry_after(error))
-                    retried += 1
-                except NetworkError as error:
-                    _LOGGER.warning(
-                        "transient delivery failure for %s: %s", delivery.delivery_id, error
-                    )
-                    await self._retry(delivery, now)
-                    retried += 1
-                else:
-                    sent += 1
-            return DeliveryRun(attempted=attempted, sent=sent, retried=retried, failed=failed)
+                    await self._back_off(delivery, now)
+                    attempts.append(self._record(delivery, DeliveryAttemptOutcome.RETRIED))
+            return DeliveryRun(attempts=tuple(attempts))
 
-    async def _send(self, delivery: NotificationDelivery, renderable: _Renderable) -> None:
-        """Send the message, then record its consequences in one transaction.
+    async def _attempt(self, delivery: NotificationDelivery, now: datetime) -> DeliveryAttempt:
+        """Render, send, and record one delivery, classifying every failure it knows."""
+        renderable = await self._render(delivery)
+        if renderable is None:
+            _LOGGER.error(
+                "unknown notification kind %r for delivery %s; failing it",
+                delivery.payload.kind,
+                delivery.delivery_id,
+            )
+            await self._fail(delivery, now)
+            return self._record(delivery, DeliveryAttemptOutcome.FAILED)
+        try:
+            await self._send(renderable, delivery)
+        except (Forbidden, BadRequest, InvalidToken) as error:
+            _LOGGER.error("permanent delivery failure for %s: %s", delivery.delivery_id, error)
+            await self._fail(delivery, now)
+            return self._record(delivery, DeliveryAttemptOutcome.FAILED)
+        except RetryAfter as error:
+            await self._retry(delivery, now, floor=_retry_after(error))
+            return self._record(delivery, DeliveryAttemptOutcome.RETRIED)
+        except NetworkError as error:
+            _LOGGER.warning("transient delivery failure for %s: %s", delivery.delivery_id, error)
+            await self._retry(delivery, now)
+            return self._record(delivery, DeliveryAttemptOutcome.RETRIED)
+        except TelegramError as error:
+            # A Telegram failure this code has no rule for. Assume it is transient:
+            # retrying costs a duplicate at worst, while failing it would throw away a
+            # message the user is owed on the strength of an error nobody has read yet.
+            _LOGGER.error(
+                "unclassified Telegram failure for %s (%s); retrying: %s",
+                delivery.delivery_id,
+                type(error).__name__,
+                error,
+            )
+            await self._retry(delivery, now)
+            return self._record(delivery, DeliveryAttemptOutcome.RETRIED)
+        try:
+            await self._mark_sent(delivery, renderable)
+        except Exception:
+            # The message went out; only the bookkeeping failed. The row stays PENDING
+            # so at-least-once delivery repeats it, and it is backed off so a database
+            # that is failing consistently cannot turn the queue into a resend loop.
+            _LOGGER.exception(
+                "delivery %s was sent but could not be recorded; leaving it pending",
+                delivery.delivery_id,
+            )
+            await self._back_off(delivery, now)
+            return self._record(delivery, DeliveryAttemptOutcome.SENT, recorded=False)
+        return self._record(delivery, DeliveryAttemptOutcome.SENT)
 
-        Sending first is deliberate: a crash between the send and the mark leaves the
-        delivery pending and may repeat a message, which is a nuisance. The other order
-        would mark options known for a message nobody received, which is silence.
-        """
+    @staticmethod
+    def _record(
+        delivery: NotificationDelivery,
+        outcome: DeliveryAttemptOutcome,
+        *,
+        recorded: bool = True,
+    ) -> DeliveryAttempt:
+        return DeliveryAttempt(
+            delivery_id=delivery.delivery_id,
+            idempotency_key=delivery.idempotency_key,
+            recipient_user_id=delivery.payload.recipient_user_id,
+            watch_id=delivery.payload.watch_id,
+            outcome=outcome,
+            recorded=recorded,
+        )
+
+    async def _send(self, renderable: _Renderable, delivery: NotificationDelivery) -> None:
         message = renderable.message
         await self._bot.send_message(
             chat_id=delivery.payload.recipient_user_id,
@@ -239,6 +383,16 @@ class DeliveryWorker:
             parse_mode=message.parse_mode,
             reply_markup=message.reply_markup,
         )
+
+    async def _mark_sent(
+        self, delivery: NotificationDelivery, renderable: _Renderable
+    ) -> None:
+        """Record a sent message's consequences in one transaction.
+
+        Sending first is deliberate: a crash between the send and the mark leaves the
+        delivery pending and may repeat a message, which is a nuisance. The other order
+        would mark options known for a message nobody received, which is silence.
+        """
         async with self._database.connection() as conn:
             await self._notifications.mark_delivered(
                 conn,
@@ -246,6 +400,20 @@ class DeliveryWorker:
                 renderable.option_keys,
                 renderable.best_rank,
                 self._clock.now(),
+            )
+
+    async def _back_off(self, delivery: NotificationDelivery, now: datetime) -> None:
+        """Push a row down the retry ladder, tolerating a database that is still broken.
+
+        Used only on paths that have already failed unexpectedly, where the alternative
+        -- leaving ``next_attempt_at`` untouched -- would make the row due again
+        immediately and let the very next sweep repeat whatever just went wrong.
+        """
+        try:
+            await self._retry(delivery, now)
+        except Exception:
+            _LOGGER.exception(
+                "could not back off delivery %s; it stays due", delivery.delivery_id
             )
 
     async def _retry(
@@ -361,34 +529,63 @@ def _route(
 ) -> Callable[[Update, _Context], Coroutine[Any, Any, None]]:
     """Adapt a pure handler into a PTB callback that sends whatever it returns.
 
-    A denial (:class:`InputError` escaping the handler) is logged and answered with
-    nothing at all: any reply, even a refusal, tells an unauthorized caller that this
-    bot exists and is listening.
+    Authorization happens here, first, before any bot call and before the handler is
+    entered. Answering a callback query is itself a request made on the caller's behalf
+    against a resource they named, so doing it ahead of the allow-list check would let
+    an unlisted user provoke a bot action -- and would confirm, by the spinner stopping,
+    that the button was live. An unauthorized caller therefore gets exactly
+    :data:`~cinema_friend.telegram.auth.DENIAL_TEXT` and nothing else: no callback
+    answer, no resource-specific wording, nothing that distinguishes a real watch id
+    from an invented one.
+
+    An :class:`InputError` that is *not* an authorization failure means an allowed user
+    hit something stale or invalid that the handler did not convert into a reply.
+    Silence there would be a bug the user cannot see, so it becomes the same benign
+    guidance a stale button gets, with the underlying message left in the log.
     """
 
     async def callback(update: Update, context: _Context) -> None:
+        try:
+            authorized_user_id(update, deps.allowed_user_ids)
+        except AuthorizationError:
+            _LOGGER.warning("denied update %s", update.update_id)
+            await _reply(update, context, DENIAL_TEXT)
+            return
         if answers_callback and update.callback_query is not None:
             # Stop the client's spinner before doing any work, so a slow handler does
-            # not look like a broken button.
+            # not look like a broken button. Only ever for a caller already allowed in.
             await context.bot.answer_callback_query(update.callback_query.id)
         try:
             message = await handler(update, deps)
+        except AuthorizationError:  # pragma: no cover - the guard above already ran
+            _LOGGER.warning("denied update %s", update.update_id)
+            await _reply(update, context, DENIAL_TEXT)
+            return
         except InputError as error:
-            _LOGGER.warning("rejected update %s: %s", update.update_id, error)
+            _LOGGER.warning("unhandled input error on update %s: %s", update.update_id, error)
+            await _reply(update, context, STALE_ACTION)
             return
         if message is None:
             return
-        chat_id = _chat_id(update)
-        if chat_id is None:  # pragma: no cover - Telegram always supplies one of the two
-            return
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=message.text,
-            parse_mode=message.parse_mode,
-            reply_markup=message.reply_markup,
-        )
+        await _send(update, context, message)
 
     return callback
+
+
+async def _reply(update: Update, context: _Context, text: str) -> None:
+    await _send(update, context, _plain(text))
+
+
+async def _send(update: Update, context: _Context, message: RenderedMessage) -> None:
+    chat_id = _chat_id(update)
+    if chat_id is None:  # pragma: no cover - Telegram always supplies one of the two
+        return
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=message.text,
+        parse_mode=message.parse_mode,
+        reply_markup=message.reply_markup,
+    )
 
 
 def build_telegram_application(
