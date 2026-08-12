@@ -72,29 +72,27 @@ def partition_seat_banks(
     )
 
 
+_MIN_BANKS_FOR_INTERIOR = 3
+
+
 def center_seat_bank(row_seats: Sequence[Seat]) -> tuple[Seat, ...] | None:
-    """Return the unique bank nearest the physical row center, failing closed on ties."""
+    """Return the unique interior bank holding the row's median seat, or None.
+
+    Simple mode promises seats between the aisles, so this fails closed unless the row
+    offers positive evidence of an interior bank: at least three physical banks, and
+    exactly one non-edge bank whose horizontal span contains the median x-coordinate of
+    every physical seat in the row (available or not). A single bank, two banks, a median
+    that lands in an aisle or in an edge bank, and any ambiguity all return ``None``.
+    The median is used rather than a min/max midpoint so a detached side cluster cannot
+    drag the selection onto an outer bank.
+    """
     banks = partition_seat_banks(row_seats)
-    if not banks:
+    if banks is None or len(banks) < _MIN_BANKS_FOR_INTERIOR:
         return None
-    row_center = (
-        min(seat.x for seat in row_seats) + max(seat.x for seat in row_seats)
-    ) / 2
-    distances = [
-        abs(
-            (
-                min(seat.x for seat in bank)
-                + max(seat.x for seat in bank)
-            )
-            / 2
-            - row_center
-        )
-        for bank in banks
-    ]
-    nearest = min(distances)
+    row_median = statistics.median(seat.x for seat in row_seats)
     winners = [
         bank
-        for bank, distance in zip(banks, distances, strict=True)
-        if distance == nearest
+        for bank in banks[1:-1]
+        if min(seat.x for seat in bank) <= row_median <= max(seat.x for seat in bank)
     ]
     return winners[0] if len(winners) == 1 else None

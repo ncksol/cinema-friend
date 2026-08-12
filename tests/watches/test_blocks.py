@@ -354,3 +354,44 @@ def test_simple_strategy_fails_closed_and_logs_for_an_unsupported_row_label(
 
     assert blocks == ()
     assert "unsupported row label" in caplog.text
+
+
+def test_simple_strategy_aggregates_each_diagnostic_once_per_seat_map(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    unresolved_rows = [
+        seat(row, column, x)
+        for row in ("J", "K")
+        for column, x in enumerate([0.0, 10.0, 20.0, 30.0, 70.0, 80.0, 90.0, 100.0], start=1)
+    ]
+    unsupported_rows = [
+        *_three_bank_row("AA"),
+        *_three_bank_row("BB"),
+    ]
+    seat_map = SeatMap(
+        performance_id="p1",
+        seats=tuple(unresolved_rows + unsupported_rows),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        blocks = generate_blocks(
+            seat_map,
+            criteria_for(
+                quantity=1,
+                seat_preference_strategy=SeatPreferenceStrategy.ONLY_BEST,
+            ),
+        )
+
+    assert blocks == ()
+    unsupported_warnings = [
+        record for record in caplog.records if "unsupported row label" in record.getMessage()
+    ]
+    unresolved_warnings = [
+        record
+        for record in caplog.records
+        if "could not identify a unique center bank" in record.getMessage()
+    ]
+    assert len(unsupported_warnings) == 1
+    assert len(unresolved_warnings) == 1
+    assert sorted(unsupported_warnings[0].rows) == ["AA", "BB"]
+    assert sorted(unresolved_warnings[0].rows) == ["J", "K"]

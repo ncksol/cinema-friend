@@ -846,9 +846,14 @@ async def handle_wizard_callback(update: Update, deps: WizardDeps) -> RenderedMe
     """Advance a button-driven wizard step, or confirm/cancel from the review screen.
 
     Returns ``None`` under the same "not this handler's update" conditions as
-    :func:`handle_wizard_text`: no draft, or a button press that does not apply to the
-    draft's current state (e.g. a quantity button pressed twice, once the draft has
-    already moved on).
+    :func:`handle_wizard_text`: no callback data, no draft, or a button press arriving
+    while the draft sits in a state this handler does not drive (e.g. a stale quantity
+    button pressed once the draft has already moved on to a typed prompt such as the
+    date range).
+
+    Stale ``Simple``/``Advanced`` and seat-preference presses are the one exception: they
+    are answered with a recoverable retry prompt telling the user to use the current
+    prompt, because silently ignoring them looks like a dead button.
     """
     user_id = _require_user(update)
     query = update.callback_query

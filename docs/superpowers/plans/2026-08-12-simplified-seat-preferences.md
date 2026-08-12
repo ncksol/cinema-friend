@@ -4,7 +4,7 @@
 
 **Goal:** Add simple `Only the best` and `Best and good` seat presets that hard-filter BFI seat maps while preserving the current manual controls as Advanced.
 
-**Architecture:** Persist one `SeatPreferenceStrategy` on `WatchCriteria`, defaulting missing legacy data to `advanced`. A pure seat-bank helper owns the existing aisle geometry and identifies the unique center bank; block generation applies the selected row cutoff and center-bank filter before the existing ranking path. The Telegram wizard branches after quantity, using a draft flow-version marker to distinguish new drafts from legacy drafts that must continue as Advanced.
+**Architecture:** Persist one `SeatPreferenceStrategy` on `WatchCriteria`, defaulting missing legacy data to `advanced`. A pure seat-bank helper owns the existing aisle geometry and identifies the unique interior (centre) bank; block generation applies the selected row cutoff and center-bank filter before the existing ranking path. The Telegram wizard branches after quantity, using a draft flow-version marker to distinguish new drafts from legacy drafts that must continue as Advanced.
 
 **Tech Stack:** Python 3.12, `python-telegram-bot`, dataclasses and enums, SQLite JSON via `aiosqlite`, pytest, pytest-asyncio, Ruff, mypy.
 
@@ -12,10 +12,12 @@
 
 - Strategy values are exactly `advanced`, `only_best`, and `best_and_good`.
 - Simple presets are hard eligibility rules; seats outside the preset must never be returned as lower-ranked alternatives.
-- `only_best` permits the aisle-bounded center bank in row J and later ASCII row letters, inclusively.
-- `best_and_good` permits the same center bank in row C and later ASCII row letters, inclusively.
-- Center-bank geometry uses all parsed physical seats regardless of current availability.
-- An ambiguous center-bank tie, insufficient aisle geometry, or a non-A-Z row label fails closed for that row and emits a diagnostic.
+- `only_best` permits the aisle-bounded interior bank in row J and later ASCII row letters, inclusively.
+- `best_and_good` permits the same interior bank in row C and later ASCII row letters, inclusively.
+- Interior-bank geometry uses all parsed physical seats regardless of current availability.
+- A row qualifies only when it splits into at least three physical banks and exactly one non-edge bank contains the median x-coordinate of its physical seats.
+- Fewer than three banks, a median falling in an aisle or in an edge bank, ambiguity, insufficient aisle geometry, or a non-A-Z row label fails closed for that row.
+- Each simple-eligibility diagnostic category is logged once per seat map, listing the affected rows.
 - Advanced retains the existing preferred-row, preferred-seat, excluded-row, excluded-seat, and ranking behavior.
 - Simple criteria cannot contain any of the four manual preferred or excluded sets.
 - Existing stored watches and interrupted drafts with no new fields behave as Advanced without user action.
@@ -33,12 +35,12 @@
 | `src/cinema_friend/domain/state.py` | Define the persisted `SeatPreferenceStrategy` enum |
 | `src/cinema_friend/domain/watch.py` | Store the strategy and reject conflicting simple/manual criteria |
 | `src/cinema_friend/storage/watch_repository.py` | Encode the strategy and default missing legacy JSON to Advanced |
-| `src/cinema_friend/watches/seat_banks.py` | Partition physical rows with the shared aisle rule and select a unique center bank |
+| `src/cinema_friend/watches/seat_banks.py` | Partition physical rows with the shared aisle rule and select the unique interior bank |
 | `src/cinema_friend/watches/blocks.py` | Preserve Advanced block generation and hard-filter Simple blocks |
 | `src/cinema_friend/telegram/wizard.py` | Branch the persisted wizard, explain presets, resume legacy drafts, and render review text |
 | `tests/domain/test_watch.py` | Verify strategy defaults and domain invariants |
 | `tests/storage/test_watch_repository.py` | Verify explicit persistence and legacy decoding |
-| `tests/watches/test_seat_banks.py` | Verify aisle, section, center, tie, and insufficient-geometry behavior |
+| `tests/watches/test_seat_banks.py` | Verify aisle, section, interior-bank, single/two-bank, detached-cluster, and insufficient-geometry behavior |
 | `tests/watches/test_blocks.py` | Verify preset row cutoffs and hard filtering without Advanced regressions |
 | `tests/telegram/test_wizard.py` | Verify both wizard branches, callbacks, review text, persistence, and legacy draft recovery |
 | `README.md` | Document Simple, Advanced, and both preset meanings |
@@ -339,7 +341,7 @@ git commit \
 
 **Interfaces:**
 - Produces: `partition_seat_banks(row_seats: Sequence[Seat]) -> tuple[tuple[Seat, ...], ...] | None`
-- Produces: `center_seat_bank(row_seats: Sequence[Seat]) -> tuple[Seat, ...] | None`
+- Produces: `center_seat_bank(row_seats: Sequence[Seat]) -> tuple[Seat, ...] | None` (unique non-edge bank containing the row's median seat x)
 - Consumes: `WatchCriteria.seat_preference_strategy`
 - Preserves: `generate_blocks(seat_map: SeatMap, criteria: WatchCriteria) -> tuple[SeatBlock, ...]`
 
@@ -434,7 +436,7 @@ def test_partition_seat_banks_splits_on_section_boundaries() -> None:
     assert {seat.section for seat in center} == {"Center"}
 
 
-def test_center_seat_bank_rejects_an_exact_two_bank_tie() -> None:
+def test_center_seat_bank_rejects_a_two_bank_row() -> None:
     row = [
         seat(column, x)
         for column, x in enumerate(
@@ -450,6 +452,79 @@ def test_partition_seat_banks_rejects_insufficient_geometry() -> None:
     row = [seat(1, 0.0), seat(2, 10.0), seat(3, 20.0)]
 
     assert partition_seat_banks(row) is None
+    assert center_seat_bank(row) is None
+
+
+def test_center_seat_bank_rejects_a_single_uninterrupted_row() -> None:
+    row = [
+        seat(column, x)
+        for column, x in enumerate(
+            [0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0],
+            start=1,
+        )
+    ]
+
+    banks = partition_seat_banks(row)
+
+    assert banks is not None
+    assert len(banks) == 1
+    assert center_seat_bank(row) is None
+
+
+def test_center_seat_bank_ignores_a_detached_side_cluster() -> None:
+    row = [
+        seat(column, x)
+        for column, x in enumerate(
+            [
+                *[0.0, 10.0, 20.0, 30.0, 40.0, 50.0],
+                *[90.0, 100.0, 110.0, 120.0, 130.0, 140.0],
+                *[180.0, 190.0, 200.0, 210.0, 220.0, 230.0],
+                *[500.0, 510.0, 520.0, 530.0],
+            ],
+            start=1,
+        )
+    ]
+
+    center = center_seat_bank(row)
+
+    assert center is not None
+    assert [seat.column for seat in center] == [7, 8, 9, 10, 11, 12]
+
+
+def test_center_seat_bank_rejects_a_median_that_falls_in_an_aisle() -> None:
+    row = [
+        seat(column, x)
+        for column, x in enumerate(
+            [
+                *[0.0, 10.0, 20.0, 30.0],
+                *[70.0, 80.0, 90.0, 100.0],
+                *[140.0, 150.0, 160.0, 170.0],
+                *[400.0, 410.0, 420.0, 430.0],
+            ],
+            start=1,
+        )
+    ]
+
+    assert center_seat_bank(row) is None
+
+
+def test_center_seat_bank_never_selects_an_edge_bank() -> None:
+    row = [
+        seat(column, x)
+        for column, x in enumerate(
+            [
+                *[0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0],
+                *[130.0, 140.0, 150.0],
+                *[190.0, 200.0, 210.0],
+            ],
+            start=1,
+        )
+    ]
+
+    banks = partition_seat_banks(row)
+
+    assert banks is not None
+    assert len(banks) == 3
     assert center_seat_bank(row) is None
 ```
 
@@ -542,30 +617,28 @@ def partition_seat_banks(
     )
 
 
+_MIN_BANKS_FOR_INTERIOR = 3
+
+
 def center_seat_bank(row_seats: Sequence[Seat]) -> tuple[Seat, ...] | None:
-    """Return the unique bank nearest the physical row center, failing closed on ties."""
+    """Return the unique interior bank holding the row's median seat, or None.
+
+    Simple mode promises seats between the aisles, so this fails closed unless the row
+    offers positive evidence of an interior bank: at least three physical banks, and
+    exactly one non-edge bank whose horizontal span contains the median x-coordinate of
+    every physical seat in the row (available or not). A single bank, two banks, a median
+    that lands in an aisle or in an edge bank, and any ambiguity all return ``None``.
+    The median is used rather than a min/max midpoint so a detached side cluster cannot
+    drag the selection onto an outer bank.
+    """
     banks = partition_seat_banks(row_seats)
-    if not banks:
+    if banks is None or len(banks) < _MIN_BANKS_FOR_INTERIOR:
         return None
-    row_center = (
-        min(seat.x for seat in row_seats) + max(seat.x for seat in row_seats)
-    ) / 2
-    distances = [
-        abs(
-            (
-                min(seat.x for seat in bank)
-                + max(seat.x for seat in bank)
-            )
-            / 2
-            - row_center
-        )
-        for bank in banks
-    ]
-    nearest = min(distances)
+    row_median = statistics.median(seat.x for seat in row_seats)
     winners = [
         bank
-        for bank, distance in zip(banks, distances, strict=True)
-        if distance == nearest
+        for bank in banks[1:-1]
+        if min(seat.x for seat in bank) <= row_median <= max(seat.x for seat in bank)
     ]
     return winners[0] if len(winners) == 1 else None
 ```
@@ -854,35 +927,42 @@ def _generate_simple_blocks(
         seats_by_row[seat.row].append(seat)
 
     blocks: list[SeatBlock] = []
+    unsupported_rows: list[str] = []
+    unresolved_rows: list[str] = []
     for row, row_seats in seats_by_row.items():
         row_allowed = _simple_row_is_allowed(
             row,
             criteria.seat_preference_strategy,
         )
         if row_allowed is None:
-            logger.warning(
-                "simple seat preference excluded unsupported row label",
-                extra={
-                    "performance_id": seat_map.performance_id,
-                    "row": row,
-                    "strategy": criteria.seat_preference_strategy.value,
-                },
-            )
+            unsupported_rows.append(row)
             continue
         if not row_allowed:
             continue
         bank = center_seat_bank(row_seats)
         if bank is None:
-            logger.warning(
-                "simple seat preference could not identify a unique center bank",
-                extra={
-                    "performance_id": seat_map.performance_id,
-                    "row": row,
-                    "strategy": criteria.seat_preference_strategy.value,
-                },
-            )
+            unresolved_rows.append(row)
             continue
         blocks.extend(_generate_bank_blocks(row, bank, criteria))
+
+    if unsupported_rows:
+        logger.warning(
+            "simple seat preference excluded unsupported row labels",
+            extra={
+                "performance_id": seat_map.performance_id,
+                "rows": sorted(unsupported_rows),
+                "strategy": criteria.seat_preference_strategy.value,
+            },
+        )
+    if unresolved_rows:
+        logger.warning(
+            "simple seat preference could not identify a unique center bank",
+            extra={
+                "performance_id": seat_map.performance_id,
+                "rows": sorted(unresolved_rows),
+                "strategy": criteria.seat_preference_strategy.value,
+            },
+        )
     return blocks
 ```
 
@@ -909,7 +989,8 @@ def generate_blocks(
 ```
 
 Update the docstring to state that Advanced keeps explicit exclusions while Simple admits
-only the selected center bank and row range.
+only the selected interior bank and row range, and that each diagnostic category is logged
+once per seat map.
 
 - [ ] **Step 9: Run helper, block, and ranking regression suites**
 

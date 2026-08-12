@@ -95,35 +95,42 @@ def _generate_simple_blocks(
         seats_by_row[seat.row].append(seat)
 
     blocks: list[SeatBlock] = []
+    unsupported_rows: list[str] = []
+    unresolved_rows: list[str] = []
     for row, row_seats in seats_by_row.items():
         row_allowed = _simple_row_is_allowed(
             row,
             criteria.seat_preference_strategy,
         )
         if row_allowed is None:
-            logger.warning(
-                "simple seat preference excluded unsupported row label",
-                extra={
-                    "performance_id": seat_map.performance_id,
-                    "row": row,
-                    "strategy": criteria.seat_preference_strategy.value,
-                },
-            )
+            unsupported_rows.append(row)
             continue
         if not row_allowed:
             continue
         bank = center_seat_bank(row_seats)
         if bank is None:
-            logger.warning(
-                "simple seat preference could not identify a unique center bank",
-                extra={
-                    "performance_id": seat_map.performance_id,
-                    "row": row,
-                    "strategy": criteria.seat_preference_strategy.value,
-                },
-            )
+            unresolved_rows.append(row)
             continue
         blocks.extend(_generate_bank_blocks(row, bank, criteria))
+
+    if unsupported_rows:
+        logger.warning(
+            "simple seat preference excluded unsupported row labels",
+            extra={
+                "performance_id": seat_map.performance_id,
+                "rows": sorted(unsupported_rows),
+                "strategy": criteria.seat_preference_strategy.value,
+            },
+        )
+    if unresolved_rows:
+        logger.warning(
+            "simple seat preference could not identify a unique center bank",
+            extra={
+                "performance_id": seat_map.performance_id,
+                "rows": sorted(unresolved_rows),
+                "strategy": criteria.seat_preference_strategy.value,
+            },
+        )
     return blocks
 
 
@@ -137,9 +144,11 @@ def generate_blocks(seat_map: SeatMap, criteria: WatchCriteria) -> tuple[SeatBlo
     in seat x-coordinates relative to the row's normal gap) and across a section
     boundary. Explicit row exclusions are respected.
 
-    Simple modes (ONLY_BEST, BEST_AND_GOOD): Only seats in the physical center bank
-    of each row, at or behind the preset's minimum row, are candidates. Rows with
-    ambiguous or insufficient geometry produce no blocks and emit a warning.
+    Simple modes (ONLY_BEST, BEST_AND_GOOD): Only seats in the interior seating bank of
+    each row, at or behind the preset's minimum row, are candidates. The interior bank is
+    the single non-edge bank containing the median x-coordinate of the row's physical
+    seats, and only rows split into at least three banks qualify. Rows with ambiguous or
+    insufficient geometry produce no blocks; each diagnostic is logged once per seat map.
     """
     if criteria.seat_preference_strategy is not SeatPreferenceStrategy.ADVANCED:
         return tuple(_generate_simple_blocks(seat_map, criteria))

@@ -74,12 +74,17 @@ For each physical row, using all parsed seats regardless of availability:
 1. Sort its seats by horizontal SVG coordinate.
 2. Reuse the existing aisle-gap calculation and threshold used by adjacency.
 3. Split the row into banks at an aisle or BFI section boundary.
-4. Calculate the row centre from its minimum and maximum horizontal coordinates.
-5. Select the bank whose horizontal centre is closest to the row centre.
+4. Require at least three banks, so the row carries positive evidence of a bank bounded
+   by an aisle on both sides.
+5. Take the median horizontal coordinate of every physical seat in the row.
+6. Select the bank when exactly one non-edge bank's horizontal span contains that median.
 
-An exact tie between banks is ambiguous and selects neither. A row also selects no bank
-when its geometry does not provide enough evidence for the existing aisle-gap calculation.
-These cases fail closed so simple mode cannot return a seat outside its promise.
+Everything else selects no bank: a single bank, two banks, a median that lands in an
+aisle between banks, a median that lands in the first or last bank, more than one
+candidate bank, and a row whose geometry does not provide enough evidence for the
+existing aisle-gap calculation. These cases fail closed so simple mode cannot return a
+seat outside its promise. The median is used instead of a minimum/maximum midpoint
+because a detached side cluster can drag a midpoint far enough to select an outer bank.
 
 Rows must have a single ASCII letter from A through Z, normalized to uppercase.
 `only_best` permits J and later row letters; `best_and_good` permits C and later row
@@ -133,7 +138,9 @@ Invalid or stale seat-choice callbacks produce the existing recoverable input er
 leave the draft on its current step. A valid simple watch with no currently eligible block
 uses the normal no-match result. Ambiguous row geometry or labels exclude only the affected
 row and emit a diagnostic consistent with existing seat-map geometry diagnostics; they do
-not broaden eligibility.
+not broaden eligibility. Each diagnostic category is aggregated into one warning per seat
+map, listing the affected rows, so a recurring check on a large auditorium does not emit a
+warning per row on every poll.
 
 ## Testing
 
@@ -149,6 +156,9 @@ Tests cover:
 - Inclusive C and J boundaries.
 - Exclusion of rows in front of each cutoff.
 - Selection of the aisle-bounded centre bank and rejection of outer banks.
+- Rejection of a single uninterrupted row and of a two-bank row.
+- A detached side cluster leaving the centre-bank selection unchanged.
+- Each simple-eligibility diagnostic being logged once per seat map.
 - Multi-seat blocks remaining within one bank and section.
 - Quantity-one behavior under the same simple eligibility rule.
 - Ambiguous or insufficient geometry failing closed.
