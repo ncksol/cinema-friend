@@ -11,6 +11,16 @@ from cinema_friend.domain.watch import WatchCriteria
 _ON_SALE_BASE_CODES = frozenset({"S", "O", "R"})
 
 
+def is_on_sale(performance: Performance) -> bool:
+    """Return True if *performance*'s sales status means BFI is currently selling it.
+
+    The trailing ``*`` some codes carry is a display marker, not a different status, so
+    the comparison is against :attr:`~Performance.sales_status_base`. Shared with the
+    smoke command so there is exactly one definition of "on sale" to drift.
+    """
+    return performance.sales_status_base in _ON_SALE_BASE_CODES
+
+
 def _matches_date_window(criteria: WatchCriteria, local_date: date) -> bool:
     return criteria.date_from <= local_date <= criteria.date_to
 
@@ -23,7 +33,7 @@ def performance_matches(criteria: WatchCriteria, performance: Performance) -> bo
     base sales-status code, reserved seating, and sufficient availability for
     the requested quantity.
     """
-    if performance.sales_status_base not in _ON_SALE_BASE_CODES:
+    if not is_on_sale(performance):
         return False
     if not performance.reserved_seating:
         return False
