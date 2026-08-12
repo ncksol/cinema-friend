@@ -22,6 +22,8 @@ What it deliberately does not do:
 - It never polls, and is not part of the automated suite.
 - It prints counts and statuses only. The transient ``sToken`` and the fetched documents
   are never printed, because the terminal it runs in is nobody's idea of a secret store.
+  That holds on the failure paths too: a message about a failed request names the
+  document's host and path, never its query.
 
 Exit codes:
 
@@ -63,6 +65,7 @@ from cinema_friend.domain.errors import (
     InputError,
 )
 from cinema_friend.domain.results import CircuitState, HostCircuit
+from cinema_friend.logging_config import strip_url_queries
 from cinema_friend.watches.criteria import is_on_sale
 
 EXIT_OK: Final = 0
@@ -429,7 +432,12 @@ def main(
 
 
 def _fail(code: int, message: str) -> int:
-    print(message, file=sys.stderr)
+    # Redacted on the way out rather than trusted on the way in. The transport writes
+    # its own messages with `describe_url`, so nothing this module raises carries a
+    # query -- but `curl_cffi` quotes the URL it was handed in some of its failures,
+    # and that URL is a pagination URL carrying the transient `sToken`. A terminal, a
+    # scrollback buffer and a launchd log are all places a token outlives its request.
+    print(strip_url_queries(message), file=sys.stderr)
     return code
 
 

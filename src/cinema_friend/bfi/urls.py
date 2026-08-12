@@ -19,6 +19,7 @@ PAGE_PARAM: Final = "BOset::WScontent::SearchResultsInfo::current_page"
 GET_PAGE_PARAM: Final = "BOparam::WScontent::getPage::article_id"
 DO_WORK_PARAM: Final = "doWork::WScontent::getPage"
 MAP_PARAM: Final = "BOparam::WSmap::loadMap::performance_ids"
+UNPARSEABLE_URL: Final = "<unparseable-url>"
 SLUG_RE: Final = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 PERFORMANCE_ID_RE: Final = re.compile(
     r"^[0-9A-Fa-f]{8}-"
@@ -39,6 +40,28 @@ class ArticleRef:
 
 def _literal_query(pairs: Sequence[tuple[str, str]]) -> str:
     return "&".join(f"{name}={quote(value, safe='')}" for name, value in pairs)
+
+
+def describe_url(raw_url: str) -> str:
+    """Name a URL by host and path alone, for a message that may be written down.
+
+    A pagination URL carries BFI's transient ``sToken`` in its query string, and a
+    seat-map URL carries a performance GUID; neither belongs in an exception message,
+    a log line, or a terminal, because all three outlive the request that produced
+    them. Host and path are what an operator actually needs -- *which* document, on
+    *which* route -- and they are constant, so nothing is lost by dropping the rest.
+
+    Credentials, port, query and fragment are all discarded rather than escaped: this
+    is a label, never something to request.
+    """
+    try:
+        split = urlsplit(raw_url)
+        host = split.hostname
+    except ValueError:
+        return UNPARSEABLE_URL
+    if not host:
+        return UNPARSEABLE_URL
+    return f"{host}{split.path}"
 
 
 def _validate_host(raw_url: str) -> SplitResult:

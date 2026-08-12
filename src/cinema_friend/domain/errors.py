@@ -50,3 +50,12 @@ class ConflictError(Exception):
 
 class DeliveryError(Exception):
     """Raised when a Telegram notification cannot be delivered."""
+
+
+class AlreadyRunningError(RuntimeError):
+    """Raised when another process already holds this database's single-instance lock.
+
+    A deployment fault rather than a runtime one: nothing about it improves by waiting,
+    so it is reported at startup, before the process has polled Telegram or asked BFI
+    for anything.
+    """

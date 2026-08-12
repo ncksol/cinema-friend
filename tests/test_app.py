@@ -39,8 +39,9 @@ from cinema_friend.app import (
 )
 from cinema_friend.clock import SystemClock
 from cinema_friend.config import Settings
-from cinema_friend.domain.errors import InputError, PersistenceError
+from cinema_friend.domain.errors import AlreadyRunningError, InputError, PersistenceError
 from cinema_friend.services.watch_service import WatchService
+from cinema_friend.single_instance import lock_path_for
 from cinema_friend.storage.database import Database
 from cinema_friend.storage.draft_repository import DraftRepository
 from cinema_friend.storage.notification_repository import NotificationRepository
@@ -807,3 +808,132 @@ def test_main_rejects_an_unusable_log_level(
     ran: list[Settings] = []
     assert main(["--env-file", str(path)], runner=ran.append) == 2
     assert ran == []
+
+
+# ---------------------------------------------------------------------------
+# Single instance
+# ---------------------------------------------------------------------------
+#
+# Two processes on one database means two long-polls against one bot token, two
+# schedulers doubling the request rate at BFI, and every notification delivered twice.
+# The second one has to lose, and it has to lose before it has polled Telegram or
+# touched BFI -- which means before the schema is even opened.
+
+
+async def test_a_second_app_on_the_same_database_is_refused(
+    settings: Settings, recovered: list[RecoveredConfirmation], database_path: Path
+) -> None:
+    first = make_harness(settings)
+    await first.app.start()
+    second = make_harness(settings)
+    try:
+        with pytest.raises(AlreadyRunningError) as caught:
+            await second.app.start()
+
+        assert str(lock_path_for(database_path)) in str(caught.value)
+    finally:
+        await second.app.stop()
+        await first.app.stop()
+
+
+async def test_a_refused_second_app_never_reaches_telegram_or_bfi(
+    settings: Settings, recovered: list[RecoveredConfirmation]
+) -> None:
+    first = make_harness(settings)
+    await first.app.start()
+    ORDER.clear()
+    second = make_harness(settings)
+    try:
+        with pytest.raises(AlreadyRunningError):
+            await second.app.start()
+
+        assert second.sessions == [], "no BFI session may be built"
+        assert "telegram.build" not in ORDER
+        assert "updater.start_polling" not in ORDER
+        assert "migrate" not in ORDER, "the lock is taken before the schema is touched"
+    finally:
+        await second.app.stop()
+        await first.app.stop()
+
+
+async def test_a_running_app_holds_a_private_lock_beside_its_database(
+    harness: Harness, database_path: Path
+) -> None:
+    await harness.app.start()
+    try:
+        lock = lock_path_for(database_path)
+        assert lock.exists()
+        assert stat.S_IMODE(lock.stat().st_mode) == 0o600
+    finally:
+        await harness.app.stop()
+
+
+async def test_a_second_app_on_a_different_database_may_run(
+    settings: Settings, recovered: list[RecoveredConfirmation], tmp_path: Path
+) -> None:
+    first = make_harness(settings)
+    await first.app.start()
+    elsewhere = Harness(
+        Settings(
+            telegram_bot_token=TOKEN,
+            allowed_user_ids=frozenset({11}),
+            database_path=tmp_path / "other" / "cinema-friend.db",
+        )
+    )
+    try:
+        await elsewhere.app.start()
+    finally:
+        await elsewhere.app.stop()
+        await first.app.stop()
+
+
+async def test_stopping_releases_the_lock(
+    settings: Settings, recovered: list[RecoveredConfirmation]
+) -> None:
+    first = make_harness(settings)
+    await first.app.start()
+    await first.app.stop()
+
+    second = make_harness(settings)
+    await second.app.start()
+    try:
+        assert "updater.start_polling" in second.events
+    finally:
+        await second.app.stop()
+
+
+async def test_a_startup_that_fails_half_way_releases_the_lock(
+    settings: Settings, recovered: list[RecoveredConfirmation]
+) -> None:
+    """A refused restart after a crashed startup would need a human with a shell."""
+    failed = make_harness(settings)
+    failed.telegram.initialize_error = RuntimeError("bad token")
+    with pytest.raises(RuntimeError, match="bad token"):
+        await failed.app.start()
+
+    healthy = make_harness(settings)
+    await healthy.app.start()
+    try:
+        assert "updater.start_polling" in healthy.events
+    finally:
+        await healthy.app.stop()
+
+
+def test_main_reports_a_second_instance_clearly(
+    env_file: Path, isolated_root_logging: None, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The operator gets one sentence naming the cause, not a traceback."""
+    from cinema_friend.__main__ import main
+
+    def explode(_settings: Settings) -> None:
+        raise AlreadyRunningError(
+            "another cinema-friend process is already using this database "
+            "(lock: /tmp/cinema-friend.db.lock)"
+        )
+
+    exit_code = main(["--env-file", str(env_file)], runner=explode)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "already" in (captured.err + captured.out).lower()
+    assert "Traceback" not in captured.err + captured.out

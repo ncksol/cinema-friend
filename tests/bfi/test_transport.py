@@ -14,7 +14,12 @@ from cinema_friend.bfi.transport import (
     DocumentKind,
     FetchedDocument,
 )
-from cinema_friend.bfi.urls import PERMALINK_PARAM, film_page_url, seat_map_url
+from cinema_friend.bfi.urls import (
+    PERMALINK_PARAM,
+    film_page_url,
+    pagination_url,
+    seat_map_url,
+)
 from cinema_friend.config import Settings
 from cinema_friend.domain.errors import BfiChallengeError, BfiNetworkError, CircuitOpenError
 from cinema_friend.domain.results import CircuitState, HostCircuit
@@ -629,3 +634,80 @@ async def test_close_closes_the_underlying_session():
     transport = make_transport(session=session)
     await transport.close()
     assert session.closed is True
+
+
+# ---------------------------------------------------------------------------
+# Loggable failure messages
+# ---------------------------------------------------------------------------
+#
+# Every pagination URL carries BFI's transient `sToken` in its query string, so any
+# exception message that interpolates a whole URL hands that token to whatever prints
+# or logs it. The transport is where those messages are written, so it is where the
+# query has to be dropped: a message identifies the document by kind, host and path,
+# which is everything an operator needs and nothing that must not be written down.
+
+PAGE_TOKEN = "PAGE2-TOKEN-DO-NOT-LEAK"
+PAGE_TWO_URL = pagination_url(PAGE_TOKEN, 2, "2152D1E8-CFF7-419F-BE57-F51C1E490F24")
+ARTICLE_PATH = "whatson.bfi.org.uk/imax/Online/default.asp"
+
+
+def assert_safe(message: str) -> None:
+    assert PAGE_TOKEN not in message, "the transient sToken must not reach a message"
+    assert "sToken" not in message
+    assert "?" not in message and "#" not in message, "no query or fragment may survive"
+    assert ARTICLE_PATH in message, "the document must still be identifiable by host and path"
+
+
+@pytest.mark.parametrize(
+    ("items", "error"),
+    [
+        pytest.param([response(429)], BfiChallengeError, id="challenge"),
+        pytest.param(
+            [response(403)] * 4,
+            BfiChallengeError,
+            id="persistent-unmarked-403",
+        ),
+        pytest.param(
+            [FakeNetworkError("connection reset")] * 3,
+            BfiNetworkError,
+            id="network",
+        ),
+        pytest.param([response(503)] * 3, BfiNetworkError, id="server-error"),
+        pytest.param([response(418)], BfiNetworkError, id="unexpected-status"),
+        pytest.param([response(302)], BfiNetworkError, id="redirect-without-location"),
+        pytest.param(
+            [response(302, headers={"location": FILM_URL}) for _ in range(6)],
+            BfiNetworkError,
+            id="too-many-redirects",
+        ),
+    ],
+)
+async def test_failure_messages_name_the_document_without_its_query(
+    items: list[object], error: type[BaseException]
+):
+    transport = make_transport(session=FakeSession(items))  # type: ignore[arg-type]
+
+    with pytest.raises(error) as caught:
+        await transport.get(PAGE_TWO_URL, DocumentKind.ARTICLE)
+
+    assert_safe(str(caught.value))
+
+
+async def test_a_challenge_message_still_names_the_document_kind():
+    transport = make_transport(session=FakeSession([response(429)]))
+
+    with pytest.raises(BfiChallengeError) as caught:
+        await transport.get(PAGE_TWO_URL, DocumentKind.ARTICLE)
+
+    assert "article" in str(caught.value)
+
+
+async def test_a_network_message_does_not_carry_the_query_of_its_cause():
+    """The underlying client's own message is not repeated, only its identified document."""
+    leaky = FakeNetworkError(f"failed to connect to {PAGE_TWO_URL}")
+    transport = make_transport(session=FakeSession([leaky] * 3))
+
+    with pytest.raises(BfiNetworkError) as caught:
+        await transport.get(PAGE_TWO_URL, DocumentKind.ARTICLE)
+
+    assert_safe(str(caught.value))

@@ -8,12 +8,16 @@ Startup order is not arbitrary:
 
 1. Check the SQLite build first. Snapshot paging needs JSON functions that arrived in
    3.38, and finding that out an hour later, mid-check, is not a diagnosis anyone wants.
-2. Migrate before anything can read or write, so no component ever meets a half-built
+2. Take the single-instance lock before anything else touches the database or reaches
+   outside the process. A second copy of the service on one database double-polls the
+   bot, doubles the request rate at BFI, and delivers every notification twice; the
+   only safe moment to refuse it is before it has done any of those things once.
+3. Migrate before anything can read or write, so no component ever meets a half-built
    schema.
-3. Build exactly one BFI session, shared by the one transport. The transport's spacing,
+4. Build exactly one BFI session, shared by the one transport. The transport's spacing,
    concurrency cap, and circuit breaker are all per-instance, so a second session would
    silently double the request rate against a host that is already rate-limiting us.
-4. Initialize Telegram, then converge stale wizard confirmations, and only then start
+5. Initialize Telegram, then converge stale wizard confirmations, and only then start
    polling. A confirmation left half-written by a crash has to be resolved before the
    user can send another update about it -- and telling the user about it needs a bot
    that is initialized but not yet racing incoming messages.
@@ -21,7 +25,8 @@ Startup order is not arbitrary:
 Shutdown is the same list backwards, with one addition: new work stops first, then
 checks already in flight get a bounded grace period, and only then is anything closed.
 Every close step runs even if an earlier one throws, because a failure to stop polling
-is no reason to leak an HTTP session.
+is no reason to leak an HTTP session -- or to leave the lock held against the next
+start.
 """
 
 from __future__ import annotations
@@ -46,6 +51,7 @@ from cinema_friend.domain.errors import InputError
 from cinema_friend.services.check_service import CheckService
 from cinema_friend.services.scheduler import Scheduler, SchedulerDependencies
 from cinema_friend.services.watch_service import WatchService
+from cinema_friend.single_instance import SingleInstanceLock
 from cinema_friend.storage.circuit_repository import SqliteCircuitStore
 from cinema_friend.storage.database import Database, ensure_supported_sqlite
 from cinema_friend.storage.draft_repository import DraftRepository
@@ -170,6 +176,7 @@ class CinemaFriendApp:
         self._grace = shutdown_grace_seconds
 
         self._running = False
+        self._lock = SingleInstanceLock(settings.database_path)
         self._stop_requested = asyncio.Event()
         self._scheduler_stop = asyncio.Event()
         self._scheduler_task: asyncio.Task[None] | None = None
@@ -193,6 +200,10 @@ class CinemaFriendApp:
         if self._running:
             raise RuntimeError("application is already running")
         ensure_supported_sqlite()
+        # Outside the try: a refused lock is a deployment mistake, not a failed
+        # startup. There is nothing built yet to unwind and nothing about it worth a
+        # traceback, so it propagates as the one sentence it is.
+        self._lock.acquire()
 
         self._stop_requested = asyncio.Event()
         self._scheduler_stop = asyncio.Event()
@@ -377,6 +388,11 @@ class CinemaFriendApp:
             await _closing("close bfi session", self._session.close())
         self._transport = None
         self._session = None
+
+        # Last, and unconditional: the lock is what the next start needs back. Releasing
+        # it only closes the descriptor this process opened, so an instance that was
+        # refused the lock cannot free the holder's by unwinding.
+        self._lock.release()
 
     async def _stop_scheduler(self) -> None:
         task = self._scheduler_task

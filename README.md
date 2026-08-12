@@ -173,6 +173,26 @@ launchctl print "gui/$(id -u)/com.ncksol.cinema-friend"
 Look for `state = running` and a `pid`. A `last exit code` that keeps changing means the
 service is crash-looping; the reason will be in the error log.
 
+### One copy at a time
+
+Only one process may run against a given `DATABASE_PATH`. On startup the service takes an
+exclusive lock on `<DATABASE_PATH>.lock` and holds it until it exits. A second copy stops
+immediately, before it polls Telegram or asks BFI for anything:
+
+```
+another cinema-friend process is already running against this database (pid 4821);
+lock: /Users/you/.local/state/cinema-friend/cinema-friend.db.lock
+```
+
+That is worth enforcing because the failure is otherwise quiet: two processes sharing one
+bot token split incoming commands unpredictably between them, double the request rate at a
+site that is already rate-limiting us, and send you every notification twice.
+
+The lock is held by the kernel, not written down, so it is released however the process
+ends — including a crash or `kill -9`. There is nothing to clean up by hand and no stale
+lock to clear; the empty `.lock` file left behind is expected. If you genuinely want two
+instances, give each its own `DATABASE_PATH`, and a separate bot token.
+
 ### Logs
 
 ```sh
@@ -181,9 +201,11 @@ tail -f ~/Library/Logs/cinema-friend/cinema-friend.err.log
 ```
 
 Logs are JSON, one object per line, and carry watch and check correlation IDs so a single
-check can be followed end to end. The bot token and BFI URL tokens are redacted before
-anything is written. BFI page bodies and seat-map SVGs are never logged or stored — only
-parsed records, statuses and byte counts.
+check can be followed end to end. The bot token is redacted before anything is written, and
+so is every URL query — BFI's paging URLs carry a session token, so a logged URL is cut
+back to its host and path. Failure messages name the document that failed, not its address.
+BFI page bodies and seat-map SVGs are never logged or stored — only parsed records, statuses
+and byte counts. The same holds for the contract check in the terminal.
 
 To read them comfortably, pipe through `jq`:
 
@@ -275,7 +297,8 @@ there is a supported data source to move to — it will not quietly start guessi
 
 Everything the bot knows lives in the SQLite file at `DATABASE_PATH`: your watches, the
 results it has found, and which notifications it has already sent. No credentials are
-stored there.
+stored there. Beside it sits an empty `<DATABASE_PATH>.lock`, which exists only to hold the
+single-instance lock — there is nothing in it to back up.
 
 To back it up, stop the service first so nothing is mid-write:
 
@@ -288,8 +311,8 @@ cp ~/.local/state/cinema-friend/cinema-friend.db ~/backups/cinema-friend-$(date 
 
 Restore by putting the file back with the service stopped.
 
-To remove Cinema Friend completely, uninstall the agent and then delete the database, the
-log directory, and the env file.
+To remove Cinema Friend completely, uninstall the agent and then delete the database, its
+`.lock` file, the log directory, and the env file.
 
 ---
 

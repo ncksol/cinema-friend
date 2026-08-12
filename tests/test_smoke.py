@@ -19,6 +19,7 @@ under test are as much about restraint as about correctness:
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 from typing import Any
 
@@ -422,3 +423,97 @@ def test_closes_the_session_when_the_url_is_rejected() -> None:
 
     assert main(["https://example.com/nope"], session=session, clock=clock()) == EXIT_INPUT
     assert session.closed
+
+
+# ---------------------------------------------------------------------------
+# Token safety on the failure paths
+# ---------------------------------------------------------------------------
+#
+# Success was already proven quiet. Failure is the harder case: every pagination URL
+# carries the transient ``sToken``, and a failure message that interpolates the URL it
+# was fetching puts that token on the terminal, into the launchd log, and into any
+# journal that scrapes it. Page two is where that first becomes possible, so page two is
+# where each failure class is provoked.
+
+
+def paginated_session(*after_page_one: Any) -> FakeSession:
+    """A two-page listing whose second page fails in the supplied way."""
+    return FakeSession(
+        [response(200, article_html([eligible_row()], current_page=1, total_pages=2)),
+         *after_page_one]
+    )
+
+
+def assert_token_free(
+    captured: pytest.CaptureFixture[str], caplog: pytest.LogCaptureFixture
+) -> None:
+    output = captured.readouterr()
+    printed = output.out + output.err
+    logged = "\n".join(record.getMessage() for record in caplog.records) + caplog.text
+    assert TOKEN not in printed, "the transient sToken must never be printed"
+    assert TOKEN not in logged, "the transient sToken must never be logged"
+    assert "sToken" not in printed
+    assert printed.strip(), "a failure must still say something useful"
+
+
+def test_a_page_two_challenge_reports_without_the_pagination_token(
+    capsys: pytest.CaptureFixture[str], caplog: pytest.LogCaptureFixture
+) -> None:
+    session = paginated_session(response(429, "slow down"))
+
+    with caplog.at_level(logging.DEBUG):
+        assert main([FILM_URL], session=session, clock=clock()) == EXIT_CHALLENGE
+
+    assert len(session.calls) == 2, "the failure must happen on the pagination request"
+    assert TOKEN in session.calls[1], "the token really is in the URL that failed"
+    assert_token_free(capsys, caplog)
+
+
+def test_a_page_two_network_failure_reports_without_the_pagination_token(
+    capsys: pytest.CaptureFixture[str], caplog: pytest.LogCaptureFixture
+) -> None:
+    session = paginated_session(*[FakeNetworkError("connection reset")] * 3)
+
+    with caplog.at_level(logging.DEBUG):
+        assert main([FILM_URL], session=session, clock=clock()) == EXIT_NETWORK
+
+    assert TOKEN in session.calls[1]
+    assert_token_free(capsys, caplog)
+
+
+def test_a_client_failure_that_quotes_the_url_is_not_echoed(
+    capsys: pytest.CaptureFixture[str], caplog: pytest.LogCaptureFixture
+) -> None:
+    """curl_cffi writes its own messages, and one of them may quote the whole URL.
+
+    The transport's own messages are token-free by construction, but the smoke command
+    prints exception text it did not write, so it redacts what it prints rather than
+    trusting every library in the stack to have been careful.
+    """
+    leaky = FakeNetworkError(
+        f"Failed to perform, curl: (56) Recv failure on "
+        f"{pagination_url(TOKEN, 2, ARTICLE_ID)}"
+    )
+    session = paginated_session(*[leaky] * 3)
+
+    with caplog.at_level(logging.DEBUG):
+        assert main([FILM_URL], session=session, clock=clock()) == EXIT_NETWORK
+
+    assert_token_free(capsys, caplog)
+
+
+def test_a_contract_failure_reports_without_the_pagination_token(
+    capsys: pytest.CaptureFixture[str], caplog: pytest.LogCaptureFixture
+) -> None:
+    session = FakeSession(
+        [
+            response(200, article_html([eligible_row()], current_page=1, total_pages=2)),
+            response(204, article_html([eligible_row()], current_page=2, total_pages=2)),
+            response(200, seat_map_html()),
+        ]
+    )
+
+    with caplog.at_level(logging.DEBUG):
+        assert main([FILM_URL], session=session, clock=clock()) == EXIT_CONTRACT
+
+    assert_token_free(capsys, caplog)

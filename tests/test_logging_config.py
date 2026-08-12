@@ -186,3 +186,48 @@ def test_configure_logging_rejects_an_unknown_level(stream: io.StringIO) -> None
             if handler not in original:
                 root.removeHandler(handler)
         root.setLevel(original_level)
+
+
+# ---------------------------------------------------------------------------
+# URL queries
+# ---------------------------------------------------------------------------
+
+
+PAGE_TOKEN = "LOGGED-STOKEN-DO-NOT-WRITE"
+PAGE_URL = (
+    "https://whatson.bfi.org.uk/imax/Online/default.asp"
+    f"?sToken={PAGE_TOKEN}&BOset::WScontent::SearchResultsInfo::current_page=2"
+)
+
+
+def test_a_url_in_a_message_keeps_its_path_and_loses_its_query(
+    logger: logging.Logger, stream: io.StringIO
+) -> None:
+    """A BFI URL is only loggable up to its path; the query holds the transient token."""
+    logger.warning("could not fetch %s", PAGE_URL)
+
+    event = str(records(stream)[0]["event"])
+    assert PAGE_TOKEN not in event
+    assert "sToken" not in event
+    assert "whatson.bfi.org.uk/imax/Online/default.asp" in event
+
+
+def test_a_url_inside_a_traceback_loses_its_query(
+    logger: logging.Logger, stream: io.StringIO
+) -> None:
+    try:
+        raise RuntimeError(f"Recv failure on {PAGE_URL}")
+    except RuntimeError:
+        logger.exception("fetch failed")
+
+    error = str(records(stream)[0]["error"])
+    assert PAGE_TOKEN not in error
+    assert "whatson.bfi.org.uk/imax/Online/default.asp" in error
+
+
+def test_a_fragment_is_dropped_with_the_query(logger: logging.Logger, stream: io.StringIO) -> None:
+    logger.info("redirected to https://whatson.bfi.org.uk/imax/Online/x.asp#SECRET-FRAGMENT rest")
+
+    event = str(records(stream)[0]["event"])
+    assert "SECRET-FRAGMENT" not in event
+    assert "rest" in event, "only the URL's own query and fragment are removed"

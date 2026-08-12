@@ -5,12 +5,15 @@ safe to keep if the bot token, a Cloudflare ``sToken``, and the raw pages fetche
 BFI never appear in them. Both goals are met at the same place: one handler that
 formats records as JSON objects, and one filter that scrubs them first.
 
-The filter deliberately does two different jobs, because a secret can arrive by two
+The filter deliberately does three different jobs, because a secret can arrive by three
 different routes. A *structured* value is caught by its key -- anything whose name looks
 like a token, a secret, or a raw body/html/svg payload becomes ``[redacted]``. A
 *literal* value is caught by matching the registered secret strings anywhere in the
 rendered message or its traceback, which covers the case where a token was interpolated
-into a sentence or embedded in an exception raised by a library.
+into a sentence or embedded in an exception raised by a library. A *transient* value --
+BFI's per-session ``sToken``, which is not known in advance and so cannot be registered
+-- is caught positionally: every URL in a rendered message or traceback is cut back to
+its path, because everything after the ``?`` is request state that no log needs.
 """
 
 from __future__ import annotations
@@ -35,6 +38,28 @@ Matching on a substring costs the occasional over-redaction -- a field called
 ``body_bytes`` would be hidden -- which is the right way round for a value that is
 unrecoverable once logged.
 """
+
+URL_QUERY_RE: Final = re.compile(r"([a-zA-Z][a-zA-Z0-9+.\-]*://[^\s\"'<>]*?)[?#][^\s\"'<>]*")
+"""One absolute URL, captured up to the first ``?`` or ``#`` that follows its scheme."""
+
+
+def strip_url_queries(text: str) -> str:
+    """Cut every URL in *text* back to scheme, host and path.
+
+    A BFI pagination URL carries the transient ``sToken`` in its query string, so any
+    sentence quoting a whole URL is a sentence carrying a token. This service writes
+    its own messages with :func:`~cinema_friend.bfi.urls.describe_url` and never
+    interpolates a raw URL, but it is not the only thing that writes: ``curl_cffi``,
+    ``httpx`` and ``python-telegram-bot`` all put the URL they were given into their
+    own exception messages, and those messages reach the log through an ``exc_info``
+    nobody here wrote. Removing the query where the text is rendered covers all of it,
+    including the libraries that have not been written yet.
+
+    Only the URL's own query and fragment are removed; the surrounding sentence is left
+    alone, so the line stays readable and still names the route that failed.
+    """
+    return URL_QUERY_RE.sub(lambda match: match.group(1), text)
+
 
 _RESERVED: Final = frozenset(
     {
@@ -121,6 +146,7 @@ class RedactingFilter(logging.Filter):
         return self._scrub(text)
 
     def _scrub(self, text: str) -> str:
+        text = strip_url_queries(text)
         for secret in self._secrets:
             text = text.replace(secret, REDACTED)
         return text

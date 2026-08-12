@@ -101,3 +101,39 @@ def test_rejects_unsafe_urls(url: str):
 
     with pytest.raises(InputError):
         parse_article_url(url)
+
+
+# ---------------------------------------------------------------------------
+# Loggable identification
+# ---------------------------------------------------------------------------
+
+
+def test_describe_url_names_the_host_and_path_only():
+    from cinema_friend.bfi.urls import describe_url, pagination_url
+
+    url = pagination_url("SECRET-STOKEN-VALUE", 2, "2152D1E8-CFF7-419F-BE57-F51C1E490F24")
+
+    described = describe_url(url)
+
+    assert described == "whatson.bfi.org.uk/imax/Online/default.asp"
+    assert "SECRET-STOKEN-VALUE" not in described
+    assert "?" not in described
+    assert "sToken" not in described
+
+
+def test_describe_url_drops_a_fragment_and_credentials():
+    from cinema_friend.bfi.urls import describe_url
+
+    described = describe_url(
+        "https://user:pw@whatson.bfi.org.uk/imax/Online/mapSelect.asp?a=b#frag"
+    )
+
+    assert described == "whatson.bfi.org.uk/imax/Online/mapSelect.asp"
+    assert "pw" not in described
+    assert "frag" not in described
+
+
+def test_describe_url_survives_an_unparseable_value():
+    from cinema_friend.bfi.urls import describe_url
+
+    assert describe_url("::not a url::?sToken=SECRET") == "<unparseable-url>"

@@ -13,7 +13,7 @@ from urllib.parse import urljoin, urlsplit
 
 from curl_cffi.requests import AsyncSession
 
-from cinema_friend.bfi.urls import validate_redirect_target
+from cinema_friend.bfi.urls import describe_url, validate_redirect_target
 from cinema_friend.clock import Clock
 from cinema_friend.config import Settings
 from cinema_friend.domain.errors import BfiChallengeError, BfiNetworkError, CircuitOpenError
@@ -396,7 +396,10 @@ class BfiTransport:
                 break
             location = _header(response.headers, "location")
             if not location:
-                raise BfiNetworkError(f"redirect from {current_url} is missing a Location header")
+                raise BfiNetworkError(
+                    f"redirect from {describe_url(current_url)} ({kind.value}) "
+                    "is missing a Location header"
+                )
             target = urljoin(current_url, location)
             # validate_redirect_target() is a strict gate (Task 2, article
             # routes only) -- it raises on a disallowed target but its
@@ -407,7 +410,7 @@ class BfiTransport:
             # default.asp targets doesn't collapse onto one repeated URL.
             validate_redirect_target(target)
             current_url = target
-        raise BfiNetworkError(f"too many redirects starting from {url}")
+        raise BfiNetworkError(f"too many redirects starting from {describe_url(url)} ({kind.value})")
 
     # -- single hop with bounded retries -----------------------------------
 
@@ -419,7 +422,9 @@ class BfiTransport:
                 response = await self._throttled_request(url)
             except OSError as exc:
                 if server_attempt >= len(_SERVER_ERROR_DELAYS):
-                    raise BfiNetworkError(f"network error contacting {url} ({kind.value})") from exc
+                    raise BfiNetworkError(
+                        f"network error contacting {describe_url(url)} ({kind.value})"
+                    ) from exc
                 await self._clock.sleep(_SERVER_ERROR_DELAYS[server_attempt] * (1.0 + self._jitter()))
                 server_attempt += 1
                 continue
@@ -428,22 +433,27 @@ class BfiTransport:
             if classification in (_Classification.SUCCESS, _Classification.REDIRECT):
                 return response
             if classification is _Classification.CHALLENGE:
-                raise BfiChallengeError(f"BFI challenged the request to {url} ({kind.value})")
+                raise BfiChallengeError(
+                    f"BFI challenged the request to {describe_url(url)} ({kind.value})"
+                )
             if classification is _Classification.SERVER_ERROR:
                 if server_attempt >= len(_SERVER_ERROR_DELAYS):
                     raise BfiNetworkError(
-                        f"server error {response.status_code} from {url} ({kind.value})"
+                        f"server error {response.status_code} from {describe_url(url)} ({kind.value})"
                     )
                 await self._clock.sleep(_SERVER_ERROR_DELAYS[server_attempt] * (1.0 + self._jitter()))
                 server_attempt += 1
                 continue
             if classification is _Classification.UNMARKED_403:
                 if forbidden_attempt >= len(_FORBIDDEN_DELAYS):
-                    raise BfiChallengeError(f"persistent 403 from {url} ({kind.value})")
+                    raise BfiChallengeError(f"persistent 403 from {describe_url(url)} ({kind.value})")
                 await self._clock.sleep(_FORBIDDEN_DELAYS[forbidden_attempt])
                 forbidden_attempt += 1
                 continue
-            raise BfiNetworkError(f"unexpected status {response.status_code} from {url} ({kind.value})")
+            raise BfiNetworkError(
+                f"unexpected status {response.status_code} from "
+                f"{describe_url(url)} ({kind.value})"
+            )
 
     # -- concurrency + spacing ----------------------------------------------
 

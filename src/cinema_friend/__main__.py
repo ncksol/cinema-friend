@@ -15,7 +15,7 @@ from pathlib import Path
 
 from cinema_friend.app import load_settings, run_app
 from cinema_friend.config import Settings
-from cinema_friend.domain.errors import InputError
+from cinema_friend.domain.errors import AlreadyRunningError, InputError
 from cinema_friend.logging_config import configure_logging
 
 logger = logging.getLogger("cinema_friend.cli")
@@ -60,6 +60,11 @@ def main(
 
     try:
         runner(settings)
+    except AlreadyRunningError as error:
+        # A traceback here would describe the machinery instead of the mistake. The
+        # operator needs one sentence: something else already owns this database.
+        logger.error("%s", error)
+        return 1
     except Exception:
         # Reported through the redacting handler rather than left to the default
         # excepthook: an authentication failure from Telegram or curl carries the token
