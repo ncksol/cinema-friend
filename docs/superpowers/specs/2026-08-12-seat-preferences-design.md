@@ -67,13 +67,16 @@ preferred and excluded row and seat details.
 
 ## Centre-Bank Eligibility
 
-Simple eligibility is evaluated independently for every fetched seat map.
+Simple eligibility is evaluated independently for every fetched seat map. A physical row
+is identified by its BFI section and row label; sections that reuse a label are evaluated
+independently so their coordinates and geometry cannot affect each other.
 
-For each physical row, using all parsed seats regardless of availability:
+For each physical section-row, using all parsed seats regardless of availability:
 
-1. Sort its seats by horizontal SVG coordinate.
-2. Reuse the existing aisle-gap calculation and threshold used by adjacency.
-3. Split the row into banks at an aisle or BFI section boundary.
+1. Sort its seats by displayed seat number.
+2. Reuse the existing horizontal aisle-gap calculation and threshold used by adjacency.
+3. Split the row into banks only at an oversized horizontal gap. A gap in displayed seat
+   numbers is not evidence of an aisle.
 4. Require at least three banks, so the row carries positive evidence of a bank bounded
    by an aisle on both sides.
 5. Take the median horizontal coordinate of every physical seat in the row.
@@ -85,13 +88,17 @@ candidate bank, and a row whose geometry does not provide enough evidence for th
 existing aisle-gap calculation. These cases fail closed so simple mode cannot return a
 seat outside its promise. The median is used instead of a minimum/maximum midpoint
 because a detached side cluster can drag a midpoint far enough to select an outer bank.
+A section-row with weak geometry does not invalidate another section-row that shares its
+row label.
 
 Rows must have a single ASCII letter from A through Z, normalized to uppercase.
 `only_best` permits J and later row letters; `best_and_good` permits C and later row
 letters. Both cutoffs are inclusive. Other row labels are ineligible in simple mode.
 
 A candidate block is eligible only when every seat in the block belongs to the selected
-centre bank and its row meets the preset cutoff. This filtering occurs before ranking.
+centre bank and its row meets the preset cutoff. Displayed seat numbers must still be
+consecutive within a purchasable block, so a numbering gap breaks adjacency after physical
+bank selection without masquerading as an aisle. This filtering occurs before ranking.
 Eligible blocks retain the current view-score and preferred-performance-time ordering.
 
 Advanced criteria bypass the preset filter and continue through the current explicit
@@ -137,10 +144,10 @@ row or seat sets.
 Invalid or stale seat-choice callbacks produce the existing recoverable input error and
 leave the draft on its current step. A valid simple watch with no currently eligible block
 uses the normal no-match result. Ambiguous row geometry or labels exclude only the affected
-row and emit a diagnostic consistent with existing seat-map geometry diagnostics; they do
-not broaden eligibility. Each diagnostic category is aggregated into one warning per seat
-map, listing the affected rows, so a recurring check on a large auditorium does not emit a
-warning per row on every poll.
+section-row and emit a diagnostic consistent with existing seat-map geometry diagnostics;
+they do not broaden eligibility. Each diagnostic category is aggregated into one warning
+per seat map, listing the affected section-rows, so a recurring check on a large auditorium
+does not emit a warning per row on every poll.
 
 ## Testing
 
@@ -156,6 +163,9 @@ Tests cover:
 - Inclusive C and J boundaries.
 - Exclusion of rows in front of each cutoff.
 - Selection of the aisle-bounded centre bank and rejection of outer banks.
+- Numbering gaps not creating physical banks while still breaking purchasable adjacency.
+- Sections that reuse a row label being evaluated independently.
+- A weak section-row not invalidating a well-formed section-row with the same label.
 - Rejection of a single uninterrupted row and of a two-bank row.
 - A detached side cluster leaving the centre-bank selection unchanged.
 - Each simple-eligibility diagnostic being logged once per seat map.

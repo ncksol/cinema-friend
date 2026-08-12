@@ -52,6 +52,17 @@ def test_partition_seat_banks_splits_on_oversized_aisle_gaps() -> None:
     assert [seat.column for seat in center] == [4, 5, 6]
 
 
+def test_numbering_gaps_do_not_create_physical_banks() -> None:
+    columns = [1, 2, 4, 5, 6, 7, 9, 10, 11, 12, 13]
+    row = [seat(column, index * 10.0) for index, column in enumerate(columns)]
+
+    banks = partition_seat_banks(row)
+
+    assert banks is not None
+    assert [[seat.column for seat in bank] for bank in banks] == [columns]
+    assert center_seat_bank(row) is None
+
+
 def test_center_seat_bank_uses_unavailable_seats_to_hold_the_physical_layout() -> None:
     row = [
         seat(

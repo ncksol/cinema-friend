@@ -37,6 +37,7 @@ def _generate_bank_blocks(
     bank: tuple[Seat, ...],
     criteria: WatchCriteria,
 ) -> list[SeatBlock]:
+    """Generate purchasable windows inside one physical bank."""
     blocks: list[SeatBlock] = []
     run: list[Seat] = []
     for seat in bank:
@@ -44,7 +45,11 @@ def _generate_bank_blocks(
             _emit_windows(blocks, row, run, criteria.quantity)
             run = []
             continue
-        run.append(seat)
+        if run and seat.column != run[-1].column + 1:
+            _emit_windows(blocks, row, run, criteria.quantity)
+            run = [seat]
+        else:
+            run.append(seat)
     _emit_windows(blocks, row, run, criteria.quantity)
     return blocks
 
@@ -90,26 +95,30 @@ def _generate_simple_blocks(
     seat_map: SeatMap,
     criteria: WatchCriteria,
 ) -> list[SeatBlock]:
-    seats_by_row: dict[str, list[Seat]] = defaultdict(list)
+    seats_by_section_row: dict[tuple[str, str], list[Seat]] = defaultdict(list)
     for seat in seat_map.seats:
-        seats_by_row[seat.row].append(seat)
+        seats_by_section_row[(seat.section, seat.row)].append(seat)
 
     blocks: list[SeatBlock] = []
     unsupported_rows: list[str] = []
+    unsupported_section_rows: list[str] = []
     unresolved_rows: list[str] = []
-    for row, row_seats in seats_by_row.items():
+    unresolved_section_rows: list[str] = []
+    for (section, row), row_seats in seats_by_section_row.items():
         row_allowed = _simple_row_is_allowed(
             row,
             criteria.seat_preference_strategy,
         )
         if row_allowed is None:
             unsupported_rows.append(row)
+            unsupported_section_rows.append(f"{section}/{row}")
             continue
         if not row_allowed:
             continue
         bank = center_seat_bank(row_seats)
         if bank is None:
             unresolved_rows.append(row)
+            unresolved_section_rows.append(f"{section}/{row}")
             continue
         blocks.extend(_generate_bank_blocks(row, bank, criteria))
 
@@ -118,7 +127,8 @@ def _generate_simple_blocks(
             "simple seat preference excluded unsupported row labels",
             extra={
                 "performance_id": seat_map.performance_id,
-                "rows": sorted(unsupported_rows),
+                "rows": sorted(set(unsupported_rows)),
+                "section_rows": sorted(unsupported_section_rows),
                 "strategy": criteria.seat_preference_strategy.value,
             },
         )
@@ -127,7 +137,8 @@ def _generate_simple_blocks(
             "simple seat preference could not identify a unique center bank",
             extra={
                 "performance_id": seat_map.performance_id,
-                "rows": sorted(unresolved_rows),
+                "rows": sorted(set(unresolved_rows)),
+                "section_rows": sorted(unresolved_section_rows),
                 "strategy": criteria.seat_preference_strategy.value,
             },
         )
@@ -144,11 +155,13 @@ def generate_blocks(seat_map: SeatMap, criteria: WatchCriteria) -> tuple[SeatBlo
     in seat x-coordinates relative to the row's normal gap) and across a section
     boundary. Explicit row exclusions are respected.
 
-    Simple modes (ONLY_BEST, BEST_AND_GOOD): Only seats in the interior seating bank of
-    each row, at or behind the preset's minimum row, are candidates. The interior bank is
-    the single non-edge bank containing the median x-coordinate of the row's physical
-    seats, and only rows split into at least three banks qualify. Rows with ambiguous or
-    insufficient geometry produce no blocks; each diagnostic is logged once per seat map.
+    Simple modes (ONLY_BEST, BEST_AND_GOOD): Each section-row is evaluated independently.
+    Only seats in its interior seating bank, at or behind the preset's minimum row, are
+    candidates. The interior bank is the single non-edge bank containing the median
+    x-coordinate of the section-row's physical seats, and only section-rows split into at
+    least three banks qualify. Numbering gaps do not create physical banks but still break
+    purchasable runs. Ambiguous or insufficient geometry produces no blocks for that
+    section-row; each diagnostic category is logged once per seat map.
     """
     if criteria.seat_preference_strategy is not SeatPreferenceStrategy.ADVANCED:
         return tuple(_generate_simple_blocks(seat_map, criteria))

@@ -196,6 +196,28 @@ def test_quantity_larger_than_run_yields_no_blocks() -> None:
     assert blocks == ()
 
 
+def test_numbering_gap_breaks_advanced_purchasable_run_without_creating_an_aisle() -> None:
+    columns = [1, 2, 4, 5, 6, 7, 9, 10, 11, 12, 13]
+    seats = [
+        seat("J", column, index * 10.0)
+        for index, column in enumerate(columns)
+    ]
+    seat_map = SeatMap(performance_id="p1", seats=tuple(seats))
+
+    blocks = generate_blocks(seat_map, criteria_for(quantity=2))
+
+    assert {tuple(seat.column for seat in block.seats) for block in blocks} == {
+        (1, 2),
+        (4, 5),
+        (5, 6),
+        (6, 7),
+        (9, 10),
+        (10, 11),
+        (11, 12),
+        (12, 13),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Fix round 1: section identity gates adjacency, independent of row/geometry
 # ---------------------------------------------------------------------------
@@ -231,9 +253,14 @@ def test_different_sections_same_row_never_form_a_cross_section_block() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _three_bank_row(row: str) -> list[Seat]:
+def _three_bank_row(
+    row: str,
+    *,
+    section: str = "BFI IMAX",
+    x_offset: float = 0.0,
+) -> list[Seat]:
     return [
-        seat(row, column, x)
+        seat(row, column, x + x_offset, section=section)
         for column, x in enumerate(
             [0.0, 10.0, 20.0, 70.0, 80.0, 90.0, 140.0, 150.0, 160.0],
             start=1,
@@ -286,6 +313,59 @@ def test_simple_quantity_one_still_requires_the_center_bank() -> None:
     )
 
     assert {block.seats[0].label for block in blocks} == {"J4", "J5", "J6"}
+
+
+def test_simple_strategy_evaluates_overlapping_sections_independently() -> None:
+    seats = [
+        *_three_bank_row("J", section="Stalls"),
+        *_three_bank_row("J", section="Balcony", x_offset=10.0),
+    ]
+    seat_map = SeatMap(performance_id="p1", seats=tuple(seats))
+
+    blocks = generate_blocks(
+        seat_map,
+        criteria_for(
+            quantity=2,
+            seat_preference_strategy=SeatPreferenceStrategy.ONLY_BEST,
+        ),
+    )
+
+    assert {
+        (block.seats[0].section, tuple(seat.column for seat in block.seats))
+        for block in blocks
+    } == {
+        ("Stalls", (4, 5)),
+        ("Stalls", (5, 6)),
+        ("Balcony", (4, 5)),
+        ("Balcony", (5, 6)),
+    }
+
+
+def test_weak_section_does_not_void_a_well_formed_section() -> None:
+    seats = [
+        *_three_bank_row("J", section="Main"),
+        *[
+            seat("J", column, 300.0 + column * 10.0, section="Side")
+            for column in range(1, 4)
+        ],
+    ]
+    seat_map = SeatMap(performance_id="p1", seats=tuple(seats))
+
+    blocks = generate_blocks(
+        seat_map,
+        criteria_for(
+            quantity=2,
+            seat_preference_strategy=SeatPreferenceStrategy.ONLY_BEST,
+        ),
+    )
+
+    assert {
+        (block.seats[0].section, tuple(seat.column for seat in block.seats))
+        for block in blocks
+    } == {
+        ("Main", (4, 5)),
+        ("Main", (5, 6)),
+    }
 
 
 def test_simple_strategy_fails_closed_and_logs_when_center_geometry_is_ambiguous(
@@ -395,3 +475,11 @@ def test_simple_strategy_aggregates_each_diagnostic_once_per_seat_map(
     assert len(unresolved_warnings) == 1
     assert sorted(unsupported_warnings[0].rows) == ["AA", "BB"]
     assert sorted(unresolved_warnings[0].rows) == ["J", "K"]
+    assert sorted(unsupported_warnings[0].section_rows) == [
+        "BFI IMAX/AA",
+        "BFI IMAX/BB",
+    ]
+    assert sorted(unresolved_warnings[0].section_rows) == [
+        "BFI IMAX/J",
+        "BFI IMAX/K",
+    ]

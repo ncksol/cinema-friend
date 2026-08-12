@@ -34,7 +34,11 @@ def _normal_gap(section_seats: Sequence[Seat]) -> float | None:
 def partition_seat_banks(
     row_seats: Sequence[Seat],
 ) -> tuple[tuple[Seat, ...], ...] | None:
-    """Return aisle- and section-bounded physical banks, or None if geometry is weak."""
+    """Return aisle- and section-bounded physical banks, or None if geometry is weak.
+
+    Displayed-number gaps are not physical aisle evidence; block generation applies that
+    separate adjacency rule after selecting a bank.
+    """
     if not row_seats:
         return None
     seats_by_section: dict[str, list[Seat]] = defaultdict(list)
@@ -50,10 +54,7 @@ def partition_seat_banks(
         threshold = _AISLE_THRESHOLD_MULTIPLIER * normal_gap
         current = [ordered[0]]
         for left, right in pairwise(ordered):
-            if (
-                right.column != left.column + 1
-                or abs(right.x - left.x) > threshold
-            ):
+            if abs(right.x - left.x) > threshold:
                 banks.append(tuple(current))
                 current = [right]
             else:

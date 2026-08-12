@@ -4,7 +4,7 @@
 
 **Goal:** Add simple `Only the best` and `Best and good` seat presets that hard-filter BFI seat maps while preserving the current manual controls as Advanced.
 
-**Architecture:** Persist one `SeatPreferenceStrategy` on `WatchCriteria`, defaulting missing legacy data to `advanced`. A pure seat-bank helper owns the existing aisle geometry and identifies the unique interior (centre) bank; block generation applies the selected row cutoff and center-bank filter before the existing ranking path. The Telegram wizard branches after quantity, using a draft flow-version marker to distinguish new drafts from legacy drafts that must continue as Advanced.
+**Architecture:** Persist one `SeatPreferenceStrategy` on `WatchCriteria`, defaulting missing legacy data to `advanced`. A pure seat-bank helper identifies physical banks from horizontal aisle geometry within each section-row; block generation separately enforces displayed-number adjacency and applies the selected row cutoff before the existing ranking path. The Telegram wizard branches after quantity, using a draft flow-version marker to distinguish new drafts from legacy drafts that must continue as Advanced.
 
 **Tech Stack:** Python 3.12, `python-telegram-bot`, dataclasses and enums, SQLite JSON via `aiosqlite`, pytest, pytest-asyncio, Ruff, mypy.
 
@@ -15,9 +15,12 @@
 - `only_best` permits the aisle-bounded interior bank in row J and later ASCII row letters, inclusively.
 - `best_and_good` permits the same interior bank in row C and later ASCII row letters, inclusively.
 - Interior-bank geometry uses all parsed physical seats regardless of current availability.
-- A row qualifies only when it splits into at least three physical banks and exactly one non-edge bank contains the median x-coordinate of its physical seats.
-- Fewer than three banks, a median falling in an aisle or in an edge bank, ambiguity, insufficient aisle geometry, or a non-A-Z row label fails closed for that row.
-- Each simple-eligibility diagnostic category is logged once per seat map, listing the affected rows.
+- Simple eligibility evaluates each `(section, row)` independently.
+- Only oversized horizontal gaps create physical bank boundaries; displayed-number gaps do not count as aisles.
+- Displayed-number gaps still break purchasable adjacency after a physical bank is selected.
+- A section-row qualifies only when it splits into at least three physical banks and exactly one non-edge bank contains the median x-coordinate of its physical seats.
+- Fewer than three banks, a median falling in an aisle or in an edge bank, ambiguity, insufficient aisle geometry, or a non-A-Z row label fails closed for that section-row.
+- Each simple-eligibility diagnostic category is logged once per seat map, listing the affected section-rows.
 - Advanced retains the existing preferred-row, preferred-seat, excluded-row, excluded-seat, and ranking behavior.
 - Simple criteria cannot contain any of the four manual preferred or excluded sets.
 - Existing stored watches and interrupted drafts with no new fields behave as Advanced without user action.
@@ -35,8 +38,8 @@
 | `src/cinema_friend/domain/state.py` | Define the persisted `SeatPreferenceStrategy` enum |
 | `src/cinema_friend/domain/watch.py` | Store the strategy and reject conflicting simple/manual criteria |
 | `src/cinema_friend/storage/watch_repository.py` | Encode the strategy and default missing legacy JSON to Advanced |
-| `src/cinema_friend/watches/seat_banks.py` | Partition physical rows with the shared aisle rule and select the unique interior bank |
-| `src/cinema_friend/watches/blocks.py` | Preserve Advanced block generation and hard-filter Simple blocks |
+| `src/cinema_friend/watches/seat_banks.py` | Partition section-rows by physical aisle geometry and select the unique interior bank |
+| `src/cinema_friend/watches/blocks.py` | Enforce numbered adjacency, preserve Advanced behavior, and hard-filter Simple blocks per section-row |
 | `src/cinema_friend/telegram/wizard.py` | Branch the persisted wizard, explain presets, resume legacy drafts, and render review text |
 | `tests/domain/test_watch.py` | Verify strategy defaults and domain invariants |
 | `tests/storage/test_watch_repository.py` | Verify explicit persistence and legacy decoding |
@@ -404,6 +407,17 @@ def test_partition_seat_banks_splits_on_oversized_aisle_gaps() -> None:
     assert [seat.column for seat in center] == [4, 5, 6]
 
 
+def test_numbering_gaps_do_not_create_physical_banks() -> None:
+    columns = [1, 2, 4, 5, 6, 7, 9, 10, 11, 12, 13]
+    row = [seat(column, index * 10.0) for index, column in enumerate(columns)]
+
+    banks = partition_seat_banks(row)
+
+    assert banks is not None
+    assert [[seat.column for seat in bank] for bank in banks] == [columns]
+    assert center_seat_bank(row) is None
+
+
 def test_center_seat_bank_uses_unavailable_seats_to_hold_the_physical_layout() -> None:
     row = [
         seat(
@@ -595,10 +609,7 @@ def partition_seat_banks(
         threshold = _AISLE_THRESHOLD_MULTIPLIER * normal_gap
         current = [ordered[0]]
         for left, right in pairwise(ordered):
-            if (
-                right.column != left.column + 1
-                or abs(right.x - left.x) > threshold
-            ):
+            if abs(right.x - left.x) > threshold:
                 banks.append(tuple(current))
                 current = [right]
             else:
@@ -691,9 +702,14 @@ def criteria_for(
 Add these helpers and tests:
 
 ```python
-def _three_bank_row(row: str) -> list[Seat]:
+def _three_bank_row(
+    row: str,
+    *,
+    section: str = "BFI IMAX",
+    x_offset: float = 0.0,
+) -> list[Seat]:
     return [
-        seat(row, column, x)
+        seat(row, column, x + x_offset, section=section)
         for column, x in enumerate(
             [0.0, 10.0, 20.0, 70.0, 80.0, 90.0, 140.0, 150.0, 160.0],
             start=1,
@@ -746,6 +762,81 @@ def test_simple_quantity_one_still_requires_the_center_bank() -> None:
     )
 
     assert {block.seats[0].label for block in blocks} == {"J4", "J5", "J6"}
+
+
+def test_simple_strategy_evaluates_overlapping_sections_independently() -> None:
+    seats = [
+        *_three_bank_row("J", section="Stalls"),
+        *_three_bank_row("J", section="Balcony", x_offset=10.0),
+    ]
+    seat_map = SeatMap(performance_id="p1", seats=tuple(seats))
+
+    blocks = generate_blocks(
+        seat_map,
+        criteria_for(
+            quantity=2,
+            seat_preference_strategy=SeatPreferenceStrategy.ONLY_BEST,
+        ),
+    )
+
+    assert {
+        (block.seats[0].section, tuple(seat.column for seat in block.seats))
+        for block in blocks
+    } == {
+        ("Stalls", (4, 5)),
+        ("Stalls", (5, 6)),
+        ("Balcony", (4, 5)),
+        ("Balcony", (5, 6)),
+    }
+
+
+def test_weak_section_does_not_void_a_well_formed_section() -> None:
+    seats = [
+        *_three_bank_row("J", section="Main"),
+        *[
+            seat("J", column, 300.0 + column * 10.0, section="Side")
+            for column in range(1, 4)
+        ],
+    ]
+    seat_map = SeatMap(performance_id="p1", seats=tuple(seats))
+
+    blocks = generate_blocks(
+        seat_map,
+        criteria_for(
+            quantity=2,
+            seat_preference_strategy=SeatPreferenceStrategy.ONLY_BEST,
+        ),
+    )
+
+    assert {
+        (block.seats[0].section, tuple(seat.column for seat in block.seats))
+        for block in blocks
+    } == {
+        ("Main", (4, 5)),
+        ("Main", (5, 6)),
+    }
+
+
+def test_numbering_gap_breaks_advanced_purchasable_run_without_creating_an_aisle() -> None:
+    columns = [1, 2, 4, 5, 6, 7, 9, 10, 11, 12, 13]
+    seats = [
+        seat("J", column, index * 10.0)
+        for index, column in enumerate(columns)
+    ]
+    seat_map = SeatMap(performance_id="p1", seats=tuple(seats))
+
+    blocks = generate_blocks(seat_map, criteria_for(quantity=2))
+
+    assert {tuple(seat.column for seat in block.seats) for block in blocks} == {
+        (1, 2),
+        (4, 5),
+        (5, 6),
+        (6, 7),
+        (9, 10),
+        (10, 11),
+        (11, 12),
+        (12, 13),
+    }
 
 
 def test_simple_strategy_fails_closed_and_logs_when_center_geometry_is_ambiguous(
@@ -867,7 +958,11 @@ def _generate_bank_blocks(
             _emit_windows(blocks, row, run, criteria.quantity)
             run = []
             continue
-        run.append(seat)
+        if run and seat.column != run[-1].column + 1:
+            _emit_windows(blocks, row, run, criteria.quantity)
+            run = [seat]
+        else:
+            run.append(seat)
     _emit_windows(blocks, row, run, criteria.quantity)
     return blocks
 
@@ -922,26 +1017,30 @@ def _generate_simple_blocks(
     seat_map: SeatMap,
     criteria: WatchCriteria,
 ) -> list[SeatBlock]:
-    seats_by_row: dict[str, list[Seat]] = defaultdict(list)
+    seats_by_section_row: dict[tuple[str, str], list[Seat]] = defaultdict(list)
     for seat in seat_map.seats:
-        seats_by_row[seat.row].append(seat)
+        seats_by_section_row[(seat.section, seat.row)].append(seat)
 
     blocks: list[SeatBlock] = []
     unsupported_rows: list[str] = []
+    unsupported_section_rows: list[str] = []
     unresolved_rows: list[str] = []
-    for row, row_seats in seats_by_row.items():
+    unresolved_section_rows: list[str] = []
+    for (section, row), row_seats in seats_by_section_row.items():
         row_allowed = _simple_row_is_allowed(
             row,
             criteria.seat_preference_strategy,
         )
         if row_allowed is None:
             unsupported_rows.append(row)
+            unsupported_section_rows.append(f"{section}/{row}")
             continue
         if not row_allowed:
             continue
         bank = center_seat_bank(row_seats)
         if bank is None:
             unresolved_rows.append(row)
+            unresolved_section_rows.append(f"{section}/{row}")
             continue
         blocks.extend(_generate_bank_blocks(row, bank, criteria))
 
@@ -950,7 +1049,8 @@ def _generate_simple_blocks(
             "simple seat preference excluded unsupported row labels",
             extra={
                 "performance_id": seat_map.performance_id,
-                "rows": sorted(unsupported_rows),
+                "rows": sorted(set(unsupported_rows)),
+                "section_rows": sorted(unsupported_section_rows),
                 "strategy": criteria.seat_preference_strategy.value,
             },
         )
@@ -959,7 +1059,8 @@ def _generate_simple_blocks(
             "simple seat preference could not identify a unique center bank",
             extra={
                 "performance_id": seat_map.performance_id,
-                "rows": sorted(unresolved_rows),
+                "rows": sorted(set(unresolved_rows)),
+                "section_rows": sorted(unresolved_section_rows),
                 "strategy": criteria.seat_preference_strategy.value,
             },
         )
