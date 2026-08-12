@@ -1,4 +1,4 @@
-# Cinema Ticket Finder Implementation Plan
+# Cinema ticket finder implementation plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python 3.12+, `python-telegram-bot`, `curl_cffi`, `lxml`, `aiosqlite`, SQLite, pytest, pytest-asyncio, Ruff, mypy, macOS `launchd`.
 
-## Global Constraints
+## Global constraints
 
 - Require Python 3.12 or later; invoke it as `python3.12` on the target Mac.
 - Use one shared `curl_cffi.requests.AsyncSession` with `BFI_IMPERSONATE_PROFILE`, default `chrome`, for every BFI request.
@@ -28,7 +28,7 @@
 
 ---
 
-## Planned File Layout
+## Planned file layout
 
 | Path | Responsibility |
 |---|---|
@@ -1095,7 +1095,7 @@ Test watch round-trip, owner filtering, due filtering, paused exclusion, update 
 
 - [ ] **Step 5: Implement JSON codecs and repositories**
 
-Store enum values as strings and datetimes as UTC ISO 8601 ending in `+00:00`. Sort sets before JSON encoding so fingerprints and round trips are deterministic. Repository methods accept an existing connection so callers can compose atomic transactions. `list_active_owner_ids()` returns distinct owners of active/backoff watches for one host, enabling one host alert per user rather than per watch.
+Store enum values as strings and datetimes as UTC ISO 8601 ending in `+00:00`. Sort sets before JSON encoding so fingerprints and round trips are deterministic. Repository methods accept an existing connection so callers can compose atomic transactions. `list_active_owner_ids()` returns distinct owners of active/backoff watches for one host, so the service can send one host alert per user rather than per watch.
 
 - [ ] **Step 6: Run focused verification**
 
@@ -1294,7 +1294,7 @@ Test:
 - Every surviving map contributes all blocks.
 - No-match writes an empty valid snapshot.
 - One-off success becomes `completed`.
-- Recurring creation check sets next run to completion + interval + 0–10% positive jitter.
+- Recurring creation check sets next run to completion + interval + 0-10% positive jitter.
 - Manual `/check` preserves an existing recurring `next_run_at`.
 
 - [ ] **Step 3: Add typed failure cases**
@@ -1430,7 +1430,7 @@ Test:
 - Rows `L,M`.
 - Seats/ranges `L16-L22,M17`.
 - Skip values.
-- Quantity buttons 1–8.
+- Quantity buttons 1-8.
 - Interval minutes rejecting values below 15.
 - Preferred date/time required to satisfy both predicates.
 
@@ -1690,7 +1690,7 @@ git commit -m "feat: add BFI smoke test and launchd deployment"
 
 ---
 
-## Final Verification
+## Final verification
 
 - [ ] Run the complete suite: `.venv/bin/python -m pytest -q`
 - [ ] Run lint: `.venv/bin/python -m ruff check src tests scripts`

@@ -1,4 +1,4 @@
-# Cinema Ticket Finder Design
+# Cinema ticket finder design
 
 **Status:** Approved
 
@@ -37,7 +37,7 @@ The service is read-only with respect to BFI. It does not select or reserve seat
 - Price filtering or ranking by standard, premium, or VIP category.
 - Natural-language interpretation through an LLM.
 
-## BFI Access Method and Web Contract
+## BFI access method and web contract
 
 `whatson.bfi.org.uk` runs Tessitura Network "Online" 7.90, the classic ASP product rather than TNEW. Two unauthenticated `GET` routes expose everything the service needs. Neither requires a cookie, login, or session token for a cold read.
 
@@ -84,7 +84,7 @@ The `::` sequences in parameter *names* must be sent literally. Standard encoder
 
 The seat-map URL doubles as the Telegram purchase link. It opens BFI's own seat map in the user's browser and leaves seat selection and checkout entirely to the user. No `createBO` parameter is required.
 
-### Performance Records
+### Performance records
 
 The film page embeds a JavaScript object literal, not JSON:
 
@@ -144,7 +144,7 @@ GET /imax/Online/default.asp
 
 Each page returns the same `articleContext` shape. `sToken` and `articleId` are read from page 1 and are required only for subsequent pages. The gateway iterates from page 2 to `pagination.total_pages` inclusive and treats a page count that changes mid-chain, or a page that yields no rows, as a parser-contract error rather than as an empty result. `sToken` is transient and is neither logged nor persisted.
 
-### Seat Map
+### Seat map
 
 `mapSelect.asp` returns a server-rendered SVG inside an HTML page. There is no XHR call and no separate data feed. Every seat is one `<circle>`, nested inside a `<g>` whose `id` is the price-zone GUID:
 
@@ -171,7 +171,7 @@ Each page returns the same `articleContext` shape. `sToken` and `articleId` are 
 | `cx`, `cy` | position within the seat-map coordinate space |
 | enclosing `<g id>` | price-zone GUID |
 
-Parsing uses `lxml` over the whole document. Each `<circle>` carrying `data-status` is a seat; its price zone is the `id` of its nearest ancestor `<g>`. The same seat `id` can appear on more than one circle, because a seat is drawn as an outline and a fill, so seats are deduplicated by `id`. Only `data-status="A"` counts as available. `O` is contended rather than permanently gone — it can revert to `A` when another customer's basket times out — but it is not offerable now and is excluded from option generation exactly like `S` and `U`.
+Parsing uses `lxml` over the whole document. Each `<circle>` carrying `data-status` is a seat; its price zone is the `id` of its nearest ancestor `<g>`. The same seat `id` can appear on more than one circle, because a seat is drawn as an outline and a fill, so seats are deduplicated by `id`. Only `data-status="A"` counts as available. `O` is contended rather than permanently gone: it can revert to `A` when another customer's basket times out, but it is not offerable now and is excluded from option generation exactly like `S` and `U`.
 
 Price zones are resolved from inline legend scripts:
 
@@ -195,11 +195,11 @@ Observed zones and prices:
 
 The wheelchair and companion zone labels, together with `data-tsmessage` text, are the two independent signals used to exclude restricted access seats.
 
-### Venue Geometry
+### Venue geometry
 
 BFI IMAX presents 493 seats across 15 rows labelled `A` to `Q`, skipping `I` and `O`. The skipped letters are why row distance in the ranking formula is computed from observed row order by median vertical (`cy`) position rather than from alphabetic distance.
 
-### Cross-Source Consistency
+### Cross-source consistency
 
 `availability_num` and the seat map are independently produced. In a single controlled read they agree exactly, and 387 against 387 was observed for the verified performance. At runtime the two documents are fetched seconds apart and genuine bookings occur in between, so the gateway tolerates small drift rather than requiring equality; the smoke test, which reads both in immediate succession, asserts the exact match. This is the cheapest available detector of drift in either parser.
 
@@ -219,12 +219,12 @@ Verified live from the target Mac on 2026-08-11, read-only, five HTTP requests i
 | Seats parsed | 493 unique, all carrying `cx`/`cy`; statuses `A` 387, `S` 86, `U` 20 |
 | `availability_num` versus `data-status="A"` count | 387 versus 387, exact match |
 | Price zones resolved from legend | 5 zones, all with prices |
-| Rows observed | `A`–`Q` excluding `I` and `O`, 15 rows |
+| Rows observed | `A` to `Q` excluding `I` and `O`, 15 rows |
 | Seats carrying `data-tsmessage` | 8, all wheelchair-space or companion wording |
 
 Payload sizes measured in that run set the fetch strategy. One film-page request is roughly 124 KB and carries up to `page_size` performances, so the full performance list for a film costs one such request per page of the pagination chain. One seat map is roughly 504 KB and covers a single performance. Seat maps are therefore fetched only for performances that survive every cheaper filter.
 
-## System Architecture
+## System architecture
 
 A single Python asyncio process contains the following units:
 
@@ -267,7 +267,7 @@ The initial implementation uses Python 3.12 or later with:
 
 The `articleContext` JavaScript literal is normalised and decoded with the standard library, using the steps set out in the contract section, so no additional JavaScript-parsing dependency is required.
 
-## Domain Model
+## Domain model
 
 ### Watch
 
@@ -313,7 +313,7 @@ A seat contains:
 - Price-zone GUID and resolved zone label and price when available, for display only.
 - A restricted-access flag derived from the zone label and from BFI's `data-tsmessage` seat message.
 
-### Ranked Option
+### Ranked option
 
 A ranked option contains:
 
@@ -348,7 +348,7 @@ Latest results remain available after restart. Result snapshots older than 24 ho
 
 Writes for a successful check use one transaction: insert the check result and complete snapshot, update the watch schedule, decide whether a notification is due, create its pending delivery record, and commit. Telegram delivery occurs after commit. A second transaction marks the delivery and its option keys as surfaced. A delivery failure leaves the pending record retryable rather than pretending the notification succeeded.
 
-## Telegram Interaction
+## Telegram interaction
 
 ### Authorization
 
@@ -365,7 +365,7 @@ Writes for a successful check use one transaction: insert the check result and c
 - `/cancel`: abandon the current wizard draft.
 - `/help`: show concise usage help.
 
-### Watch Wizard
+### Watch wizard
 
 The wizard gathers one item at a time:
 
@@ -404,9 +404,9 @@ Each page contains up to ten options. Each option shows:
 
 Pagination callbacks refer to an immutable snapshot and enforce ownership. If the snapshot has expired, the bot explains that the result is stale and offers a fresh check.
 
-## Retrieval Flow
+## Retrieval flow
 
-### URL Validation
+### URL validation
 
 The gateway accepts only:
 
@@ -421,7 +421,7 @@ Validation reduces the URL to a single article slug, which is the watch's canoni
 
 One slug is one article. BFI publishes subtitled variants as separate articles, so `dog-stars` and `dog-stars-sdh` are distinct watches and a watch on one does not surface performances of the other. The wizard shows this caveat whenever the slug ends in a recognised variant suffix, initially `-sdh`, and treats the suffix list as a best-effort hint rather than a validation rule. The aggregate programme article that lists every IMAX film in one result set is not used; watches are per-film by design.
 
-### Film Discovery
+### Film discovery
 
 1. Normalize and validate the supplied URL and reduce it to an article slug.
 2. Fetch the film page through the shared Chrome-impersonating session, with the permalink parameter name sent literally.
@@ -436,7 +436,7 @@ One slug is one article. BFI publishes subtitled variants as separate articles, 
 
 Filtering on the exact `availability_num` count rather than only on the coarse availability band avoids fetching a roughly 504 KB seat map for a performance that cannot possibly hold the requested block. A performance without reserved seating has no meaningful seat map; it is recorded as an unsupported-performance skip rather than an error. A future poll re-evaluates the film page, so a performance that later gains enough seats is checked then.
 
-### Seat Retrieval
+### Seat retrieval
 
 For each candidate performance:
 
@@ -473,7 +473,7 @@ For a requested quantity `N`, every sliding window of exactly `N` seats within e
 
 ## Ranking
 
-### Explicit Preferences
+### Explicit preferences
 
 Blocks containing an excluded row or seat are removed.
 
@@ -484,7 +484,7 @@ Remaining blocks are ranked first by:
 
 An explicit preference therefore overrides the default venue profile without changing the underlying view score.
 
-### Default BFI View Score
+### Default BFI view score
 
 The default score ranges from 0 through 100 and measures viewing position only:
 
@@ -503,7 +503,7 @@ view_score = row_score + center_score
 
 Rows are ordered front to back by their observed median vertical (`cy`) coordinate, so omitted letters such as `I` and `O` do not distort distance. Row distance is counted in steps along that observed order, not in alphabetic steps. Rows L and M are the default ideal band, and horizontal centring has the stronger weight. The score is rounded to two decimal places. Standard, premium, and VIP categories do not change it.
 
-### Final Ordering
+### Final ordering
 
 The deterministic sort key is:
 
@@ -517,7 +517,7 @@ The deterministic sort key is:
 
 The score band lets performance time break genuine seat-quality near-ties while preventing a materially worse seat from winning solely because of time.
 
-## Scheduling and Notifications
+## Scheduling and notifications
 
 The scheduler scans for due watches once per minute. A recurring watch's next run is its completion time plus the chosen interval plus positive random jitter of up to 10 percent. The interval itself cannot be less than 15 minutes.
 
@@ -532,7 +532,7 @@ Later recurring checks send one digest when either:
 
 The digest shows the current top ten, counts of all current and new options, and a button to browse the complete snapshot. All current option keys are marked surfaced only after the Telegram delivery succeeds. Unchanged snapshots, worse-only changes, and mere disappearances are silent.
 
-## Error Handling, Rate Limiting, and Cloudflare
+## Error handling, rate limiting, and Cloudflare
 
 Errors are typed and handled distinctly:
 
@@ -560,7 +560,7 @@ Sustained request rates provoke sporadic challenges even through an impersonatin
 
 The service does not attempt to answer, bypass, outsource, or automate a challenge once one is presented. Impersonating a browser's TLS fingerprint to read a public page is the transport the site requires of any client; responding to a challenge is not, and the circuit breaker exists so the service backs off instead. If BFI permanently protects the public route, the service remains visibly degraded until an authorized data source or a separately approved design replaces the gateway.
 
-## Operations and Security
+## Operations and security
 
 `launchd` runs the process with `KeepAlive` and restarts it after failures. The process handles termination signals by stopping new checks, awaiting active checks within a bounded shutdown period, committing state, and closing Telegram, HTTP, and SQLite clients.
 
@@ -576,9 +576,9 @@ There is no configurable `User-Agent`. The impersonation profile supplies a cohe
 
 Secrets are never stored in SQLite or written to logs. Logs are structured, redact URL tokens and Telegram credentials, and include watch/check correlation IDs. BFI HTML, SVG bodies, and transient `sToken` values are neither logged nor persisted; only parsed records, statuses, and byte counts are retained. The single-instance lock is `<DATABASE_PATH>.lock` and is held for the process lifetime.
 
-## Testing Strategy
+## Testing strategy
 
-### Unit Tests
+### Unit tests
 
 - URL normalization, host/path restrictions, slug reduction, and redirect validation.
 - Literal query-string construction, asserting that `::` in parameter names is never percent-encoded and that the `sToken` value is.
@@ -593,7 +593,7 @@ Secrets are never stored in SQLite or written to logs. Logs are structured, reda
 - Date/time filtering across daylight-saving changes and midnight-wrapping time windows.
 - Notification option keys, improvement detection, and repeat suppression.
 
-### Integration Tests
+### Integration tests
 
 - Telegram wizard and command handlers with fake updates and callback ownership checks.
 - SQLite migrations, transactions, restart recovery, retention, and cascade deletion using temporary databases.
@@ -604,11 +604,11 @@ Secrets are never stored in SQLite or written to logs. Logs are structured, reda
 
 Fixtures are minimal synthetic HTML/SVG documents that preserve the required contract without committing full BFI pages. No test makes a live BFI request.
 
-### Manual Contract Smoke Test
+### Manual contract smoke test
 
 A separately invoked smoke test performs one film-page GET, its pagination chain, and one seat-map GET for one returned performance. It asserts that each response is `HTTP 200`, that `articleContext` parses into performance records with every consumed field present, that the seat map parses into deduplicated seats carrying status, row, seat, coordinates, and price zone, and that `availability_num` equals the count of `data-status="A"` for that performance. It reports contract drift and the observed impersonation profile. It is not part of normal automated test runs, does not scan the programme, and does not poll.
 
-## Acceptance Criteria
+## Acceptance criteria
 
 1. Given a valid BFI IMAX film URL, date/time criteria, and quantity, the bot returns every distinct eligible contiguous block for every matching on-sale performance, across the complete paginated performance list rather than the first page alone.
 2. Results follow the approved preference, view-quality, and preferred-time ordering and remain deterministic across repeated runs over identical input.

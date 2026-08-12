@@ -3,7 +3,7 @@
 A Telegram bot that watches BFI IMAX seating and messages you when good seats appear. You
 tell it a film, a date range, a time window and how many seats you need; it checks the
 public BFI listing on a schedule and sends you a link to the seat map when a block of
-adjacent seats that matches shows up. It never buys anything — you follow the link and
+adjacent seats that matches shows up. It never buys anything. You follow the link and
 complete the purchase yourself.
 
 It runs as a single-user background service on macOS under `launchd`.
@@ -53,7 +53,7 @@ credential: anyone who has it can act as your bot.
 
 Message [@userinfobot](https://t.me/userinfobot). It replies with your numeric ID. The bot
 ignores every message from anyone not on this list, so add the IDs of everyone who should
-be able to see and edit your watches — and nobody else.
+be able to see and edit your watches, and nobody else.
 
 ### 3. Write the env file
 
@@ -92,7 +92,7 @@ it running unattended, confirm that the page still looks the way the parsers exp
   'https://whatson.bfi.org.uk/imax/Online/default.asp?BOparam::WScontent::loadArticle::permalink=dog-stars'
 ```
 
-Substitute any current BFI IMAX film URL — `dog-stars` is only an example, and a film that
+Substitute any current BFI IMAX film URL: `dog-stars` is only an example, and a film that
 has finished its run will have no performances on sale.
 
 This makes one film-page request, follows that film's pagination chain, and fetches the
@@ -120,19 +120,19 @@ The last line is the verdict. Exit codes:
 | `0` | contract holds | deploy |
 | `2` | the URL was not a BFI IMAX film page | check the URL you pasted |
 | `3` | BFI presented a challenge, or refused repeatedly | wait and try again later; do not retry in a loop |
-| `4` | the page parsed, but not the way the code expects | the contract has drifted — see below |
+| `4` | the page parsed, but not the way the code expects | the contract has drifted; see below |
 | `5` | the network failed | check your connection, try again |
 
-**Exit code 4 is the one that matters.** It means BFI changed the page and the service's
-reading of it is now wrong. The message says which check failed — a missing field, an
+Exit code 4 is the one that matters. It means BFI changed the page and the service's
+reading of it is now wrong. The message says which check failed: a missing field, an
 unrecognised seat status, an accessible space that no longer reads as restricted, or a
 mismatch between the availability count BFI reports and the number of available seats in
-the seat map. Do not deploy against a drifted contract: a
-parser that silently mis-reads a seat map is worse than no bot, because it will confidently
-tell you seats exist when they do not. The fix is a code change, not a configuration one.
+the seat map. Do not deploy against a drifted contract. A parser that silently mis-reads a
+seat map is worse than no bot, because it will confidently tell you seats exist when they
+do not. The fix is a code change, not a configuration one.
 
 Exit code 3 is not a defect. BFI puts a challenge in front of clients it does not like, and
-this project does not answer, bypass or automate challenges — it backs off. If the smoke
+this project does not answer, bypass or automate challenges. It backs off. If the smoke
 test is challenged persistently rather than occasionally, the public route is no longer
 usable and no amount of retrying will change that.
 
@@ -190,7 +190,7 @@ bot token split incoming commands unpredictably between them, double the request
 site that is already rate-limiting us, and send you every notification twice.
 
 The lock is held by the kernel, not written down, so it is released however the process
-ends — including a crash or `kill -9`. There is nothing to clean up by hand and no stale
+ends, including a crash or `kill -9`. There is nothing to clean up by hand and no stale
 lock to clear; the empty `.lock` file left behind is expected. If you genuinely want two
 instances, give each its own `DATABASE_PATH`, and a separate bot token.
 
@@ -203,9 +203,9 @@ tail -f ~/Library/Logs/cinema-friend/cinema-friend.err.log
 
 Logs are JSON, one object per line, and carry watch and check correlation IDs so a single
 check can be followed end to end. The bot token is redacted before anything is written, and
-so is every URL query — BFI's paging URLs carry a session token, so a logged URL is cut
+so is every URL query: BFI's paging URLs carry a session token, so a logged URL is cut
 back to its host and path. Failure messages name the document that failed, not its address.
-BFI page bodies and seat-map SVGs are never logged or stored — only parsed records, statuses
+BFI page bodies and seat-map SVGs are never logged or stored: only parsed records, statuses
 and byte counts. The same holds for the contract check in the terminal.
 
 To read them comfortably, pipe through `jq`:
@@ -246,18 +246,18 @@ Message your bot on Telegram and send `/help`.
 
 `/new` asks one question at a time:
 
-1. **Film URL** — the BFI page for the film, e.g.
+1. **Film URL**: the BFI page for the film, e.g.
    `https://whatson.bfi.org.uk/imax/Online/article/dog-stars`
-2. **Date range** — `2026-08-26 to 2026-08-30`
-3. **Time window** — `18:00 to 22:30`, applied to each day in the range
-4. **Seats** — `1` to `8`, chosen from buttons
-5. **Preferred rows** — `L,M`, or `skip`
-6. **Preferred seats** — `L16-L22,M17`, or `skip`
-7. **Rows and seats to exclude** — same formats, or `skip`
-8. **Preferred time** — a specific showing you would rather have, or `skip`
-9. **One-off or recurring** — one-off checks until it finds something; recurring keeps
+2. **Date range**: `2026-08-26 to 2026-08-30`
+3. **Time window**: `18:00 to 22:30`, applied to each day in the range
+4. **Seats**: `1` to `8`, chosen from buttons
+5. **Preferred rows**: `L,M`, or `skip`
+6. **Preferred seats**: `L16-L22,M17`, or `skip`
+7. **Rows and seats to exclude**: same formats, or `skip`
+8. **Preferred time**: a specific showing you would rather have, or `skip`
+9. **One-off or recurring**: one-off checks until it finds something; recurring keeps
    checking on an interval
-10. **Interval** — for recurring watches, at least 15 minutes
+10. **Interval**: for recurring watches, at least 15 minutes
 
 It shows you a summary and waits for you to confirm. Nothing is saved until you do, and a
 half-finished setup survives a restart of the service.
@@ -269,7 +269,7 @@ options in preference order, each with a link straight to that performance's sea
 still choose seats and pay on the BFI site.
 
 A watch that finds nothing new sends nothing. You are messaged again only when something
-appears that is genuinely better than what you were last told about — so a recurring watch
+appears that is genuinely better than what you were last told about, so a recurring watch
 on a quiet film is silent, not repetitive.
 
 ---
@@ -290,7 +290,7 @@ This is deliberate. The service never tries to answer, bypass or automate a chal
 Impersonating a browser's TLS fingerprint to read a public page is the transport the site
 requires of any client; defeating a challenge is a different thing, and this project does
 not do it. If BFI protects the route permanently, the bot stays visibly degraded until
-there is a supported data source to move to — it will not quietly start guessing.
+there is a supported data source to move to. It will not quietly start guessing.
 
 ---
 
@@ -299,7 +299,7 @@ there is a supported data source to move to — it will not quietly start guessi
 Everything the bot knows lives in the SQLite file at `DATABASE_PATH`: your watches, the
 results it has found, and which notifications it has already sent. No credentials are
 stored there. Beside it sits an empty `<DATABASE_PATH>.lock`, which exists only to hold the
-single-instance lock — there is nothing in it to back up.
+single-instance lock: there is nothing in it to back up.
 
 To back it up, stop the service first so nothing is mid-write:
 
@@ -333,13 +333,13 @@ repository that talks to BFI, and it is never run automatically.
 ## A caveat worth reading
 
 This reads a public web page that has no API, no versioning and no compatibility promise.
-BFI can change the markup at any time, and when they do this bot will stop working —
+BFI can change the markup at any time, and when they do this bot will stop working,
 ideally loudly, via the smoke test's exit code 4 or a degraded-service message, but the
 possibility of a subtle mis-read is real. Treat what it tells you as a prompt to go and
 look at the BFI site, not as an authority on what is available.
 
 It is also, unavoidably, an automated client on someone else's site. The request rates
-here are deliberately low — at most two requests at a time, at least a second apart, a
-15-minute floor on recurring checks, and no scanning of the wider programme — because
+here are deliberately low: at most two requests at a time, at least a second apart, a
+15-minute floor on recurring checks, and no scanning of the wider programme, because
 that restraint is the only thing that makes running it defensible. Do not raise those
 limits.
