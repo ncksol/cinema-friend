@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from cinema_friend.bfi.article_context import ArticlePage, parse_article_page, performance_from_row
-from cinema_friend.bfi.seat_map import parse_seat_map
+from cinema_friend.bfi.seat_map import KNOWN_STATUS_CODES, parse_seat_map
 from cinema_friend.bfi.transport import DocumentKind, FetchedDocument
 from cinema_friend.bfi.urls import film_page_url, pagination_url
 from cinema_friend.clock import Clock
@@ -154,9 +154,15 @@ class BfiGateway:
         performance identity does not match *performance* (checked by
         :func:`~cinema_friend.bfi.seat_map.parse_seat_map`), or if BFI
         reports positive availability while the map carries no raw-``A``
-        seat at all. A larger, non-zero drift is logged but does not fail
-        the read, and a map whose available seats are all restricted is a
-        logged metric rather than any kind of failure.
+        seat *and* some seat carries a status code this parser does not
+        recognise. A map with no raw-``A`` seat whose seats are all
+        explicable is an ordinary sell-out, not a site change: the listing
+        and the map are two documents read up to a cache lifetime apart,
+        and the last free seats can be bought -- or merely taken into
+        another customer's basket as ``O`` -- in between. A larger,
+        non-zero drift is logged but does not fail the read, and a map
+        whose available seats are all restricted is a logged metric rather
+        than any kind of failure.
         """
         if performance.seat_map_url is None:
             raise BfiContractError(
@@ -167,9 +173,25 @@ class BfiGateway:
         drift = _availability_drift(performance, seat_map)
 
         if drift.parsed == 0 and performance.availability_num > 0:
-            raise BfiContractError(
-                f"performance {performance.performance_id!r} reports "
-                f"availability_num={performance.availability_num} but zero available seats parsed"
+            unrecognised = sorted(
+                {
+                    seat.raw_status_code
+                    for seat in seat_map.seats
+                    if seat.raw_status_code not in KNOWN_STATUS_CODES
+                }
+            )
+            if unrecognised:
+                raise BfiContractError(
+                    f"performance {performance.performance_id!r} reports "
+                    f"availability_num={performance.availability_num} but zero available "
+                    f"seats parsed, and the map carries unrecognised status codes "
+                    f"{unrecognised}"
+                )
+            logger.info(
+                "performance %s sold out between its listing and its seat map: "
+                "reported=%d parsed=0",
+                performance.performance_id,
+                drift.reported,
             )
         if abs(drift.difference) > _DRIFT_LOG_THRESHOLD:
             logger.warning(

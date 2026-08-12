@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import re
 from decimal import Decimal
-from typing import Any, cast
+from typing import Any, Final, cast
 
 import lxml.html
 
@@ -28,6 +28,14 @@ _STATUS_MAP: dict[str, SeatStatus] = {
     "U": SeatStatus.UNAVAILABLE,
     "O": SeatStatus.CONTENDED,
 }
+
+KNOWN_STATUS_CODES: Final[frozenset[str]] = frozenset(_STATUS_MAP)
+"""The raw ``data-status`` codes this parser understands.
+
+Anything outside this set parses as :attr:`SeatStatus.UNKNOWN`. Callers use it to tell
+a map whose seats are all explicable -- and which therefore says what it means when it
+shows nothing available -- from one written in a vocabulary this parser no longer reads.
+"""
 
 _RESTRICTED_KEYWORDS = ("wheelchair", "companion", "assistant")
 

@@ -520,23 +520,61 @@ async def test_load_seat_map_returns_seat_map_matching_performance():
     assert len(seat_map.seats) == 3
 
 
-async def test_positive_reported_availability_with_zero_parsed_available_is_contract_error():
-    performance = make_performance(availability_num=3)
-    html = (
+def single_seat_map_html(raw_status: str, *, performance_id: str = PERF_1) -> str:
+    """A map with exactly one seat, carrying *raw_status*, and no raw-``A`` seat at all."""
+    return (
         "<html><script>"
-        f'getPerformanceEcommerceObject({{"item_id":"{PERF_1}"}})'
+        f'getPerformanceEcommerceObject({{"item_id":"{performance_id}"}})'
         "</script><svg>"
-        '<circle id="seat-1" data-status="S" data-seat-section="BFI IMAX" '
+        f'<circle id="seat-1" data-status="{raw_status}" data-seat-section="BFI IMAX" '
         'data-seat-row="L" data-seat-seat="1" cx="1" cy="1"/>'
         "</svg></html>"
     )
+
+
+@pytest.mark.parametrize("raw_status", ["S", "O", "U"])
+async def test_zero_parsed_available_with_explicable_statuses_is_not_a_contract_error(
+    raw_status: str, caplog: pytest.LogCaptureFixture
+):
+    """Losing the last seats between the two reads is an ordinary sell-out, not a site change.
+
+    ``availability_num`` comes from the listing and the seat count comes from the map,
+    and the two documents are read up to a cache lifetime apart. The last free seats can
+    be bought (``S``) or merely taken into another customer's basket (``O``, which
+    reverts on timeout) in that window. Raising here paused the watch and alerted its
+    owner about a change that never happened -- and on a nearly-sold-out screening,
+    which is exactly the one its owner most wants watched.
+    """
+    performance = make_performance(availability_num=3)
+    html = single_seat_map_html(raw_status)
     gateway, _, _ = make_gateway(
         transport=FakeTransport(
             {performance.seat_map_url: fetched_document(html, url=performance.seat_map_url)}
         )
     )
 
-    with pytest.raises(BfiContractError, match="zero available"):
+    with caplog.at_level(logging.INFO):
+        seat_map = await gateway.load_seat_map(performance)
+
+    assert len(seat_map.seats) == 1
+    assert any("sold out" in record.message.lower() for record in caplog.records)
+
+
+async def test_zero_parsed_available_with_unrecognised_status_is_a_contract_error():
+    """A status vocabulary this parser cannot read is a real site change, and must escalate.
+
+    This is the signal the zero-parsed branch exists to catch: not "nothing is free",
+    which is ordinary, but "the map no longer says anything this parser understands".
+    """
+    performance = make_performance(availability_num=3)
+    html = single_seat_map_html("X")
+    gateway, _, _ = make_gateway(
+        transport=FakeTransport(
+            {performance.seat_map_url: fetched_document(html, url=performance.seat_map_url)}
+        )
+    )
+
+    with pytest.raises(BfiContractError, match="unrecognised status codes"):
         await gateway.load_seat_map(performance)
 
 
