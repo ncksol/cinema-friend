@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import sqlite3
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -12,9 +13,39 @@ from typing import Final
 
 import aiosqlite
 
+from cinema_friend.domain.errors import PersistenceError
+
 _MIGRATIONS_DIR: Final = Path(__file__).parent / "migrations"
 _MIGRATION_NAME_RE: Final = re.compile(r"^(\d+)_.*\.sql$")
 _SAVEPOINT_NAMES: Final = count()
+
+DEFAULT_BUSY_TIMEOUT_MS: Final = 5000
+"""How long a connection waits for a lock before giving up.
+
+Writers here are short and several of them are independent -- checks, circuit-breaker
+updates, delivery bookkeeping -- so meeting a held write lock is normal and waiting a
+few seconds is the correct response. The SQLite default is zero, which turns every such
+overlap into an immediate "database is locked" error.
+"""
+
+MINIMUM_SQLITE_VERSION: Final = (3, 38, 0)
+"""Snapshot paging queries the stored JSON, and those functions became built-ins in 3.38."""
+
+
+def ensure_supported_sqlite() -> None:
+    """Fail loudly at startup when the runtime's SQLite is too old.
+
+    Left unchecked, an old library gets through configuration and migrations and only
+    fails later, when a check tries to page a result snapshot -- long after the process
+    looked healthy.
+    """
+    parts = tuple(int(part) for part in sqlite3.sqlite_version.split(".")[:3])
+    padded = parts + (0,) * (3 - len(parts))
+    if padded < MINIMUM_SQLITE_VERSION:
+        expected = ".".join(str(part) for part in MINIMUM_SQLITE_VERSION)
+        raise PersistenceError(
+            f"SQLite {sqlite3.sqlite_version} is too old; {expected} or newer is required"
+        )
 
 
 def encode_datetime(value: datetime) -> str:
@@ -70,11 +101,12 @@ def _discover_migrations() -> list[tuple[int, Path]]:
 class Database:
     """Owns connection setup, transactions, and migrations for one SQLite file."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS) -> None:
         self._path = path
+        self._busy_timeout_ms = busy_timeout_ms
 
     async def connect(self) -> aiosqlite.Connection:
-        """Open a fresh connection with row access by name, FKs, and WAL enabled.
+        """Open a fresh connection with row access by name, FKs, WAL, and a busy timeout.
 
         ``isolation_level=None`` turns off the driver's legacy implicit transactions, so
         this module owns every ``BEGIN``. Two things follow: a write issued outside
@@ -91,6 +123,7 @@ class Database:
         conn.row_factory = aiosqlite.Row
         await _run_pragma(conn, "PRAGMA foreign_keys = ON")
         await _run_pragma(conn, "PRAGMA journal_mode = WAL")
+        await _run_pragma(conn, f"PRAGMA busy_timeout = {self._busy_timeout_ms:d}")
         return conn
 
     @asynccontextmanager

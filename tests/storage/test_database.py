@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -9,7 +10,13 @@ from pathlib import Path
 import aiosqlite
 import pytest
 
-from cinema_friend.storage.database import Database, _discover_migrations
+from cinema_friend.domain.errors import PersistenceError
+from cinema_friend.storage.database import (
+    DEFAULT_BUSY_TIMEOUT_MS,
+    Database,
+    _discover_migrations,
+    ensure_supported_sqlite,
+)
 
 # Derived rather than hard-coded so adding a migration doesn't need these tests edited;
 # what they assert is that every discovered migration is applied exactly once.
@@ -63,6 +70,49 @@ async def test_connect_enables_foreign_keys(
     cursor = await conn.execute("PRAGMA foreign_keys")
     row = await cursor.fetchone()
     assert row[0] == 1
+
+
+async def test_connect_sets_a_busy_timeout(database: Database, conn: aiosqlite.Connection) -> None:
+    """Without this, a writer that meets a held lock raises "database is locked" at once.
+
+    Several connections write concurrently -- the scheduler's checks, the circuit store,
+    the delivery worker -- so every connection has to be willing to wait its turn.
+    """
+    cursor = await conn.execute("PRAGMA busy_timeout")
+    row = await cursor.fetchone()
+    assert row[0] == DEFAULT_BUSY_TIMEOUT_MS
+
+
+async def test_busy_timeout_is_configurable(tmp_path: Path) -> None:
+    database = Database(tmp_path / "cinema-friend.db", busy_timeout_ms=250)
+    connection = await database.connect()
+    try:
+        cursor = await connection.execute("PRAGMA busy_timeout")
+        row = await cursor.fetchone()
+        assert row[0] == 250
+    finally:
+        await connection.close()
+
+
+def test_supported_sqlite_passes_on_this_runtime() -> None:
+    ensure_supported_sqlite()
+
+
+def test_unsupported_sqlite_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Snapshot paging leans on SQLite's JSON functions, which arrived in 3.38."""
+    monkeypatch.setattr(sqlite3, "sqlite_version", "3.37.2")
+
+    with pytest.raises(PersistenceError, match="3.38"):
+        ensure_supported_sqlite()
+
+
+@pytest.mark.parametrize("version", ["3.38.0", "3.40.1", "4.0.0", "3.45"])
+def test_supported_sqlite_versions_are_accepted(
+    monkeypatch: pytest.MonkeyPatch, version: str
+) -> None:
+    monkeypatch.setattr(sqlite3, "sqlite_version", version)
+
+    ensure_supported_sqlite()
 
 
 async def test_connect_uses_row_factory(database: Database, conn: aiosqlite.Connection) -> None:
