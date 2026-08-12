@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
-import statistics
+import logging
 from collections import defaultdict
 
 from cinema_friend.domain.bfi import Seat, SeatBlock, SeatMap, SeatStatus
+from cinema_friend.domain.state import SeatPreferenceStrategy
 from cinema_friend.domain.watch import WatchCriteria
+from cinema_friend.watches.seat_banks import center_seat_bank, partition_seat_banks
 
-_AISLE_THRESHOLD_MULTIPLIER = 1.75
-_MIN_USABLE_GAPS = 3
+logger = logging.getLogger(__name__)
 
 
 def _is_purchasable(seat: Seat, criteria: WatchCriteria) -> bool:
@@ -21,64 +22,108 @@ def _is_purchasable(seat: Seat, criteria: WatchCriteria) -> bool:
     return seat.status is SeatStatus.AVAILABLE and seat.label not in criteria.excluded_seats
 
 
-def _median_gap(row_seats_sorted: list[Seat]) -> float | None:
-    """Return the row's normal seat-to-seat gap, or None if there is not
-    enough geometric evidence (fewer than three usable gaps, or zero width).
-    """
-    xs = [seat.x for seat in row_seats_sorted]
-    if max(xs) - min(xs) == 0:
-        return None
-    gaps = [
-        abs(row_seats_sorted[i + 1].x - row_seats_sorted[i].x)
-        for i in range(len(row_seats_sorted) - 1)
-        if row_seats_sorted[i + 1].column == row_seats_sorted[i].column + 1
-    ]
-    if len(gaps) < _MIN_USABLE_GAPS:
-        return None
-    return statistics.median(gaps)
-
-
 def _emit_windows(
-    blocks: list[SeatBlock], row: str, run: list[Seat], quantity: int
+    blocks: list[SeatBlock],
+    row: str,
+    run: list[Seat],
+    quantity: int,
 ) -> None:
     for start in range(len(run) - quantity + 1):
         blocks.append(SeatBlock(row=row, seats=tuple(run[start : start + quantity])))
 
 
-def _generate_row_blocks(
-    row: str, row_seats: list[Seat], criteria: WatchCriteria
+def _generate_bank_blocks(
+    row: str,
+    bank: tuple[Seat, ...],
+    criteria: WatchCriteria,
 ) -> list[SeatBlock]:
-    quantity = criteria.quantity
-    row_seats_sorted = sorted(row_seats, key=lambda s: s.column)
-
-    if quantity == 1:
-        return [
-            SeatBlock(row=row, seats=(seat,))
-            for seat in row_seats_sorted
-            if _is_purchasable(seat, criteria)
-        ]
-
-    median_gap = _median_gap(row_seats_sorted)
-    if median_gap is None:
-        return []
-    threshold = _AISLE_THRESHOLD_MULTIPLIER * median_gap
-
     blocks: list[SeatBlock] = []
     run: list[Seat] = []
-    for seat in row_seats_sorted:
+    for seat in bank:
         if not _is_purchasable(seat, criteria):
-            _emit_windows(blocks, row, run, quantity)
+            _emit_windows(blocks, row, run, criteria.quantity)
             run = []
             continue
-        can_extend = bool(run) and (
-            seat.column == run[-1].column + 1 and abs(seat.x - run[-1].x) <= threshold
+        run.append(seat)
+    _emit_windows(blocks, row, run, criteria.quantity)
+    return blocks
+
+
+def _generate_advanced_row_blocks(
+    row: str,
+    row_seats: list[Seat],
+    criteria: WatchCriteria,
+) -> list[SeatBlock]:
+    if criteria.quantity == 1:
+        return [
+            SeatBlock(row=row, seats=(seat,))
+            for seat in sorted(row_seats, key=lambda seat: seat.column)
+            if _is_purchasable(seat, criteria)
+        ]
+    banks = partition_seat_banks(row_seats)
+    if banks is None:
+        return []
+    return [
+        block
+        for bank in banks
+        for block in _generate_bank_blocks(row, bank, criteria)
+    ]
+
+
+_MINIMUM_ROW = {
+    SeatPreferenceStrategy.ONLY_BEST: "J",
+    SeatPreferenceStrategy.BEST_AND_GOOD: "C",
+}
+
+
+def _simple_row_is_allowed(
+    row: str,
+    strategy: SeatPreferenceStrategy,
+) -> bool | None:
+    normalized = row.upper()
+    if len(normalized) != 1 or not ("A" <= normalized <= "Z"):
+        return None
+    return normalized >= _MINIMUM_ROW[strategy]
+
+
+def _generate_simple_blocks(
+    seat_map: SeatMap,
+    criteria: WatchCriteria,
+) -> list[SeatBlock]:
+    seats_by_row: dict[str, list[Seat]] = defaultdict(list)
+    for seat in seat_map.seats:
+        seats_by_row[seat.row].append(seat)
+
+    blocks: list[SeatBlock] = []
+    for row, row_seats in seats_by_row.items():
+        row_allowed = _simple_row_is_allowed(
+            row,
+            criteria.seat_preference_strategy,
         )
-        if run and not can_extend:
-            _emit_windows(blocks, row, run, quantity)
-            run = [seat]
-        else:
-            run.append(seat)
-    _emit_windows(blocks, row, run, quantity)
+        if row_allowed is None:
+            logger.warning(
+                "simple seat preference excluded unsupported row label",
+                extra={
+                    "performance_id": seat_map.performance_id,
+                    "row": row,
+                    "strategy": criteria.seat_preference_strategy.value,
+                },
+            )
+            continue
+        if not row_allowed:
+            continue
+        bank = center_seat_bank(row_seats)
+        if bank is None:
+            logger.warning(
+                "simple seat preference could not identify a unique center bank",
+                extra={
+                    "performance_id": seat_map.performance_id,
+                    "row": row,
+                    "strategy": criteria.seat_preference_strategy.value,
+                },
+            )
+            continue
+        blocks.extend(_generate_bank_blocks(row, bank, criteria))
     return blocks
 
 
@@ -86,15 +131,19 @@ def generate_blocks(seat_map: SeatMap, criteria: WatchCriteria) -> tuple[SeatBlo
     """Generate every exact-size sliding-window seat block purchasable under
     *criteria* from *seat_map*.
 
-    Only ``AVAILABLE`` seats are offerable; sold, unavailable, contended,
+    Advanced mode: Only ``AVAILABLE`` seats are offerable; sold, unavailable, contended,
     restricted, unknown-status, and explicitly excluded seats break a run of
-    adjacent seats. Runs are also broken across an aisle, detected by an
-    outsized gap in seat x-coordinates relative to the row's normal
-    (median) seat-to-seat gap, and across a section boundary: seats only
-    form a contiguous run when they share both section and row, so
-    consecutively numbered seats in different sections never adjoin even
-    when geometrically close.
+    adjacent seats. Runs are also broken across an aisle (detected by an outsized gap
+    in seat x-coordinates relative to the row's normal gap) and across a section
+    boundary. Explicit row exclusions are respected.
+
+    Simple modes (ONLY_BEST, BEST_AND_GOOD): Only seats in the physical center bank
+    of each row, at or behind the preset's minimum row, are candidates. Rows with
+    ambiguous or insufficient geometry produce no blocks and emit a warning.
     """
+    if criteria.seat_preference_strategy is not SeatPreferenceStrategy.ADVANCED:
+        return tuple(_generate_simple_blocks(seat_map, criteria))
+
     seats_by_section_row: dict[tuple[str, str], list[Seat]] = defaultdict(list)
     for seat in seat_map.seats:
         seats_by_section_row[(seat.section, seat.row)].append(seat)
@@ -103,5 +152,5 @@ def generate_blocks(seat_map: SeatMap, criteria: WatchCriteria) -> tuple[SeatBlo
     for (_section, row), row_seats in seats_by_section_row.items():
         if row in criteria.excluded_rows:
             continue
-        blocks.extend(_generate_row_blocks(row, row_seats, criteria))
+        blocks.extend(_generate_advanced_row_blocks(row, row_seats, criteria))
     return tuple(blocks)
