@@ -21,7 +21,7 @@ It runs as a single-user background service on macOS under `launchd`.
 ## Install
 
 ```sh
-git clone <repository-url> cinema-friend
+git clone https://github.com/ncksol/cinema-friend.git cinema-friend
 cd cinema-friend
 
 python3.12 -m venv .venv
