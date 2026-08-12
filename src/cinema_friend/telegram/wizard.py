@@ -8,10 +8,11 @@ resumes from whatever was last persisted.
 
 Two state families exist. Free-text states (``AWAIT_URL`` through ``AWAIT_INTERVAL``)
 are advanced by :func:`handle_wizard_text`; button-driven states (``AWAIT_QUANTITY``,
-``AWAIT_MODE``, and the confirm/cancel actions on ``REVIEW``) are advanced by
-:func:`handle_wizard_callback`. Invalid input in either family leaves the persisted
-draft completely unchanged and replies with the same message the parser raised, which
-already names the accepted shape.
+``AWAIT_SEAT_MODE``, ``AWAIT_SIMPLE_SEAT_PREFERENCE``, ``AWAIT_MODE``, and the
+confirm/cancel actions on ``REVIEW``) are advanced by :func:`handle_wizard_callback`.
+Invalid input in either family leaves the persisted draft completely unchanged and
+replies with the same message the parser raised, which already names the accepted
+shape.
 
 Confirmation is the one step with effects outside the draft table -- a watch row and a
 creation check -- so it is written as a saga rather than a single transition. A watch
@@ -64,7 +65,7 @@ from cinema_friend.domain.errors import (
     PersistenceError,
 )
 from cinema_friend.domain.results import CheckResult
-from cinema_friend.domain.state import CheckTrigger, WatchMode
+from cinema_friend.domain.state import CheckTrigger, SeatPreferenceStrategy, WatchMode
 from cinema_friend.domain.time_window import LONDON, within_daily_window
 from cinema_friend.domain.watch import WatchCriteria
 from cinema_friend.services.watch_service import WatchService
@@ -92,6 +93,21 @@ _WATCH_NAMESPACE = UUID("6f3f7a0e-2c56-4d5b-9b1a-0d5f9f5a1c77")
 
 _SKIP = "skip"
 
+#: Marks a draft created by the current (branching) wizard. Persisted at the very
+#: start of a new draft so every later transition can tell a fresh draft from a
+#: legacy one -- created before this branch existed -- without guessing from which
+#: keys happen to be present.
+_SEAT_FLOW_VERSION = 2
+_SEAT_FLOW_VERSION_KEY = "seat_flow_version"
+_SEAT_PREFERENCE_KEY = "seat_preference_strategy"
+
+
+class SeatSetupMode(str, Enum):
+    """Which of the two seat-selection experiences the user asked for."""
+
+    SIMPLE = "simple"
+    ADVANCED = "advanced"
+
 
 class ConfirmPhase(str, Enum):
     """How far a claimed confirmation got before it stopped.
@@ -118,6 +134,8 @@ class WizardState(str, Enum):
     AWAIT_DATE_RANGE = "await_date_range"
     AWAIT_TIME_RANGE = "await_time_range"
     AWAIT_QUANTITY = "await_quantity"
+    AWAIT_SEAT_MODE = "await_seat_mode"
+    AWAIT_SIMPLE_SEAT_PREFERENCE = "await_simple_seat_preference"
     AWAIT_PREFERRED_ROWS = "await_preferred_rows"
     AWAIT_PREFERRED_SEATS = "await_preferred_seats"
     AWAIT_EXCLUDED_ROWS = "await_excluded_rows"
@@ -360,6 +378,8 @@ _PREFERRED_INSTANT_PROMPT = f"{_INSTANT_EXAMPLE.capitalize()}."
 _INTERVAL_PROMPT = f"{_INTERVAL_EXAMPLE.capitalize()}."
 
 _QTY_PREFIX = "wizard:qty:"
+_SEAT_MODE_PREFIX = "wizard:seat-mode:"
+_SEAT_PREFERENCE_PREFIX = "wizard:seat-preference:"
 _MODE_PREFIX = "wizard:mode:"
 _CONFIRM = "wizard:confirm"
 _CANCEL = "wizard:cancel"
@@ -381,6 +401,59 @@ def _quantity_prompt() -> RenderedMessage:
     )
 
 
+def _seat_mode_prompt() -> RenderedMessage:
+    rows = [
+        [
+            InlineKeyboardButton(
+                text="Simple",
+                callback_data=f"{_SEAT_MODE_PREFIX}{SeatSetupMode.SIMPLE.value}",
+            ),
+            InlineKeyboardButton(
+                text="Advanced",
+                callback_data=f"{_SEAT_MODE_PREFIX}{SeatSetupMode.ADVANCED.value}",
+            ),
+        ]
+    ]
+    return RenderedMessage(
+        text="How would you like to choose acceptable seats?",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+def _simple_seat_preference_prompt() -> RenderedMessage:
+    rows = [
+        [
+            InlineKeyboardButton(
+                text="Only the best",
+                callback_data=(
+                    f"{_SEAT_PREFERENCE_PREFIX}"
+                    f"{SeatPreferenceStrategy.ONLY_BEST.value}"
+                ),
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="Best and good",
+                callback_data=(
+                    f"{_SEAT_PREFERENCE_PREFIX}"
+                    f"{SeatPreferenceStrategy.BEST_AND_GOOD.value}"
+                ),
+            )
+        ],
+    ]
+    return RenderedMessage(
+        text=(
+            "Choose a simple seat preference:\n\n"
+            "<b>Only the best</b>: middle seating bank between the aisles, "
+            "row J or farther back.\n"
+            "<b>Best and good</b>: the same middle bank, row C or farther back."
+        ),
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
 def _mode_prompt() -> RenderedMessage:
     rows = [
         [
@@ -397,6 +470,25 @@ def _mode_prompt() -> RenderedMessage:
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(rows),
     )
+
+
+def _seat_preference_strategy(
+    payload: Mapping[str, Any],
+) -> SeatPreferenceStrategy:
+    """Resolve the draft's seat preference strategy, defaulting to Advanced.
+
+    A legacy draft -- one never given a ``seat_preference_strategy`` because it was
+    created before this branch existed -- reads as Advanced, matching the only
+    behaviour it ever had.
+    """
+    raw = payload.get(
+        _SEAT_PREFERENCE_KEY,
+        SeatPreferenceStrategy.ADVANCED.value,
+    )
+    try:
+        return SeatPreferenceStrategy(raw)
+    except (TypeError, ValueError) as exc:
+        raise InputError("seat preference strategy is invalid") from exc
 
 
 def _build_criteria(payload: Mapping[str, Any]) -> WatchCriteria:
@@ -426,6 +518,7 @@ def _build_criteria(payload: Mapping[str, Any]) -> WatchCriteria:
         preferred_utc_instant=(
             datetime.fromisoformat(preferred_instant_raw) if preferred_instant_raw else None
         ),
+        seat_preference_strategy=_seat_preference_strategy(payload),
     )
 
 
@@ -438,14 +531,19 @@ def _review_prompt(payload: Mapping[str, Any]) -> RenderedMessage:
         f"Times: {criteria.time_from.strftime('%H:%M')} to {criteria.time_to.strftime('%H:%M')}",
         f"Seats: {criteria.quantity}",
     ]
-    if criteria.preferred_rows:
-        lines.append(f"Preferred rows: {', '.join(sorted(criteria.preferred_rows))}")
-    if criteria.preferred_seats:
-        lines.append(f"Preferred seats: {', '.join(sorted(criteria.preferred_seats))}")
-    if criteria.excluded_rows:
-        lines.append(f"Excluded rows: {', '.join(sorted(criteria.excluded_rows))}")
-    if criteria.excluded_seats:
-        lines.append(f"Excluded seats: {', '.join(sorted(criteria.excluded_seats))}")
+    if criteria.seat_preference_strategy is SeatPreferenceStrategy.ONLY_BEST:
+        lines.append("Seat preference: Only the best")
+    elif criteria.seat_preference_strategy is SeatPreferenceStrategy.BEST_AND_GOOD:
+        lines.append("Seat preference: Best and good")
+    else:
+        if criteria.preferred_rows:
+            lines.append(f"Preferred rows: {', '.join(sorted(criteria.preferred_rows))}")
+        if criteria.preferred_seats:
+            lines.append(f"Preferred seats: {', '.join(sorted(criteria.preferred_seats))}")
+        if criteria.excluded_rows:
+            lines.append(f"Excluded rows: {', '.join(sorted(criteria.excluded_rows))}")
+        if criteria.excluded_seats:
+            lines.append(f"Excluded seats: {', '.join(sorted(criteria.excluded_seats))}")
     if criteria.preferred_utc_instant is not None:
         when = criteria.preferred_utc_instant.astimezone(LONDON).strftime("%Y-%m-%d %H:%M")
         lines.append(f"Preferred time (London): {when}")
@@ -474,6 +572,10 @@ def _prompt_for(state: WizardState, payload: Mapping[str, Any]) -> RenderedMessa
         return _text_prompt(_TIME_RANGE_PROMPT)
     if state is WizardState.AWAIT_QUANTITY:
         return _quantity_prompt()
+    if state is WizardState.AWAIT_SEAT_MODE:
+        return _seat_mode_prompt()
+    if state is WizardState.AWAIT_SIMPLE_SEAT_PREFERENCE:
+        return _simple_seat_preference_prompt()
     if state is WizardState.AWAIT_PREFERRED_ROWS:
         return _text_prompt(_PREFERRED_ROWS_PROMPT)
     if state is WizardState.AWAIT_PREFERRED_SEATS:
@@ -513,7 +615,14 @@ _TEXT_STATES = frozenset(
     }
 )
 
-_CALLBACK_STATES = frozenset({WizardState.AWAIT_QUANTITY, WizardState.AWAIT_MODE})
+_CALLBACK_STATES = frozenset(
+    {
+        WizardState.AWAIT_QUANTITY,
+        WizardState.AWAIT_SEAT_MODE,
+        WizardState.AWAIT_SIMPLE_SEAT_PREFERENCE,
+        WizardState.AWAIT_MODE,
+    }
+)
 
 
 def _apply_text(
@@ -569,7 +678,48 @@ def _apply_callback(
         if not (1 <= quantity <= 8):
             raise InputError("choose a quantity between 1 and 8")
         payload["quantity"] = quantity
+        if payload.get(_SEAT_FLOW_VERSION_KEY) == _SEAT_FLOW_VERSION:
+            return WizardState.AWAIT_SEAT_MODE, payload
+        # A legacy draft -- no flow marker -- keeps its only historical behaviour:
+        # straight into the manual (Advanced) seat prompts.
+        payload[_SEAT_PREFERENCE_KEY] = SeatPreferenceStrategy.ADVANCED.value
         return WizardState.AWAIT_PREFERRED_ROWS, payload
+
+    if state is WizardState.AWAIT_SEAT_MODE:
+        if not data.startswith(_SEAT_MODE_PREFIX):
+            raise InputError("choose Simple or Advanced using the buttons above")
+        try:
+            seat_mode = SeatSetupMode(data[len(_SEAT_MODE_PREFIX) :])
+        except ValueError as exc:
+            raise InputError(
+                "choose Simple or Advanced using the buttons above"
+            ) from exc
+        if seat_mode is SeatSetupMode.ADVANCED:
+            payload[_SEAT_PREFERENCE_KEY] = SeatPreferenceStrategy.ADVANCED.value
+            return WizardState.AWAIT_PREFERRED_ROWS, payload
+        return WizardState.AWAIT_SIMPLE_SEAT_PREFERENCE, payload
+
+    if state is WizardState.AWAIT_SIMPLE_SEAT_PREFERENCE:
+        if not data.startswith(_SEAT_PREFERENCE_PREFIX):
+            raise InputError("choose one of the seat preferences above")
+        try:
+            strategy = SeatPreferenceStrategy(
+                data[len(_SEAT_PREFERENCE_PREFIX) :]
+            )
+        except ValueError as exc:
+            raise InputError("choose one of the seat preferences above") from exc
+        if strategy is SeatPreferenceStrategy.ADVANCED:
+            raise InputError("choose one of the seat preferences above")
+        payload[_SEAT_PREFERENCE_KEY] = strategy.value
+        for key in (
+            "preferred_rows",
+            "preferred_seats",
+            "excluded_rows",
+            "excluded_seats",
+        ):
+            payload.pop(key, None)
+        return WizardState.AWAIT_PREFERRED_INSTANT, payload
+
     # Only AWAIT_MODE remains among _CALLBACK_STATES.
     if not data.startswith(_MODE_PREFIX):
         raise InputError("choose one-off or recurring using the buttons above")
@@ -621,9 +771,16 @@ async def start_new(update: Update, deps: WizardDeps) -> RenderedMessage:
     a clean restart regardless of what state a previous, abandoned attempt was in.
     """
     user_id = _require_user(update)
+    payload = {_SEAT_FLOW_VERSION_KEY: _SEAT_FLOW_VERSION}
     async with deps.database.connection() as conn:
-        await deps.drafts.upsert(conn, user_id, WizardState.AWAIT_URL.value, {}, deps.clock.now())
-    return _prompt_for(WizardState.AWAIT_URL, {})
+        await deps.drafts.upsert(
+            conn,
+            user_id,
+            WizardState.AWAIT_URL.value,
+            payload,
+            deps.clock.now(),
+        )
+    return _prompt_for(WizardState.AWAIT_URL, payload)
 
 
 async def cancel(update: Update, deps: WizardDeps) -> RenderedMessage:
@@ -708,6 +865,10 @@ async def handle_wizard_callback(update: Update, deps: WizardDeps) -> RenderedMe
     if data == _CONFIRM:
         return await _confirm(user_id, deps)
     if state not in _CALLBACK_STATES:
+        if data.startswith((_SEAT_MODE_PREFIX, _SEAT_PREFERENCE_PREFIX)):
+            return _retry_prompt(
+                "that seat choice is no longer active; use the current prompt"
+            )
         return None
     try:
         next_state, payload = _apply_callback(state, dict(draft.payload), data)

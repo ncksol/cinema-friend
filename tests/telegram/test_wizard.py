@@ -27,12 +27,17 @@ from telegram import CallbackQuery, Chat, Message, Update, User
 
 from cinema_friend.domain.errors import BfiNetworkError, InputError, PersistenceError
 from cinema_friend.domain.results import CheckResult
-from cinema_friend.domain.state import CheckOutcome, CheckTrigger
+from cinema_friend.domain.state import (
+    CheckOutcome,
+    CheckTrigger,
+    SeatPreferenceStrategy,
+)
 from cinema_friend.domain.watch import Watch, WatchCriteria
 from cinema_friend.services.watch_service import WatchService
 from cinema_friend.storage.database import Database
 from cinema_friend.storage.draft_repository import DraftRepository
 from cinema_friend.storage.watch_repository import WatchRepository
+from cinema_friend.telegram.rendering import RenderedMessage
 from cinema_friend.telegram.wizard import (
     CLAIM_LEASE,
     MAX_ROW_WIDTH,
@@ -212,6 +217,12 @@ async def _drive_to_review(deps: WizardDeps) -> None:
     assert (await handle_wizard_text(_text_update("2026-08-26 to 2026-08-30"), deps)) is not None
     assert (await handle_wizard_text(_text_update("18:00 to 23:00"), deps)) is not None
     assert (await handle_wizard_callback(_callback_update("wizard:qty:2"), deps)) is not None
+    assert (
+        await handle_wizard_callback(
+            _callback_update("wizard:seat-mode:advanced"),
+            deps,
+        )
+    ) is not None
     assert (await handle_wizard_text(_text_update("skip"), deps)) is not None  # preferred rows
     assert (await handle_wizard_text(_text_update("skip"), deps)) is not None  # preferred seats
     assert (await handle_wizard_text(_text_update("skip"), deps)) is not None  # excluded rows
@@ -323,7 +334,7 @@ async def test_start_new_creates_a_draft_awaiting_the_url(deps: WizardDeps) -> N
         draft = await deps.drafts.get(conn, USER_ID)
     assert draft is not None
     assert draft.state == WizardState.AWAIT_URL.value
-    assert draft.payload == {}
+    assert draft.payload == {"seat_flow_version": 2}
 
 
 async def test_start_new_replaces_an_abandoned_draft(deps: WizardDeps) -> None:
@@ -336,7 +347,7 @@ async def test_start_new_replaces_an_abandoned_draft(deps: WizardDeps) -> None:
         draft = await deps.drafts.get(conn, USER_ID)
     assert draft is not None
     assert draft.state == WizardState.AWAIT_URL.value
-    assert draft.payload == {}
+    assert draft.payload == {"seat_flow_version": 2}
 
 
 async def test_cancel_deletes_the_draft(deps: WizardDeps) -> None:
@@ -401,7 +412,7 @@ async def test_invalid_url_leaves_draft_unchanged(deps: WizardDeps) -> None:
         draft = await deps.drafts.get(conn, USER_ID)
     assert draft is not None
     assert draft.state == WizardState.AWAIT_URL.value
-    assert draft.payload == {}
+    assert draft.payload == {"seat_flow_version": 2}
 
 
 async def test_invalid_quantity_leaves_draft_unchanged(deps: WizardDeps) -> None:
@@ -447,8 +458,296 @@ async def test_quantity_eight_is_accepted(deps: WizardDeps) -> None:
     async with deps.database.connection() as conn:
         draft = await deps.drafts.get(conn, USER_ID)
     assert draft is not None
-    assert draft.state == WizardState.AWAIT_PREFERRED_ROWS.value
+    assert draft.state == WizardState.AWAIT_SEAT_MODE.value
     assert draft.payload["quantity"] == 8
+
+
+# ---------------------------------------------------------------------------
+# Simple vs Advanced seat setup
+# ---------------------------------------------------------------------------
+
+
+async def _drive_to_quantity(deps: WizardDeps) -> None:
+    await start_new(_text_update("/new"), deps)
+    await handle_wizard_text(_text_update(FILM_URL), deps)
+    await handle_wizard_text(_text_update("2026-08-26 to 2026-08-30"), deps)
+    await handle_wizard_text(_text_update("18:00 to 23:00"), deps)
+
+
+def _callback_data(message: RenderedMessage) -> set[str]:
+    reply_markup = message.reply_markup
+    assert reply_markup is not None
+    return {
+        button.callback_data
+        for row in reply_markup.inline_keyboard
+        for button in row
+        if button.callback_data is not None
+    }
+
+
+async def test_new_quantity_choice_prompts_for_simple_or_advanced(
+    deps: WizardDeps,
+) -> None:
+    await _drive_to_quantity(deps)
+
+    reply = await handle_wizard_callback(
+        _callback_update("wizard:qty:2"),
+        deps,
+    )
+
+    assert reply is not None
+    draft = await _draft(deps)
+    assert draft is not None
+    assert draft.state == WizardState.AWAIT_SEAT_MODE.value
+    assert _callback_data(reply) == {
+        "wizard:seat-mode:simple",
+        "wizard:seat-mode:advanced",
+    }
+
+
+async def test_simple_mode_explains_both_presets_before_the_buttons(
+    deps: WizardDeps,
+) -> None:
+    await _drive_to_quantity(deps)
+    await handle_wizard_callback(_callback_update("wizard:qty:2"), deps)
+
+    reply = await handle_wizard_callback(
+        _callback_update("wizard:seat-mode:simple"),
+        deps,
+    )
+
+    assert reply is not None
+    assert "Only the best" in reply.text
+    assert "between the aisles" in reply.text
+    assert "row J" in reply.text
+    assert "Best and good" in reply.text
+    assert "row C" in reply.text
+    assert _callback_data(reply) == {
+        "wizard:seat-preference:only_best",
+        "wizard:seat-preference:best_and_good",
+    }
+
+
+@pytest.mark.parametrize(
+    ("callback", "strategy"),
+    [
+        (
+            "wizard:seat-preference:only_best",
+            SeatPreferenceStrategy.ONLY_BEST,
+        ),
+        (
+            "wizard:seat-preference:best_and_good",
+            SeatPreferenceStrategy.BEST_AND_GOOD,
+        ),
+    ],
+)
+async def test_simple_preset_skips_all_manual_seat_prompts(
+    deps: WizardDeps,
+    callback: str,
+    strategy: SeatPreferenceStrategy,
+) -> None:
+    await _drive_to_quantity(deps)
+    await handle_wizard_callback(_callback_update("wizard:qty:2"), deps)
+    await handle_wizard_callback(
+        _callback_update("wizard:seat-mode:simple"),
+        deps,
+    )
+
+    await handle_wizard_callback(_callback_update(callback), deps)
+
+    draft = await _draft(deps)
+    assert draft is not None
+    assert draft.state == WizardState.AWAIT_PREFERRED_INSTANT.value
+    assert draft.payload["seat_preference_strategy"] == strategy.value
+    assert {
+        "preferred_rows",
+        "preferred_seats",
+        "excluded_rows",
+        "excluded_seats",
+    }.isdisjoint(draft.payload)
+
+
+async def test_advanced_mode_keeps_the_existing_manual_flow(
+    deps: WizardDeps,
+) -> None:
+    await _drive_to_quantity(deps)
+    await handle_wizard_callback(_callback_update("wizard:qty:2"), deps)
+
+    await handle_wizard_callback(
+        _callback_update("wizard:seat-mode:advanced"),
+        deps,
+    )
+
+    draft = await _draft(deps)
+    assert draft is not None
+    assert draft.state == WizardState.AWAIT_PREFERRED_ROWS.value
+    assert draft.payload["seat_preference_strategy"] == "advanced"
+
+
+@pytest.mark.parametrize(
+    ("callback", "label"),
+    [
+        ("wizard:seat-preference:only_best", "Only the best"),
+        ("wizard:seat-preference:best_and_good", "Best and good"),
+    ],
+)
+async def test_simple_review_names_the_selected_preset(
+    deps: WizardDeps,
+    callback: str,
+    label: str,
+) -> None:
+    await _drive_to_quantity(deps)
+    await handle_wizard_callback(_callback_update("wizard:qty:2"), deps)
+    await handle_wizard_callback(
+        _callback_update("wizard:seat-mode:simple"),
+        deps,
+    )
+    await handle_wizard_callback(
+        _callback_update(callback),
+        deps,
+    )
+    await handle_wizard_text(_text_update("skip"), deps)
+
+    reply = await handle_wizard_callback(
+        _callback_update("wizard:mode:one_off"),
+        deps,
+    )
+
+    assert reply is not None
+    assert f"Seat preference: {label}" in reply.text
+    assert "Preferred rows:" not in reply.text
+    assert "Excluded seats:" not in reply.text
+
+
+async def test_advanced_review_keeps_manual_seat_details(
+    deps: WizardDeps,
+) -> None:
+    await _drive_to_quantity(deps)
+    await handle_wizard_callback(_callback_update("wizard:qty:2"), deps)
+    await handle_wizard_callback(
+        _callback_update("wizard:seat-mode:advanced"),
+        deps,
+    )
+    await handle_wizard_text(_text_update("L"), deps)
+    await handle_wizard_text(_text_update("L17"), deps)
+    await handle_wizard_text(_text_update("A"), deps)
+    await handle_wizard_text(_text_update("A1"), deps)
+    await handle_wizard_text(_text_update("skip"), deps)
+
+    reply = await handle_wizard_callback(
+        _callback_update("wizard:mode:one_off"),
+        deps,
+    )
+
+    assert reply is not None
+    assert "Preferred rows: L" in reply.text
+    assert "Preferred seats: L17" in reply.text
+    assert "Excluded rows: A" in reply.text
+    assert "Excluded seats: A1" in reply.text
+
+
+async def test_invalid_simple_preset_callback_leaves_the_draft_unchanged(
+    deps: WizardDeps,
+) -> None:
+    await _drive_to_quantity(deps)
+    await handle_wizard_callback(_callback_update("wizard:qty:2"), deps)
+    await handle_wizard_callback(
+        _callback_update("wizard:seat-mode:simple"),
+        deps,
+    )
+
+    reply = await handle_wizard_callback(
+        _callback_update("wizard:seat-preference:advanced"),
+        deps,
+    )
+
+    assert reply is not None
+    draft = await _draft(deps)
+    assert draft is not None
+    assert draft.state == WizardState.AWAIT_SIMPLE_SEAT_PREFERENCE.value
+    assert "seat_preference_strategy" not in draft.payload
+
+
+async def test_stale_seat_callback_leaves_the_current_step_unchanged(
+    deps: WizardDeps,
+) -> None:
+    await _drive_to_quantity(deps)
+    await handle_wizard_callback(_callback_update("wizard:qty:2"), deps)
+    await handle_wizard_callback(
+        _callback_update("wizard:seat-mode:advanced"),
+        deps,
+    )
+
+    reply = await handle_wizard_callback(
+        _callback_update("wizard:seat-mode:simple"),
+        deps,
+    )
+
+    assert reply is not None
+    assert "no longer active" in reply.text
+    draft = await _draft(deps)
+    assert draft is not None
+    assert draft.state == WizardState.AWAIT_PREFERRED_ROWS.value
+    assert draft.payload["seat_preference_strategy"] == "advanced"
+
+
+async def test_legacy_quantity_draft_continues_as_advanced(
+    deps: WizardDeps,
+) -> None:
+    await _seed_state(deps, WizardState.AWAIT_QUANTITY, {})
+
+    await handle_wizard_callback(_callback_update("wizard:qty:2"), deps)
+
+    draft = await _draft(deps)
+    assert draft is not None
+    assert draft.state == WizardState.AWAIT_PREFERRED_ROWS.value
+    assert draft.payload["seat_preference_strategy"] == "advanced"
+
+
+@pytest.mark.parametrize(
+    ("state", "expected"),
+    [
+        (WizardState.AWAIT_PREFERRED_ROWS, WizardState.AWAIT_PREFERRED_SEATS),
+        (WizardState.AWAIT_PREFERRED_SEATS, WizardState.AWAIT_EXCLUDED_ROWS),
+        (WizardState.AWAIT_EXCLUDED_ROWS, WizardState.AWAIT_EXCLUDED_SEATS),
+        (WizardState.AWAIT_EXCLUDED_SEATS, WizardState.AWAIT_PREFERRED_INSTANT),
+        (WizardState.AWAIT_PREFERRED_INSTANT, WizardState.AWAIT_MODE),
+    ],
+)
+async def test_legacy_manual_draft_resumes_without_a_flow_marker(
+    deps: WizardDeps,
+    state: WizardState,
+    expected: WizardState,
+) -> None:
+    await _seed_state(deps, state, {})
+
+    reply = await handle_wizard_text(_text_update("skip"), deps)
+
+    assert reply is not None
+    draft = await _draft(deps)
+    assert draft is not None
+    assert draft.state == expected.value
+    assert "seat_flow_version" not in draft.payload
+
+
+async def test_legacy_review_draft_confirms_as_advanced(
+    deps: WizardDeps,
+) -> None:
+    await _drive_to_review(deps)
+    draft = await _draft(deps)
+    assert draft is not None
+    legacy_payload = dict(draft.payload)
+    legacy_payload.pop("seat_flow_version")
+    legacy_payload.pop("seat_preference_strategy")
+    await _seed_state(deps, WizardState.REVIEW, legacy_payload)
+
+    await handle_wizard_callback(_callback_update("wizard:confirm"), deps)
+
+    (watch,) = await deps.watches.list_for_owner(USER_ID)
+    assert (
+        watch.criteria.seat_preference_strategy
+        is SeatPreferenceStrategy.ADVANCED
+    )
 
 
 async def _drive_to_preferred_instant(
@@ -463,6 +762,12 @@ async def _drive_to_preferred_instant(
     await handle_wizard_text(_text_update(dates), deps)
     await handle_wizard_text(_text_update(times), deps)
     await handle_wizard_callback(_callback_update("wizard:qty:2"), deps)
+    assert (
+        await handle_wizard_callback(
+            _callback_update("wizard:seat-mode:advanced"),
+            deps,
+        )
+    ) is not None
     for _ in range(4):  # preferred rows/seats, excluded rows/seats
         await handle_wizard_text(_text_update("skip"), deps)
 
@@ -597,6 +902,12 @@ async def _drive_recurring_to_interval(deps: WizardDeps) -> None:
     await handle_wizard_text(_text_update("2026-08-26 to 2026-08-30"), deps)
     await handle_wizard_text(_text_update("18:00 to 23:00"), deps)
     await handle_wizard_callback(_callback_update("wizard:qty:2"), deps)
+    assert (
+        await handle_wizard_callback(
+            _callback_update("wizard:seat-mode:advanced"),
+            deps,
+        )
+    ) is not None
     await handle_wizard_text(_text_update("skip"), deps)
     await handle_wizard_text(_text_update("skip"), deps)
     await handle_wizard_text(_text_update("skip"), deps)

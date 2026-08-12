@@ -251,9 +251,12 @@ Message your bot on Telegram and send `/help`.
 2. **Date range**: `2026-08-26 to 2026-08-30`
 3. **Time window**: `18:00 to 22:30`, applied to each day in the range
 4. **Seats**: `1` to `8`, chosen from buttons
-5. **Preferred rows**: `L,M`, or `skip`
-6. **Preferred seats**: `L16-L22,M17`, or `skip`
-7. **Rows and seats to exclude**: same formats, or `skip`
+5. **Seat selection**: Simple or Advanced
+6. **Simple preference**: **Only the best** keeps the middle seating bank between the
+   aisles from row J back; **Best and good** keeps the same middle bank from row C back.
+   Seats outside the chosen preset are excluded.
+7. **Advanced seat controls**: optional preferred and excluded rows and exact seats,
+   using formats such as `L,M` and `L16-L22,M17`
 8. **Preferred time**: a specific showing you would rather have, or `skip`
 9. **One-off or recurring**: one-off checks until it finds something; recurring keeps
    checking on an interval

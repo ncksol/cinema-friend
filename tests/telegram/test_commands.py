@@ -932,4 +932,4 @@ async def test_wizard_button_advances_a_draft(harness: Harness) -> None:
     async with harness.database.connection() as conn:
         draft = await harness.drafts.get(conn, USER_ID)
     assert draft is not None
-    assert draft.state == WizardState.AWAIT_PREFERRED_ROWS.value
+    assert draft.state == WizardState.AWAIT_SEAT_MODE.value
