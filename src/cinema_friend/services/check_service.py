@@ -255,7 +255,12 @@ class CheckService:
             known_keys = await self._notifications.known_keys(conn, watch.watch_id)
             state = await self._notifications.state(conn, watch.watch_id)
             decision = decide_result_notification(
-                trigger, options, known_keys, state.last_best_rank, watch.user_id
+                trigger,
+                watch.criteria.mode,
+                options,
+                known_keys,
+                state.last_best_rank,
+                watch.user_id,
             )
             snapshot = await self._results.complete_with_snapshot(
                 conn,

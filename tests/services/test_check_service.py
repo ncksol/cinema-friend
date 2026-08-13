@@ -599,18 +599,58 @@ async def test_manual_check_preserves_an_existing_recurring_next_run_at(
     assert stored.last_check_at == harness.clock.now()
 
 
-@pytest.mark.parametrize("trigger", [CheckTrigger.MANUAL, CheckTrigger.CREATION])
-async def test_owner_initiated_checks_always_queue_a_delivery(
-    harness: Harness, trigger: CheckTrigger
+async def test_empty_recurring_creation_queues_initial_empty_delivery(
+    harness: Harness,
 ) -> None:
-    """Nothing found, nothing changed -- but the owner asked, so they get an answer."""
     harness.gateway.performances = []
     watch = await harness.add_watch()
+
+    await harness.service.check(watch.watch_id, CheckTrigger.CREATION)
+
+    deliveries = await harness.deliveries()
+    assert [delivery.payload.kind for delivery in deliveries] == [
+        "initial_recurring_empty"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("trigger", "watch_criteria"),
+    [
+        (CheckTrigger.MANUAL, criteria()),
+        (CheckTrigger.CREATION, one_off_criteria()),
+    ],
+)
+async def test_other_owner_initiated_empty_checks_queue_results(
+    harness: Harness,
+    trigger: CheckTrigger,
+    watch_criteria: WatchCriteria,
+) -> None:
+    harness.gateway.performances = []
+    watch = await harness.add_watch(watch_criteria=watch_criteria)
 
     await harness.service.check(watch.watch_id, trigger)
 
     deliveries = await harness.deliveries()
     assert [delivery.payload.kind for delivery in deliveries] == ["results"]
+
+
+async def test_empty_recurring_creation_notifies_once_then_scheduled_empty_is_silent(
+    harness: Harness,
+) -> None:
+    harness.gateway.performances = []
+    watch = await harness.add_watch()
+
+    await harness.service.check(watch.watch_id, CheckTrigger.CREATION)
+
+    first_delivery = (await harness.deliveries())[0]
+    async with harness.database.connection() as conn:
+        await harness.notifications.mark_delivered(
+            conn, first_delivery.delivery_id, (), None, NOW
+        )
+
+    await harness.service.check(watch.watch_id, CheckTrigger.SCHEDULED)
+
+    assert await harness.deliveries() == ()
 
 
 async def test_scheduled_check_with_nothing_new_writes_a_snapshot_but_no_delivery(

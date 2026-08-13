@@ -14,9 +14,10 @@ from dataclasses import dataclass
 from uuid import UUID
 
 from cinema_friend.domain.results import HostCircuit, NotificationPayload, RankedOption, RankVector
-from cinema_friend.domain.state import CheckTrigger
+from cinema_friend.domain.state import CheckTrigger, WatchMode
 
 _RESULTS_KIND = "results"
+INITIAL_RECURRING_EMPTY_KIND = "initial_recurring_empty"
 _DEGRADATION_KIND = "degradation"
 _RECOVERY_KIND = "recovery"
 _CONTRACT_ERROR_KIND = "contract_error"
@@ -76,6 +77,7 @@ def _best_rank(options: Sequence[RankedOption]) -> RankVector | None:
 
 def decide_result_notification(
     trigger: CheckTrigger,
+    mode: WatchMode,
     options: Sequence[RankedOption],
     known_keys: frozenset[str],
     last_best: RankVector | None,
@@ -85,11 +87,14 @@ def decide_result_notification(
 
     A manual check or the immediate check creating a watch schedules always responds,
     even with no options and no change, because the owner explicitly asked (directly,
-    for manual; by creating the watch, for creation). A scheduled or recovery check
-    stays silent unless there is something genuinely new: an option whose key was never
-    surfaced before (regardless of how it ranks), or a strict improvement in the best
-    rank on offer compared with what was last announced. A previously known option
-    disappearing, or the best rank only getting worse, is not news on its own.
+    for manual; by creating the watch, for creation). The empty immediate check for a
+    recurring watch gets its own event kind so later Telegram tasks can render it
+    specially; the same empty check for a one-off watch still reads as a normal results
+    notification. A scheduled or recovery check stays silent unless there is something
+    genuinely new: an option whose key was never surfaced before (regardless of how it
+    ranks), or a strict improvement in the best rank on offer compared with what was
+    last announced. A previously known option disappearing, or the best rank only
+    getting worse, is not news on its own.
     """
     current_keys = frozenset(option.key for option in options)
     new_keys = current_keys - known_keys
@@ -100,8 +105,13 @@ def decide_result_notification(
         and best_rank.sort_key() < last_best.sort_key()
     )
     requires_snapshot = trigger in _ALWAYS_NOTIFY_TRIGGERS or bool(new_keys) or rank_improved
+    kind = (
+        INITIAL_RECURRING_EMPTY_KIND
+        if trigger is CheckTrigger.CREATION and mode is WatchMode.RECURRING and not options
+        else _RESULTS_KIND
+    )
     return NotificationDecision(
-        kind=_RESULTS_KIND,
+        kind=kind,
         recipient_user_id=recipient_user_id,
         new_option_keys=new_keys,
         all_option_keys=current_keys,
