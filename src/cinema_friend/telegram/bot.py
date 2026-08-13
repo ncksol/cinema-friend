@@ -52,6 +52,7 @@ from cinema_friend.config import Settings
 from cinema_friend.domain.errors import AuthorizationError, InputError
 from cinema_friend.domain.results import NotificationDelivery, RankVector
 from cinema_friend.services.watch_service import WatchService
+from cinema_friend.services.notification_policy import INITIAL_RECURRING_EMPTY_KIND
 from cinema_friend.storage.database import Database
 from cinema_friend.storage.draft_repository import DraftRepository
 from cinema_friend.storage.notification_repository import NotificationRepository
@@ -72,7 +73,11 @@ from cinema_friend.telegram.commands import (
     handle_watches,
     handle_wizard_button,
 )
-from cinema_friend.telegram.rendering import RenderedMessage, render_result_page
+from cinema_friend.telegram.rendering import (
+    RenderedMessage,
+    render_initial_recurring_empty_page,
+    render_result_page,
+)
 from cinema_friend.telegram.wizard import CheckRunner, WizardDeps
 
 _LOGGER = logging.getLogger(__name__)
@@ -436,6 +441,10 @@ class DeliveryWorker:
         payload = delivery.payload
         if payload.kind == _RESULTS_KIND:
             return await self._render_results(payload.snapshot_id)
+        if payload.kind == INITIAL_RECURRING_EMPTY_KIND:
+            return await self._render_results(
+                payload.snapshot_id, initial_recurring_empty=True
+            )
         if payload.kind == _CONTRACT_ERROR_KIND:
             return _Renderable(
                 message=_plain(
@@ -465,7 +474,9 @@ class DeliveryWorker:
             return None
         return _title(watch.title)
 
-    async def _render_results(self, snapshot_id: UUID | None) -> _Renderable:
+    async def _render_results(
+        self, snapshot_id: UUID | None, *, initial_recurring_empty: bool = False
+    ) -> _Renderable:
         """Render the *referenced* snapshot, never the watch's latest.
 
         A page that silently upgraded itself to newer results would contradict the
@@ -493,7 +504,12 @@ class DeliveryWorker:
             key=lambda vector: vector.sort_key(),
             default=None,
         )
-        return _Renderable(render_result_page(page), keys, best)
+        message = (
+            render_initial_recurring_empty_page(page)
+            if initial_recurring_empty
+            else render_result_page(page)
+        )
+        return _Renderable(message, keys, best)
 
 
 # ---------------------------------------------------------------------------

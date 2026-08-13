@@ -40,6 +40,7 @@ from cinema_friend.domain.results import (
 from cinema_friend.domain.state import CheckOutcome, CheckTrigger, WatchMode, WatchStatus
 from cinema_friend.domain.watch import Watch, WatchCriteria
 from cinema_friend.services.watch_service import WatchService
+from cinema_friend.services.notification_policy import INITIAL_RECURRING_EMPTY_KIND
 from cinema_friend.storage.database import Database
 from cinema_friend.storage.draft_repository import DraftRepository
 from cinema_friend.storage.notification_repository import NotificationRepository
@@ -245,11 +246,15 @@ async def _queue(
     return delivery.delivery_id
 
 
-def _results_payload(snapshot_id: UUID, *, watch_id: UUID = WATCH_ID, new: int = 3) -> (
-    NotificationPayload
-):
+def _results_payload(
+    snapshot_id: UUID,
+    *,
+    watch_id: UUID = WATCH_ID,
+    new: int = 3,
+    kind: str = "results",
+) -> NotificationPayload:
     return NotificationPayload(
-        kind="results",
+        kind=kind,
         recipient_user_id=USER_ID,
         watch_id=watch_id,
         snapshot_id=snapshot_id,
@@ -289,6 +294,29 @@ async def test_successful_delivery_marks_every_snapshot_option_known(harness: Ha
     assert state.last_best_rank.sort_key() == _option(0).rank_vector.sort_key()
     row = await _delivery_row(harness, delivery_id)
     assert row["status"] == DeliveryStatus.SENT.value
+
+
+async def test_initial_recurring_empty_delivery_uses_keep_watching_copy(
+    harness: Harness,
+) -> None:
+    watch = await _seed_watch(harness)
+    snapshot_id, _ = await _seed_snapshot(harness, watch.watch_id, 0)
+    await _queue(
+        harness,
+        _results_payload(
+            snapshot_id,
+            new=0,
+            kind=INITIAL_RECURRING_EMPTY_KIND,
+        ),
+    )
+
+    await harness.worker.run_once()
+
+    text = harness.bot.sent[0]["text"]
+    assert "Dog Stars" in text
+    assert "Checked:" in text
+    assert "I haven't found anything right now, but I'll keep watching." in text
+    assert "No matching seats" not in text
 
 
 async def test_successful_delivery_renders_the_referenced_snapshot(harness: Harness) -> None:
