@@ -14,7 +14,7 @@ from uuid import UUID
 
 import aiosqlite
 
-from cinema_friend.domain.state import WatchMode, WatchStatus
+from cinema_friend.domain.state import SeatPreferenceStrategy, WatchMode, WatchStatus
 from cinema_friend.domain.watch import Watch, WatchCriteria
 from cinema_friend.storage.database import decode_datetime, encode_datetime
 
@@ -30,6 +30,7 @@ def _encode_criteria(criteria: WatchCriteria) -> str:
         "time_to": criteria.time_to.isoformat(),
         "quantity": criteria.quantity,
         "mode": criteria.mode.value,
+        "seat_preference_strategy": criteria.seat_preference_strategy.value,
         "interval_seconds": (
             int(criteria.interval.total_seconds()) if criteria.interval is not None else None
         ),
@@ -60,6 +61,9 @@ def _decode_criteria(data: str) -> WatchCriteria:
         quantity=payload["quantity"],
         mode=WatchMode(payload["mode"]),
         interval=timedelta(seconds=interval_seconds) if interval_seconds is not None else None,
+        seat_preference_strategy=SeatPreferenceStrategy(
+            payload.get("seat_preference_strategy", SeatPreferenceStrategy.ADVANCED.value)
+        ),
         preferred_seats=frozenset(payload["preferred_seats"]),
         excluded_seats=frozenset(payload["excluded_seats"]),
         preferred_rows=frozenset(payload["preferred_rows"]),

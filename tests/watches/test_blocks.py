@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import date, time
 
+import pytest
+
 from cinema_friend.domain.bfi import PriceZone, Seat, SeatMap, SeatStatus
-from cinema_friend.domain.state import WatchMode
+from cinema_friend.domain.state import SeatPreferenceStrategy, WatchMode
 from cinema_friend.domain.watch import WatchCriteria
 from cinema_friend.watches.blocks import generate_blocks
 
@@ -17,6 +20,7 @@ def criteria_for(
     quantity: int = 2,
     excluded_seats: frozenset[str] = frozenset(),
     excluded_rows: frozenset[str] = frozenset(),
+    seat_preference_strategy: SeatPreferenceStrategy = SeatPreferenceStrategy.ADVANCED,
 ) -> WatchCriteria:
     return WatchCriteria(
         source_url="https://whatson.bfi.org.uk/imax/Online/default.asp",
@@ -29,6 +33,7 @@ def criteria_for(
         mode=WatchMode.ONE_OFF,
         excluded_seats=excluded_seats,
         excluded_rows=excluded_rows,
+        seat_preference_strategy=seat_preference_strategy,
     )
 
 
@@ -191,6 +196,28 @@ def test_quantity_larger_than_run_yields_no_blocks() -> None:
     assert blocks == ()
 
 
+def test_numbering_gap_breaks_advanced_purchasable_run_without_creating_an_aisle() -> None:
+    columns = [1, 2, 4, 5, 6, 7, 9, 10, 11, 12, 13]
+    seats = [
+        seat("J", column, index * 10.0)
+        for index, column in enumerate(columns)
+    ]
+    seat_map = SeatMap(performance_id="p1", seats=tuple(seats))
+
+    blocks = generate_blocks(seat_map, criteria_for(quantity=2))
+
+    assert {tuple(seat.column for seat in block.seats) for block in blocks} == {
+        (1, 2),
+        (4, 5),
+        (5, 6),
+        (6, 7),
+        (9, 10),
+        (10, 11),
+        (11, 12),
+        (12, 13),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Fix round 1: section identity gates adjacency, independent of row/geometry
 # ---------------------------------------------------------------------------
@@ -219,3 +246,240 @@ def test_different_sections_same_row_never_form_a_cross_section_block() -> None:
     # Each section still independently forms its own adjacent-seat blocks.
     assert ("L4", "L5") in labels
     assert ("L6", "L7") in labels
+
+
+# ---------------------------------------------------------------------------
+# Task 2: Simple preset hard-filter tests
+# ---------------------------------------------------------------------------
+
+
+def _three_bank_row(
+    row: str,
+    *,
+    section: str = "BFI IMAX",
+    x_offset: float = 0.0,
+) -> list[Seat]:
+    return [
+        seat(row, column, x + x_offset, section=section)
+        for column, x in enumerate(
+            [0.0, 10.0, 20.0, 70.0, 80.0, 90.0, 140.0, 150.0, 160.0],
+            start=1,
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    ("strategy", "front_row", "cutoff_row", "back_row"),
+    [
+        (SeatPreferenceStrategy.ONLY_BEST, "I", "J", "K"),
+        (SeatPreferenceStrategy.BEST_AND_GOOD, "B", "C", "D"),
+    ],
+)
+def test_simple_strategy_keeps_only_the_center_bank_at_and_behind_its_cutoff(
+    strategy: SeatPreferenceStrategy,
+    front_row: str,
+    cutoff_row: str,
+    back_row: str,
+) -> None:
+    seats = [
+        *_three_bank_row(front_row),
+        *_three_bank_row(cutoff_row),
+        *_three_bank_row(back_row),
+    ]
+    seat_map = SeatMap(performance_id="p1", seats=tuple(seats))
+
+    blocks = generate_blocks(
+        seat_map,
+        criteria_for(quantity=2, seat_preference_strategy=strategy),
+    )
+
+    assert {(block.row, tuple(seat.column for seat in block.seats)) for block in blocks} == {
+        (cutoff_row, (4, 5)),
+        (cutoff_row, (5, 6)),
+        (back_row, (4, 5)),
+        (back_row, (5, 6)),
+    }
+
+
+def test_simple_quantity_one_still_requires_the_center_bank() -> None:
+    seat_map = SeatMap(performance_id="p1", seats=tuple(_three_bank_row("J")))
+
+    blocks = generate_blocks(
+        seat_map,
+        criteria_for(
+            quantity=1,
+            seat_preference_strategy=SeatPreferenceStrategy.ONLY_BEST,
+        ),
+    )
+
+    assert {block.seats[0].label for block in blocks} == {"J4", "J5", "J6"}
+
+
+def test_simple_strategy_evaluates_overlapping_sections_independently() -> None:
+    seats = [
+        *_three_bank_row("J", section="Stalls"),
+        *_three_bank_row("J", section="Balcony", x_offset=10.0),
+    ]
+    seat_map = SeatMap(performance_id="p1", seats=tuple(seats))
+
+    blocks = generate_blocks(
+        seat_map,
+        criteria_for(
+            quantity=2,
+            seat_preference_strategy=SeatPreferenceStrategy.ONLY_BEST,
+        ),
+    )
+
+    assert {
+        (block.seats[0].section, tuple(seat.column for seat in block.seats))
+        for block in blocks
+    } == {
+        ("Stalls", (4, 5)),
+        ("Stalls", (5, 6)),
+        ("Balcony", (4, 5)),
+        ("Balcony", (5, 6)),
+    }
+
+
+def test_weak_section_does_not_void_a_well_formed_section() -> None:
+    seats = [
+        *_three_bank_row("J", section="Main"),
+        *[
+            seat("J", column, 300.0 + column * 10.0, section="Side")
+            for column in range(1, 4)
+        ],
+    ]
+    seat_map = SeatMap(performance_id="p1", seats=tuple(seats))
+
+    blocks = generate_blocks(
+        seat_map,
+        criteria_for(
+            quantity=2,
+            seat_preference_strategy=SeatPreferenceStrategy.ONLY_BEST,
+        ),
+    )
+
+    assert {
+        (block.seats[0].section, tuple(seat.column for seat in block.seats))
+        for block in blocks
+    } == {
+        ("Main", (4, 5)),
+        ("Main", (5, 6)),
+    }
+
+
+def test_simple_strategy_fails_closed_and_logs_when_center_geometry_is_ambiguous(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    seats = [
+        seat("J", column, x)
+        for column, x in enumerate(
+            [0.0, 10.0, 20.0, 30.0, 70.0, 80.0, 90.0, 100.0],
+            start=1,
+        )
+    ]
+    seat_map = SeatMap(performance_id="p1", seats=tuple(seats))
+
+    with caplog.at_level(logging.WARNING):
+        blocks = generate_blocks(
+            seat_map,
+            criteria_for(
+                quantity=1,
+                seat_preference_strategy=SeatPreferenceStrategy.ONLY_BEST,
+            ),
+        )
+
+    assert blocks == ()
+    assert "could not identify a unique center bank" in caplog.text
+
+
+def test_simple_strategy_fails_closed_and_logs_when_geometry_is_insufficient(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    seat_map = SeatMap(
+        performance_id="p1",
+        seats=(
+            seat("J", 1, 0.0),
+            seat("J", 2, 10.0),
+            seat("J", 3, 20.0),
+        ),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        blocks = generate_blocks(
+            seat_map,
+            criteria_for(
+                quantity=1,
+                seat_preference_strategy=SeatPreferenceStrategy.ONLY_BEST,
+            ),
+        )
+
+    assert blocks == ()
+    assert "could not identify a unique center bank" in caplog.text
+
+
+def test_simple_strategy_fails_closed_and_logs_for_an_unsupported_row_label(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    seat_map = SeatMap(performance_id="p1", seats=tuple(_three_bank_row("AA")))
+
+    with caplog.at_level(logging.WARNING):
+        blocks = generate_blocks(
+            seat_map,
+            criteria_for(
+                quantity=1,
+                seat_preference_strategy=SeatPreferenceStrategy.BEST_AND_GOOD,
+            ),
+        )
+
+    assert blocks == ()
+    assert "unsupported row label" in caplog.text
+
+
+def test_simple_strategy_aggregates_each_diagnostic_once_per_seat_map(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    unresolved_rows = [
+        seat(row, column, x)
+        for row in ("J", "K")
+        for column, x in enumerate([0.0, 10.0, 20.0, 30.0, 70.0, 80.0, 90.0, 100.0], start=1)
+    ]
+    unsupported_rows = [
+        *_three_bank_row("AA"),
+        *_three_bank_row("BB"),
+    ]
+    seat_map = SeatMap(
+        performance_id="p1",
+        seats=tuple(unresolved_rows + unsupported_rows),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        blocks = generate_blocks(
+            seat_map,
+            criteria_for(
+                quantity=1,
+                seat_preference_strategy=SeatPreferenceStrategy.ONLY_BEST,
+            ),
+        )
+
+    assert blocks == ()
+    unsupported_warnings = [
+        record for record in caplog.records if "unsupported row label" in record.getMessage()
+    ]
+    unresolved_warnings = [
+        record
+        for record in caplog.records
+        if "could not identify a unique center bank" in record.getMessage()
+    ]
+    assert len(unsupported_warnings) == 1
+    assert len(unresolved_warnings) == 1
+    assert sorted(unsupported_warnings[0].rows) == ["AA", "BB"]
+    assert sorted(unresolved_warnings[0].rows) == ["J", "K"]
+    assert sorted(unsupported_warnings[0].section_rows) == [
+        "BFI IMAX/AA",
+        "BFI IMAX/BB",
+    ]
+    assert sorted(unresolved_warnings[0].section_rows) == [
+        "BFI IMAX/J",
+        "BFI IMAX/K",
+    ]

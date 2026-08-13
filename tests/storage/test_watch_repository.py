@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator
 from dataclasses import replace
 from datetime import UTC, date, datetime, time, timedelta
@@ -11,7 +12,7 @@ from uuid import UUID
 import aiosqlite
 import pytest
 
-from cinema_friend.domain.state import WatchMode, WatchStatus
+from cinema_friend.domain.state import SeatPreferenceStrategy, WatchMode, WatchStatus
 from cinema_friend.domain.watch import Watch, WatchCriteria
 from cinema_friend.storage.database import Database
 from cinema_friend.storage.watch_repository import WatchRepository
@@ -86,6 +87,62 @@ async def test_create_and_get_round_trip(
     fetched = await repo.get(conn, watch.watch_id)
 
     assert fetched == watch
+
+
+@pytest.mark.parametrize(
+    "strategy",
+    [
+        SeatPreferenceStrategy.ONLY_BEST,
+        SeatPreferenceStrategy.BEST_AND_GOOD,
+    ],
+)
+async def test_simple_seat_preference_strategy_round_trips(
+    conn: aiosqlite.Connection,
+    repo: WatchRepository,
+    strategy: SeatPreferenceStrategy,
+) -> None:
+    watch = _watch(criteria=_criteria(seat_preference_strategy=strategy))
+
+    await repo.create(conn, watch)
+
+    assert await repo.get(conn, watch.watch_id) == watch
+
+
+async def test_new_criteria_json_writes_an_explicit_advanced_strategy(
+    conn: aiosqlite.Connection,
+    repo: WatchRepository,
+) -> None:
+    await repo.create(conn, _watch())
+
+    cursor = await conn.execute(
+        "SELECT criteria_json FROM watches WHERE id = ?", (str(_uuid(1)),)
+    )
+    row = await cursor.fetchone()
+
+    assert row is not None
+    assert json.loads(row["criteria_json"])["seat_preference_strategy"] == "advanced"
+
+
+async def test_legacy_criteria_without_a_strategy_decode_as_advanced(
+    conn: aiosqlite.Connection,
+    repo: WatchRepository,
+) -> None:
+    watch = _watch()
+    await repo.create(conn, watch)
+    cursor = await conn.execute("SELECT criteria_json FROM watches WHERE id = ?", (str(watch.watch_id),))
+    row = await cursor.fetchone()
+    assert row is not None
+    legacy_payload = json.loads(row["criteria_json"])
+    legacy_payload.pop("seat_preference_strategy", None)
+    await conn.execute(
+        "UPDATE watches SET criteria_json = ? WHERE id = ?",
+        (json.dumps(legacy_payload, sort_keys=True), str(watch.watch_id)),
+    )
+
+    fetched = await repo.get(conn, watch.watch_id)
+
+    assert fetched is not None
+    assert fetched.criteria.seat_preference_strategy is SeatPreferenceStrategy.ADVANCED
 
 
 async def test_create_stores_the_canonical_uuid_string(

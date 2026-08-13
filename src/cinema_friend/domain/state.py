@@ -5,6 +5,12 @@ from __future__ import annotations
 from enum import Enum
 
 
+class SeatPreferenceStrategy(Enum):
+    ADVANCED = "advanced"
+    ONLY_BEST = "only_best"
+    BEST_AND_GOOD = "best_and_good"
+
+
 class WatchMode(Enum):
     ONE_OFF = "one_off"
     RECURRING = "recurring"

@@ -6,7 +6,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from cinema_friend.domain.errors import InputError
-from cinema_friend.domain.state import WatchMode, WatchStatus
+from cinema_friend.domain.state import SeatPreferenceStrategy, WatchMode, WatchStatus
 from cinema_friend.domain.watch import Watch, WatchCriteria
 
 
@@ -51,6 +51,48 @@ def test_quantity_out_of_range():
             time_to=time(23, 0),
             quantity=9,
             mode=WatchMode.ONE_OFF,
+        )
+
+
+def test_seat_preference_strategy_defaults_to_advanced():
+    criteria = WatchCriteria(**_BASE)
+
+    assert criteria.seat_preference_strategy is SeatPreferenceStrategy.ADVANCED
+
+
+@pytest.mark.parametrize(
+    "strategy",
+    [
+        SeatPreferenceStrategy.ONLY_BEST,
+        SeatPreferenceStrategy.BEST_AND_GOOD,
+    ],
+)
+def test_simple_seat_preference_accepts_empty_manual_criteria(
+    strategy: SeatPreferenceStrategy,
+):
+    criteria = WatchCriteria(**_BASE, seat_preference_strategy=strategy)
+
+    assert criteria.seat_preference_strategy is strategy
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("preferred_rows", frozenset({"L"})),
+        ("preferred_seats", frozenset({"L17"})),
+        ("excluded_rows", frozenset({"A"})),
+        ("excluded_seats", frozenset({"A1"})),
+    ],
+)
+def test_simple_seat_preference_rejects_manual_criteria(
+    field: str,
+    value: frozenset[str],
+):
+    with pytest.raises(InputError, match="manual seat criteria"):
+        WatchCriteria(
+            **_BASE,
+            seat_preference_strategy=SeatPreferenceStrategy.ONLY_BEST,
+            **{field: value},
         )
 
 

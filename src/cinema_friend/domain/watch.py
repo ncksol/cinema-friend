@@ -7,7 +7,7 @@ from datetime import date, datetime, time, timedelta
 from uuid import UUID
 
 from cinema_friend.domain.errors import InputError
-from cinema_friend.domain.state import WatchMode, WatchStatus
+from cinema_friend.domain.state import SeatPreferenceStrategy, WatchMode, WatchStatus
 from cinema_friend.domain.time_window import LONDON, within_daily_window
 
 
@@ -22,6 +22,7 @@ class WatchCriteria:
     quantity: int
     mode: WatchMode
     interval: timedelta | None = None
+    seat_preference_strategy: SeatPreferenceStrategy = SeatPreferenceStrategy.ADVANCED
     preferred_seats: frozenset[str] = field(default_factory=frozenset)
     excluded_seats: frozenset[str] = field(default_factory=frozenset)
     preferred_rows: frozenset[str] = field(default_factory=frozenset)
@@ -31,6 +32,16 @@ class WatchCriteria:
     def __post_init__(self) -> None:
         if not (1 <= self.quantity <= 8):
             raise InputError("quantity must be between 1 and 8")
+        manual_seat_criteria = (
+            self.preferred_seats or self.excluded_seats or self.preferred_rows or self.excluded_rows
+        )
+        if (
+            self.seat_preference_strategy is not SeatPreferenceStrategy.ADVANCED
+            and manual_seat_criteria
+        ):
+            raise InputError(
+                "simple seat preferences cannot be combined with manual seat criteria"
+            )
         if self.date_from > self.date_to:
             raise InputError("date_from must not be after date_to")
         if self.mode is WatchMode.RECURRING:
