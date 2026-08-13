@@ -288,6 +288,7 @@ class CheckService:
                         new_option_count=len(decision.new_option_keys),
                         host=None,
                         recovery_text=None,
+                        initial_recurring_empty=decision.initial_recurring_empty,
                     ),
                     completed_at,
                 )

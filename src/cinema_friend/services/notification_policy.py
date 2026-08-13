@@ -17,7 +17,6 @@ from cinema_friend.domain.results import HostCircuit, NotificationPayload, Ranke
 from cinema_friend.domain.state import CheckTrigger, WatchMode
 
 _RESULTS_KIND = "results"
-INITIAL_RECURRING_EMPTY_KIND = "initial_recurring_empty"
 _DEGRADATION_KIND = "degradation"
 _RECOVERY_KIND = "recovery"
 _CONTRACT_ERROR_KIND = "contract_error"
@@ -45,6 +44,11 @@ class NotificationDecision:
     watch's new ``last_best_rank``. ``requires_snapshot`` is ``True`` exactly when a
     notification must be sent, and therefore a snapshot must be persisted for it to
     point at -- ``False`` means nothing changed enough to justify one.
+    ``initial_recurring_empty`` is presentation metadata layered onto an ordinary
+    ``kind``: it is ``True`` only for the empty immediate check a recurring watch
+    schedules on creation, so the message can read as "still looking" rather than a
+    generic empty-results notice, without persisting anything an older release's
+    decoder would not recognise.
     """
 
     kind: str
@@ -53,6 +57,7 @@ class NotificationDecision:
     all_option_keys: frozenset[str]
     best_rank: RankVector | None
     requires_snapshot: bool
+    initial_recurring_empty: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,8 +93,10 @@ def decide_result_notification(
     A manual check or the immediate check creating a watch schedules always responds,
     even with no options and no change, because the owner explicitly asked (directly,
     for manual; by creating the watch, for creation). The empty immediate check for a
-    recurring watch gets its own event kind so later Telegram tasks can render it
-    specially; the same empty check for a one-off watch still reads as a normal results
+    recurring watch always persists as an ordinary results delivery -- only its
+    ``initial_recurring_empty`` presentation flag marks it so later Telegram rendering
+    can special-case it, so a previous release's decoder still sees a kind it knows how
+    to send. The same empty check for a one-off watch still reads as a normal results
     notification. A scheduled or recovery check stays silent unless there is something
     genuinely new: an option whose key was never surfaced before (regardless of how it
     ranks), or a strict improvement in the best rank on offer compared with what was
@@ -105,18 +112,17 @@ def decide_result_notification(
         and best_rank.sort_key() < last_best.sort_key()
     )
     requires_snapshot = trigger in _ALWAYS_NOTIFY_TRIGGERS or bool(new_keys) or rank_improved
-    kind = (
-        INITIAL_RECURRING_EMPTY_KIND
-        if trigger is CheckTrigger.CREATION and mode is WatchMode.RECURRING and not options
-        else _RESULTS_KIND
+    initial_recurring_empty = (
+        trigger is CheckTrigger.CREATION and mode is WatchMode.RECURRING and not options
     )
     return NotificationDecision(
-        kind=kind,
+        kind=_RESULTS_KIND,
         recipient_user_id=recipient_user_id,
         new_option_keys=new_keys,
         all_option_keys=current_keys,
         best_rank=best_rank,
         requires_snapshot=requires_snapshot,
+        initial_recurring_empty=initial_recurring_empty,
     )
 
 

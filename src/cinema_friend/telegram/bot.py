@@ -52,7 +52,6 @@ from cinema_friend.clock import Clock
 from cinema_friend.config import Settings
 from cinema_friend.domain.errors import AuthorizationError, InputError
 from cinema_friend.domain.results import NotificationDelivery, RankVector
-from cinema_friend.services.notification_policy import INITIAL_RECURRING_EMPTY_KIND
 from cinema_friend.services.watch_service import WatchService
 from cinema_friend.storage.database import Database
 from cinema_friend.storage.draft_repository import DraftRepository
@@ -311,7 +310,8 @@ class DeliveryWorker:
 
     def _initial_empty_is_deferred(self, delivery: NotificationDelivery) -> bool:
         return (
-            delivery.payload.kind == INITIAL_RECURRING_EMPTY_KIND
+            delivery.payload.kind == _RESULTS_KIND
+            and delivery.payload.initial_recurring_empty
             and delivery.payload.recipient_user_id in self._initial_empty_deferrals
         )
 
@@ -477,10 +477,9 @@ class DeliveryWorker:
     async def _render(self, delivery: NotificationDelivery) -> _Renderable | None:
         payload = delivery.payload
         if payload.kind == _RESULTS_KIND:
-            return await self._render_results(payload.snapshot_id)
-        if payload.kind == INITIAL_RECURRING_EMPTY_KIND:
             return await self._render_results(
-                payload.snapshot_id, initial_recurring_empty=True
+                payload.snapshot_id,
+                initial_recurring_empty=payload.initial_recurring_empty,
             )
         if payload.kind == _CONTRACT_ERROR_KIND:
             return _Renderable(

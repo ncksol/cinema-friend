@@ -14,6 +14,7 @@ delivery in the queue for the lifetime of the process.
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -42,7 +43,6 @@ from cinema_friend.domain.results import (
 )
 from cinema_friend.domain.state import CheckOutcome, CheckTrigger, WatchMode, WatchStatus
 from cinema_friend.domain.watch import Watch, WatchCriteria
-from cinema_friend.services.notification_policy import INITIAL_RECURRING_EMPTY_KIND
 from cinema_friend.services.watch_service import WatchService
 from cinema_friend.storage.database import Database
 from cinema_friend.storage.draft_repository import DraftRepository
@@ -256,19 +256,20 @@ async def _queue(
 def _results_payload(
     snapshot_id: UUID,
     *,
-    user_id: int = USER_ID,
     watch_id: UUID = WATCH_ID,
+    user_id: int = USER_ID,
     new: int = 3,
-    kind: str = "results",
+    initial_recurring_empty: bool = False,
 ) -> NotificationPayload:
     return NotificationPayload(
-        kind=kind,
+        kind="results",
         recipient_user_id=user_id,
         watch_id=watch_id,
         snapshot_id=snapshot_id,
         new_option_count=new,
         host=None,
         recovery_text=None,
+        initial_recurring_empty=initial_recurring_empty,
     )
 
 
@@ -314,7 +315,7 @@ async def test_initial_recurring_empty_delivery_uses_keep_watching_copy(
         _results_payload(
             snapshot_id,
             new=0,
-            kind=INITIAL_RECURRING_EMPTY_KIND,
+            initial_recurring_empty=True,
         ),
     )
 
@@ -337,7 +338,7 @@ async def test_initial_recurring_empty_delivery_keeps_results_copy_for_non_empty
         _results_payload(
             snapshot_id,
             new=1,
-            kind=INITIAL_RECURRING_EMPTY_KIND,
+            initial_recurring_empty=True,
         ),
     )
 
@@ -346,6 +347,28 @@ async def test_initial_recurring_empty_delivery_keeps_results_copy_for_non_empty
     text = harness.bot.sent[0]["text"]
     assert "L0-M0" in text
     assert "I haven't found anything right now, but I'll keep watching." not in text
+
+
+async def test_initial_empty_delivery_uses_rollback_readable_results_shape(
+    harness: Harness,
+) -> None:
+    watch = await _seed_watch(harness)
+    snapshot_id, _ = await _seed_snapshot(harness, watch.watch_id, 0)
+    delivery_id = await _queue(
+        harness,
+        _results_payload(
+            snapshot_id,
+            new=0,
+            initial_recurring_empty=True,
+        ),
+    )
+
+    row = await _delivery_row(harness, delivery_id)
+    encoded = json.loads(row["payload_json"])
+
+    assert row["kind"] == "results"
+    assert encoded["kind"] == "results"
+    assert encoded["initial_recurring_empty"] is True
 
 
 async def test_successful_delivery_renders_the_referenced_snapshot(harness: Harness) -> None:
@@ -866,7 +889,7 @@ async def test_initial_empty_deferral_is_scoped_by_kind_and_recipient(
         _results_payload(
             empty_snapshot,
             new=0,
-            kind="initial_recurring_empty",
+            initial_recurring_empty=True,
         ),
         key="special",
     )
@@ -898,12 +921,12 @@ async def test_deferral_is_scoped_to_the_specified_recipient(
     empty_other, _ = await _seed_snapshot(harness, watch_other.watch_id, 0)
     mine_id = await _queue(
         harness,
-        _results_payload(empty_mine, new=0, kind="initial_recurring_empty"),
+        _results_payload(empty_mine, new=0, initial_recurring_empty=True),
         key="mine",
     )
     other_delivery_id = await _queue(
         harness,
-        _results_payload(empty_other, user_id=other_id, new=0, kind="initial_recurring_empty"),
+        _results_payload(empty_other, user_id=other_id, new=0, initial_recurring_empty=True),
         key="other",
     )
 

@@ -599,7 +599,7 @@ async def test_manual_check_preserves_an_existing_recurring_next_run_at(
     assert stored.last_check_at == harness.clock.now()
 
 
-async def test_empty_recurring_creation_queues_initial_empty_delivery(
+async def test_empty_recurring_creation_queues_rollback_readable_results(
     harness: Harness,
 ) -> None:
     harness.gateway.performances = []
@@ -607,10 +607,10 @@ async def test_empty_recurring_creation_queues_initial_empty_delivery(
 
     await harness.service.check(watch.watch_id, CheckTrigger.CREATION)
 
-    deliveries = await harness.deliveries()
-    assert [delivery.payload.kind for delivery in deliveries] == [
-        "initial_recurring_empty"
-    ]
+    (delivery,) = await harness.deliveries()
+    assert delivery.payload.kind == "results"
+    assert delivery.payload.initial_recurring_empty is True
+    assert delivery.idempotency_key.startswith(f"results:{watch.watch_id}:")
 
 
 @pytest.mark.parametrize(

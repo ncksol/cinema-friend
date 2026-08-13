@@ -104,9 +104,10 @@ def test_manual_and_creation_triggers_always_require_a_snapshot_even_with_no_cha
     assert decision.requires_snapshot is True
     assert decision.kind == "results"
     assert decision.recipient_user_id == 11
+    assert decision.initial_recurring_empty is False
 
 
-def test_empty_recurring_creation_uses_initial_empty_kind() -> None:
+def test_empty_recurring_creation_uses_results_with_initial_empty_presentation() -> None:
     decision = decide_result_notification(
         CheckTrigger.CREATION,
         WatchMode.RECURRING,
@@ -117,7 +118,8 @@ def test_empty_recurring_creation_uses_initial_empty_kind() -> None:
     )
 
     assert decision.requires_snapshot is True
-    assert decision.kind == "initial_recurring_empty"
+    assert decision.kind == "results"
+    assert decision.initial_recurring_empty is True
     assert decision.all_option_keys == frozenset()
     assert decision.best_rank is None
 
@@ -144,6 +146,7 @@ def test_other_owner_initiated_empty_checks_use_results_kind(
 
     assert decision.requires_snapshot is True
     assert decision.kind == "results"
+    assert decision.initial_recurring_empty is False
 
 
 @pytest.mark.parametrize("trigger", [CheckTrigger.SCHEDULED, CheckTrigger.RECOVERY])
@@ -164,6 +167,7 @@ def test_scheduled_and_recovery_triggers_produce_no_delivery_when_unchanged(
 
     assert decision.requires_snapshot is False
     assert decision.new_option_keys == frozenset()
+    assert decision.initial_recurring_empty is False
 
 
 @pytest.mark.parametrize("trigger", [CheckTrigger.SCHEDULED, CheckTrigger.RECOVERY])
@@ -184,6 +188,7 @@ def test_scheduled_and_recovery_triggers_notify_once_for_a_never_surfaced_option
     assert decision.new_option_keys == frozenset({_WORSE_OPTION.key})
     assert decision.all_option_keys == frozenset({_GOOD_OPTION.key, _WORSE_OPTION.key})
     assert decision.best_rank == _GOOD
+    assert decision.initial_recurring_empty is False
 
 
 def test_scheduled_known_option_with_a_better_rank_notifies_once() -> None:
@@ -200,6 +205,7 @@ def test_scheduled_known_option_with_a_better_rank_notifies_once() -> None:
     assert decision.requires_snapshot is True
     assert decision.new_option_keys == frozenset()
     assert decision.best_rank == _BETTER
+    assert decision.initial_recurring_empty is False
 
 
 def test_scheduled_disappearance_is_silent() -> None:
@@ -214,6 +220,7 @@ def test_scheduled_disappearance_is_silent() -> None:
     )
 
     assert decision.requires_snapshot is False
+    assert decision.initial_recurring_empty is False
 
 
 def test_scheduled_worse_only_change_is_silent() -> None:
@@ -229,6 +236,7 @@ def test_scheduled_worse_only_change_is_silent() -> None:
 
     assert decision.requires_snapshot is False
     assert decision.best_rank == _WORSE
+    assert decision.initial_recurring_empty is False
 
 
 def test_decision_carries_the_recipient_user_id_unchanged() -> None:
@@ -244,6 +252,7 @@ def test_decision_carries_the_recipient_user_id_unchanged() -> None:
     )
 
     assert decision.recipient_user_id == 42
+    assert decision.initial_recurring_empty is False
 
 
 # ---------------------------------------------------------------------------
