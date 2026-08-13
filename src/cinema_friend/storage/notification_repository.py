@@ -51,6 +51,7 @@ def _encode_payload(payload: NotificationPayload) -> str:
             "new_option_count": payload.new_option_count,
             "host": payload.host,
             "recovery_text": payload.recovery_text,
+            "initial_recurring_empty": payload.initial_recurring_empty,
         },
         sort_keys=True,
     )
@@ -72,6 +73,7 @@ def _decode_payload(data: str, snapshot_id: str | None) -> NotificationPayload:
         new_option_count=payload["new_option_count"],
         host=payload["host"],
         recovery_text=payload["recovery_text"],
+        initial_recurring_empty=bool(payload.get("initial_recurring_empty", False)),
     )
 
 

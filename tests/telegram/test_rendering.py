@@ -25,6 +25,7 @@ from cinema_friend.telegram.rendering import (
     MAX_MESSAGE_CHARS,
     MAX_OPTIONS_PER_PAGE,
     RenderedMessage,
+    render_initial_recurring_empty_page,
     render_result_page,
     render_watch_list,
 )
@@ -471,6 +472,23 @@ def test_render_result_page_states_no_match_for_an_empty_snapshot() -> None:
 
     assert "No matching seats" in rendered.text
     assert "Showing 0 of 0" not in rendered.text
+    assert rendered.reply_markup is None
+
+
+def test_initial_recurring_empty_page_keeps_context_and_promises_to_watch() -> None:
+    page = _snapshot_page(
+        options=(),
+        total_options=0,
+        total_performances=0,
+        watch_title="Dog Stars",
+    )
+
+    rendered = render_initial_recurring_empty_page(page)
+
+    assert "Dog Stars" in rendered.text
+    assert "Checked:" in rendered.text
+    assert "I haven't found anything right now, but I'll keep watching." in rendered.text
+    assert "No matching seats" not in rendered.text
     assert rendered.reply_markup is None
 
 

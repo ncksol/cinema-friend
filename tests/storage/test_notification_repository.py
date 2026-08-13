@@ -8,6 +8,7 @@ that announced it actually went out.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -42,6 +43,7 @@ def payload(
     new_option_count: int = 2,
     host: str | None = None,
     recovery_text: str | None = None,
+    initial_recurring_empty: bool = False,
 ) -> NotificationPayload:
     return NotificationPayload(
         kind=kind,
@@ -51,6 +53,7 @@ def payload(
         new_option_count=new_option_count,
         host=host,
         recovery_text=recovery_text,
+        initial_recurring_empty=initial_recurring_empty,
     )
 
 
@@ -119,6 +122,52 @@ async def test_create_delivery_round_trips_the_payload(
     created = await repository.create_delivery(conn, "key-1", original, NOW)
     assert created.payload == original
     assert snapshot_id != created.delivery_id
+
+
+async def test_initial_empty_presentation_round_trips(
+    repository: NotificationRepository,
+    conn: aiosqlite.Connection,
+    make_watch: WatchFactory,
+) -> None:
+    watch = await make_watch()
+    original = payload(
+        watch,
+        kind="results",
+        initial_recurring_empty=True,
+    )
+
+    created = await repository.create_delivery(conn, "key-initial-empty", original, NOW)
+
+    assert created.payload == original
+
+
+async def test_legacy_payload_without_initial_empty_field_defaults_false(
+    repository: NotificationRepository,
+    conn: aiosqlite.Connection,
+    make_watch: WatchFactory,
+) -> None:
+    watch = await make_watch()
+    created = await repository.create_delivery(
+        conn, "key-legacy", payload(watch, kind="results"), NOW
+    )
+    cursor = await conn.execute(
+        "SELECT payload_json FROM notification_deliveries WHERE id = ?",
+        (str(created.delivery_id),),
+    )
+    row = await cursor.fetchone()
+    assert row is not None
+    legacy = json.loads(row["payload_json"])
+    legacy.pop("initial_recurring_empty")
+    await conn.execute(
+        "UPDATE notification_deliveries SET payload_json = ? WHERE id = ?",
+        (json.dumps(legacy, sort_keys=True), str(created.delivery_id)),
+    )
+
+    restored = await repository.delivery(conn, created.delivery_id)
+
+    assert restored is not None
+    assert restored.payload.kind == "results"
+    assert restored.payload.initial_recurring_empty is False
 
 
 async def test_create_delivery_is_idempotent_on_the_same_key(

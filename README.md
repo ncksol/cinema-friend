@@ -271,9 +271,14 @@ When a check finds adjacent seats matching your criteria, you get one message li
 options in preference order, each with a link straight to that performance's seat map. You
 still choose seats and pay on the BFI site.
 
-A watch that finds nothing new sends nothing. You are messaged again only when something
-appears that is genuinely better than what you were last told about, so a recurring watch
-on a quiet film is silent, not repetitive.
+When a recurring watch's creation check succeeds, it replies. If it finds no matching
+seats, the bot says it found nothing and will keep watching. Later scheduled checks that
+find nothing new stay silent.
+
+After that first reply, you are messaged again only when something appears that is
+genuinely better than what you were last told about, so a recurring watch on a quiet film
+is not repetitive. Manual `/check` requests still return the current result, even when
+empty.
 
 ---
 

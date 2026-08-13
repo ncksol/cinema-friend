@@ -14,7 +14,10 @@ delivery in the queue for the lifetime of the process.
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
@@ -24,6 +27,7 @@ from uuid import UUID, uuid4
 
 import pytest
 from telegram import CallbackQuery, Chat, Message, Update, User
+from telegram.constants import ParseMode
 from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError, TimedOut
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler
 
@@ -49,11 +53,14 @@ from cinema_friend.telegram.auth import DENIAL_TEXT
 from cinema_friend.telegram.bot import (
     RETRY_DELAYS,
     BotDependencies,
+    DeliveryRun,
     DeliveryWorker,
+    _route,
     build_telegram_application,
 )
-from cinema_friend.telegram.commands import STALE_ACTION
-from cinema_friend.telegram.rendering import MAX_MESSAGE_CHARS
+from cinema_friend.telegram.commands import STALE_ACTION, CommandDeps
+from cinema_friend.telegram.rendering import MAX_MESSAGE_CHARS, RenderedMessage
+from cinema_friend.telegram.wizard import WizardDeps, WizardState, prepare_confirmation_watch_id
 from tests.fakes import FakeClock
 
 NOW = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
@@ -163,13 +170,14 @@ def _criteria(**overrides: Any) -> WatchCriteria:
 async def _seed_watch(
     harness: Harness,
     *,
+    user_id: int = USER_ID,
     watch_id: UUID = WATCH_ID,
     status: WatchStatus = WatchStatus.ACTIVE,
     title: str | None = "Dog Stars",
 ) -> Watch:
     watch = Watch(
         watch_id=watch_id,
-        user_id=USER_ID,
+        user_id=user_id,
         criteria=_criteria(),
         status=status,
         created_at=NOW,
@@ -245,17 +253,23 @@ async def _queue(
     return delivery.delivery_id
 
 
-def _results_payload(snapshot_id: UUID, *, watch_id: UUID = WATCH_ID, new: int = 3) -> (
-    NotificationPayload
-):
+def _results_payload(
+    snapshot_id: UUID,
+    *,
+    watch_id: UUID = WATCH_ID,
+    user_id: int = USER_ID,
+    new: int = 3,
+    initial_recurring_empty: bool = False,
+) -> NotificationPayload:
     return NotificationPayload(
         kind="results",
-        recipient_user_id=USER_ID,
+        recipient_user_id=user_id,
         watch_id=watch_id,
         snapshot_id=snapshot_id,
         new_option_count=new,
         host=None,
         recovery_text=None,
+        initial_recurring_empty=initial_recurring_empty,
     )
 
 
@@ -289,6 +303,72 @@ async def test_successful_delivery_marks_every_snapshot_option_known(harness: Ha
     assert state.last_best_rank.sort_key() == _option(0).rank_vector.sort_key()
     row = await _delivery_row(harness, delivery_id)
     assert row["status"] == DeliveryStatus.SENT.value
+
+
+async def test_initial_recurring_empty_delivery_uses_keep_watching_copy(
+    harness: Harness,
+) -> None:
+    watch = await _seed_watch(harness)
+    snapshot_id, _ = await _seed_snapshot(harness, watch.watch_id, 0)
+    await _queue(
+        harness,
+        _results_payload(
+            snapshot_id,
+            new=0,
+            initial_recurring_empty=True,
+        ),
+    )
+
+    await harness.worker.run_once()
+
+    text = harness.bot.sent[0]["text"]
+    assert "Dog Stars" in text
+    assert "Checked:" in text
+    assert "I haven't found anything right now, but I'll keep watching." in text
+    assert "No matching seats" not in text
+
+
+async def test_initial_recurring_empty_delivery_keeps_results_copy_for_non_empty_snapshots(
+    harness: Harness,
+) -> None:
+    watch = await _seed_watch(harness)
+    snapshot_id, _ = await _seed_snapshot(harness, watch.watch_id, 1)
+    await _queue(
+        harness,
+        _results_payload(
+            snapshot_id,
+            new=1,
+            initial_recurring_empty=True,
+        ),
+    )
+
+    await harness.worker.run_once()
+
+    text = harness.bot.sent[0]["text"]
+    assert "L0-M0" in text
+    assert "I haven't found anything right now, but I'll keep watching." not in text
+
+
+async def test_initial_empty_delivery_uses_rollback_readable_results_shape(
+    harness: Harness,
+) -> None:
+    watch = await _seed_watch(harness)
+    snapshot_id, _ = await _seed_snapshot(harness, watch.watch_id, 0)
+    delivery_id = await _queue(
+        harness,
+        _results_payload(
+            snapshot_id,
+            new=0,
+            initial_recurring_empty=True,
+        ),
+    )
+
+    row = await _delivery_row(harness, delivery_id)
+    encoded = json.loads(row["payload_json"])
+
+    assert row["kind"] == "results"
+    assert encoded["kind"] == "results"
+    assert encoded["initial_recurring_empty"] is True
 
 
 async def test_successful_delivery_renders_the_referenced_snapshot(harness: Harness) -> None:
@@ -794,6 +874,101 @@ async def test_a_run_only_claims_a_send_for_the_watch_that_got_one(harness: Harn
 
 
 # ---------------------------------------------------------------------------
+# Deferral
+# ---------------------------------------------------------------------------
+
+
+async def test_initial_empty_deferral_is_scoped_by_kind_and_recipient(
+    harness: Harness,
+) -> None:
+    watch = await _seed_watch(harness)
+    empty_snapshot, _ = await _seed_snapshot(harness, watch.watch_id, 0)
+    result_snapshot, _ = await _seed_snapshot(harness, watch.watch_id, 1)
+    special_id = await _queue(
+        harness,
+        _results_payload(
+            empty_snapshot,
+            new=0,
+            initial_recurring_empty=True,
+        ),
+        key="special",
+    )
+    ordinary_id = await _queue(
+        harness,
+        _results_payload(result_snapshot),
+        key="ordinary",
+    )
+
+    async with harness.worker.defer_initial_recurring_empty(USER_ID, watch.watch_id):
+        run = await harness.worker.run_once()
+
+    assert run.sent_ids == frozenset({ordinary_id})
+    assert (await _delivery_row(harness, special_id))["status"] == "pending"
+    assert len(harness.bot.sent) == 1
+
+
+async def test_initial_empty_deferral_is_scoped_to_one_watch(
+    harness: Harness,
+) -> None:
+    target = await _seed_watch(
+        harness,
+        watch_id=UUID("00000000-0000-4000-8000-000000000001"),
+    )
+    unrelated = await _seed_watch(
+        harness,
+        watch_id=UUID("00000000-0000-4000-8000-000000000002"),
+    )
+    target_snapshot, _ = await _seed_snapshot(harness, target.watch_id, 0)
+    unrelated_snapshot, _ = await _seed_snapshot(harness, unrelated.watch_id, 0)
+    target_id = await _queue(
+        harness,
+        _results_payload(
+            target_snapshot,
+            watch_id=target.watch_id,
+            new=0,
+            initial_recurring_empty=True,
+        ),
+        key="target",
+    )
+    unrelated_id = await _queue(
+        harness,
+        _results_payload(
+            unrelated_snapshot,
+            watch_id=unrelated.watch_id,
+            new=0,
+            initial_recurring_empty=True,
+        ),
+        key="unrelated",
+    )
+
+    async with harness.worker.defer_initial_recurring_empty(USER_ID, target.watch_id):
+        run = await harness.worker.run_once()
+
+    assert run.sent_ids == frozenset({unrelated_id})
+    assert (await _delivery_row(harness, target_id))["status"] == "pending"
+
+
+async def test_nested_watch_deferrals_release_at_refcount_zero(harness: Harness) -> None:
+    watch = await _seed_watch(harness)
+    snapshot_id, _ = await _seed_snapshot(harness, watch.watch_id, 0)
+    delivery_id = await _queue(
+        harness,
+        _results_payload(
+            snapshot_id,
+            new=0,
+            initial_recurring_empty=True,
+        ),
+    )
+
+    async with harness.worker.defer_initial_recurring_empty(USER_ID, watch.watch_id):
+        async with harness.worker.defer_initial_recurring_empty(USER_ID, watch.watch_id):
+            assert (await harness.worker.run_once()).attempted == 0
+        assert (await harness.worker.run_once()).attempted == 0
+
+    assert (await harness.worker.run_once()).sent_ids == frozenset({delivery_id})
+
+
+# ---------------------------------------------------------------------------
 # Application wiring
 # ---------------------------------------------------------------------------
 
@@ -864,6 +1039,7 @@ async def test_wizard_callbacks_are_matched_before_watch_callbacks(
         for handler in _registered(application)
         if isinstance(handler, CallbackQueryHandler) and handler.pattern is not None
     ]
+    assert patterns.index("^wizard:confirm$") < patterns.index("^wizard:")
     assert patterns.index("^wizard:") < patterns.index("^v1:")
 
 
@@ -962,12 +1138,15 @@ async def test_every_denial_is_the_same_single_response(harness: Harness, tmp_pa
     await _callback_handler(application, "^v1:").callback(
         _callback_update(f"v1:pause:{WATCH_ID}", user_id=999), context
     )
+    await _callback_handler(application, "^wizard:confirm$").callback(
+        _callback_update("wizard:confirm", user_id=999), context
+    )
     await _callback_handler(application, "^wizard:").callback(
         _callback_update("wizard:qty:2", user_id=999), context
     )
 
     assert {message["text"] for message in bot.sent} == {DENIAL_TEXT}
-    assert len(bot.sent) == 9
+    assert len(bot.sent) == 10
 
 
 async def test_a_routed_callback_denies_before_answering_the_query(
@@ -1022,3 +1201,250 @@ async def test_an_operational_failure_gets_guidance_rather_than_silence(
     assert len(bot.sent) == 1
     assert bot.sent[0]["text"] == STALE_ACTION
     assert "vanished" not in bot.sent[0]["text"]
+
+
+# ---------------------------------------------------------------------------
+# Confirmation-first ordering
+# ---------------------------------------------------------------------------
+
+
+class _OrderedDispatcher:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+        self.deferred: list[tuple[int, UUID]] = []
+
+    @asynccontextmanager
+    async def defer_initial_recurring_empty(
+        self, recipient_user_id: int, watch_id: UUID
+    ) -> AsyncIterator[None]:
+        self.deferred.append((recipient_user_id, watch_id))
+        yield
+
+    async def run_once(self) -> DeliveryRun:
+        self.events.append("follow-up")
+        return DeliveryRun()
+
+
+class _RecordingDispatcher:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+        self.deferred: list[tuple[int, UUID]] = []
+
+    @asynccontextmanager
+    async def defer_initial_recurring_empty(
+        self, recipient_user_id: int, watch_id: UUID
+    ) -> AsyncIterator[None]:
+        self.deferred.append((recipient_user_id, watch_id))
+        self.events.append("defer")
+        try:
+            yield
+        finally:
+            self.events.append("release")
+
+    async def run_once(self) -> DeliveryRun:
+        self.events.append("follow-up")
+        return DeliveryRun()
+
+
+async def _seed_review_draft(
+    harness: Harness, wizard_deps: WizardDeps, *, setup_id: str = "review-setup-id"
+) -> None:
+    async with harness.database.connection() as conn:
+        await wizard_deps.drafts.upsert(
+            conn,
+            USER_ID,
+            WizardState.REVIEW.value,
+            {"setup_id": setup_id},
+            harness.clock.now(),
+        )
+
+
+async def test_confirm_route_sends_confirmation_before_flushing_delivery(
+    harness: Harness,
+) -> None:
+    events: list[str] = []
+    dispatcher = _OrderedDispatcher(events)
+    wizard_deps = WizardDeps(
+        database=harness.database,
+        drafts=DraftRepository(),
+        watches=harness.watches,
+        checks=_Checks(),
+        clock=harness.clock,
+    )
+    await _seed_review_draft(harness, wizard_deps)
+    deps = CommandDeps(
+        wizard=wizard_deps,
+        results=harness.results,
+        deliveries=dispatcher,
+        allowed_user_ids=frozenset({USER_ID}),
+    )
+
+    async def confirm(
+        update: Update, command_deps: CommandDeps
+    ) -> RenderedMessage:
+        return RenderedMessage(
+            text="Watch created",
+            parse_mode=ParseMode.HTML,
+            reply_markup=None,
+        )
+
+    bot = _Bot()
+    original_send = bot.send_message
+
+    async def record_send(**kwargs: Any) -> object:
+        events.append("confirmation")
+        return await original_send(**kwargs)
+
+    bot.send_message = record_send  # type: ignore[method-assign]
+    callback = _route(
+        confirm,
+        deps,
+        answers_callback=True,
+        defer_initial_recurring_empty=True,
+    )
+
+    await callback(
+        _callback_update("wizard:confirm", user_id=USER_ID),
+        SimpleNamespace(bot=bot),
+    )
+
+    assert events == ["confirmation", "follow-up"]
+
+
+async def test_confirm_route_defers_before_handler_and_releases_before_flush(
+    harness: Harness,
+) -> None:
+    events: list[str] = []
+    dispatcher = _RecordingDispatcher(events)
+    wizard_deps = WizardDeps(
+        database=harness.database,
+        drafts=DraftRepository(),
+        watches=harness.watches,
+        checks=_Checks(),
+        clock=harness.clock,
+    )
+    await _seed_review_draft(harness, wizard_deps)
+    prepared_watch_id = await prepare_confirmation_watch_id(USER_ID, wizard_deps)
+    assert prepared_watch_id is not None
+    deps = CommandDeps(
+        wizard=wizard_deps,
+        results=harness.results,
+        deliveries=dispatcher,
+        allowed_user_ids=frozenset({USER_ID}),
+    )
+
+    async def handler(update: Update, command_deps: CommandDeps) -> RenderedMessage:
+        events.append("handler")
+        return RenderedMessage(
+            text="Watch created",
+            parse_mode=ParseMode.HTML,
+            reply_markup=None,
+        )
+
+    bot = _Bot()
+    original_send = bot.send_message
+
+    async def record_send(**kwargs: Any) -> object:
+        events.append("confirmation")
+        return await original_send(**kwargs)
+
+    bot.send_message = record_send  # type: ignore[method-assign]
+    callback = _route(
+        handler,
+        deps,
+        answers_callback=True,
+        defer_initial_recurring_empty=True,
+    )
+
+    await callback(
+        _callback_update("wizard:confirm", user_id=USER_ID),
+        SimpleNamespace(bot=bot),
+    )
+
+    assert events == ["defer", "handler", "confirmation", "release", "follow-up"]
+    assert dispatcher.deferred == [(USER_ID, prepared_watch_id)]
+
+
+async def test_confirm_route_skips_flush_when_handler_sends_nothing(
+    harness: Harness,
+) -> None:
+    events: list[str] = []
+    dispatcher = _OrderedDispatcher(events)
+    deps = CommandDeps(
+        wizard=WizardDeps(
+            database=harness.database,
+            drafts=DraftRepository(),
+            watches=harness.watches,
+            checks=_Checks(),
+            clock=harness.clock,
+        ),
+        results=harness.results,
+        deliveries=dispatcher,
+        allowed_user_ids=frozenset({USER_ID}),
+    )
+
+    async def handler(update: Update, command_deps: CommandDeps) -> RenderedMessage | None:
+        return None
+
+    bot = _Bot()
+    callback = _route(
+        handler,
+        deps,
+        answers_callback=True,
+        defer_initial_recurring_empty=True,
+    )
+
+    await callback(
+        _callback_update("wizard:confirm", user_id=USER_ID),
+        SimpleNamespace(bot=bot),
+    )
+
+    assert bot.sent == []
+    assert events == []
+    assert dispatcher.deferred == []
+
+
+async def test_confirm_route_skips_flush_when_confirmation_send_raises(
+    harness: Harness,
+) -> None:
+    events: list[str] = []
+    dispatcher = _OrderedDispatcher(events)
+    wizard_deps = WizardDeps(
+        database=harness.database,
+        drafts=DraftRepository(),
+        watches=harness.watches,
+        checks=_Checks(),
+        clock=harness.clock,
+    )
+    await _seed_review_draft(harness, wizard_deps)
+    deps = CommandDeps(
+        wizard=wizard_deps,
+        results=harness.results,
+        deliveries=dispatcher,
+        allowed_user_ids=frozenset({USER_ID}),
+    )
+
+    async def confirm(update: Update, command_deps: CommandDeps) -> RenderedMessage:
+        return RenderedMessage(
+            text="Watch created",
+            parse_mode=ParseMode.HTML,
+            reply_markup=None,
+        )
+
+    bot = _Bot()
+    bot.errors.append(TimedOut())
+    callback = _route(
+        confirm,
+        deps,
+        answers_callback=True,
+        defer_initial_recurring_empty=True,
+    )
+
+    with pytest.raises(TimedOut):
+        await callback(
+            _callback_update("wizard:confirm", user_id=USER_ID),
+            SimpleNamespace(bot=bot),
+        )
+
+    assert bot.sent == []
+    assert events == []

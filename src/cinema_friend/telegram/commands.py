@@ -20,6 +20,7 @@ tests drive real storage without a live bot.
 from __future__ import annotations
 
 import html
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from typing import Protocol
 from uuid import UUID
@@ -122,9 +123,13 @@ class DeliveryOutcome(Protocol):
 
 
 class DeliveryDispatcher(Protocol):
-    """Flushes queued notifications. Implemented by the bot module's delivery worker."""
+    """Flushes and temporarily defers queued notifications."""
 
     async def run_once(self) -> DeliveryOutcome: ...
+
+    def defer_initial_recurring_empty(
+        self, recipient_user_id: int, watch_id: UUID
+    ) -> AbstractAsyncContextManager[None]: ...
 
 
 @dataclass(frozen=True, slots=True)

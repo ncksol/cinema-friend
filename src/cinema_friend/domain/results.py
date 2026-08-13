@@ -135,6 +135,7 @@ class NotificationPayload:
     new_option_count: int
     host: str | None
     recovery_text: str | None
+    initial_recurring_empty: bool = False
 
 
 @dataclass(frozen=True, slots=True)

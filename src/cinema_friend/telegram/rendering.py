@@ -41,6 +41,9 @@ _TRUNCATION_MARK = "…"
 
 _UNTITLED = "(untitled)"
 _NO_MATCH = "No matching seats were found for this check."
+_INITIAL_RECURRING_EMPTY = (
+    "I haven't found anything right now, but I'll keep watching."
+)
 _TOO_LONG = "Your watches are too long to display here."
 
 _STATUS_LABEL: dict[WatchStatus, str] = {
@@ -177,7 +180,10 @@ def _pagination_row(snapshot_page: SnapshotPage) -> list[InlineKeyboardButton]:
 
 
 def render_result_page(
-    snapshot_page: SnapshotPage, *, max_chars: int = MAX_MESSAGE_CHARS
+    snapshot_page: SnapshotPage,
+    *,
+    max_chars: int = MAX_MESSAGE_CHARS,
+    empty_message: str = _NO_MATCH,
 ) -> RenderedMessage:
     """Render one page of a result snapshot as a numbered, linked option list.
 
@@ -189,7 +195,8 @@ def render_result_page(
 
     A snapshot with no options is a real answer, not an empty page, so it is rendered
     as a plain "nothing matched" message under the watch's own title rather than as a
-    zero-length list with pagination.
+    zero-length list with pagination. Callers may supply context-specific copy for the
+    empty snapshot without changing the rest of the page layout.
     """
     title = _escape(_page_title(snapshot_page), _MAX_TITLE_CHARS)
     checked_at = _escape(_london(snapshot_page.checked_at), _MAX_TITLE_CHARS)
@@ -197,7 +204,7 @@ def render_result_page(
 
     if not snapshot_page.options:
         return RenderedMessage(
-            text="\n".join([*header, "", _NO_MATCH]),
+            text="\n".join([*header, "", empty_message]),
             parse_mode=ParseMode.HTML,
             reply_markup=None,
         )
@@ -228,6 +235,16 @@ def render_result_page(
 
     reply_markup = InlineKeyboardMarkup(rows) if rows else None
     return RenderedMessage(text=text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+
+
+def render_initial_recurring_empty_page(
+    snapshot_page: SnapshotPage, *, max_chars: int = MAX_MESSAGE_CHARS
+) -> RenderedMessage:
+    return render_result_page(
+        snapshot_page,
+        max_chars=max_chars,
+        empty_message=_INITIAL_RECURRING_EMPTY,
+    )
 
 
 def _interval_summary(interval: timedelta) -> str:

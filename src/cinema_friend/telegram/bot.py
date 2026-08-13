@@ -20,7 +20,8 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
-from collections.abc import Awaitable, Callable, Coroutine, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
@@ -72,8 +73,12 @@ from cinema_friend.telegram.commands import (
     handle_watches,
     handle_wizard_button,
 )
-from cinema_friend.telegram.rendering import RenderedMessage, render_result_page
-from cinema_friend.telegram.wizard import CheckRunner, WizardDeps
+from cinema_friend.telegram.rendering import (
+    RenderedMessage,
+    render_initial_recurring_empty_page,
+    render_result_page,
+)
+from cinema_friend.telegram.wizard import CheckRunner, WizardDeps, prepare_confirmation_watch_id
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -278,6 +283,43 @@ class DeliveryWorker:
         self._watches = watches
         self._clock = clock
         self._lock = asyncio.Lock()
+        self._initial_empty_deferrals: dict[tuple[int, UUID], int] = {}
+
+    @asynccontextmanager
+    async def defer_initial_recurring_empty(
+        self, recipient_user_id: int, watch_id: UUID
+    ) -> AsyncIterator[None]:
+        """Hold back one watch's initial-empty delivery while confirmation is in flight.
+
+        A row deferred this way is intentionally skipped by :meth:`run_once` for as long
+        as the deferral is held: skipping does not consume a delivery attempt or push
+        back its retry time, so the row is exactly as due the next time a sweep sees it
+        as it was before being skipped. Scoping the key to ``(recipient_user_id,
+        watch_id)`` rather than the recipient alone keeps a different watch's pending
+        initial-empty retry deliverable while this one's confirmation runs.
+        """
+        key = (recipient_user_id, watch_id)
+        self._initial_empty_deferrals[key] = self._initial_empty_deferrals.get(key, 0) + 1
+        try:
+            yield
+        finally:
+            remaining = self._initial_empty_deferrals[key] - 1
+            if remaining:
+                self._initial_empty_deferrals[key] = remaining
+            else:
+                del self._initial_empty_deferrals[key]
+
+    def _initial_empty_is_deferred(self, delivery: NotificationDelivery) -> bool:
+        return (
+            delivery.payload.kind == _RESULTS_KIND
+            and delivery.payload.initial_recurring_empty
+            and delivery.payload.watch_id is not None
+            and (
+                delivery.payload.recipient_user_id,
+                delivery.payload.watch_id,
+            )
+            in self._initial_empty_deferrals
+        )
 
     async def run_once(self) -> DeliveryRun:
         """Attempt every delivery that is due now and report what happened to each.
@@ -289,6 +331,10 @@ class DeliveryWorker:
         row and would abort every future sweep at exactly the same place, permanently
         blocking every message queued behind it.
 
+        A due row deferred through :meth:`defer_initial_recurring_empty` is skipped the
+        same way: intentionally, and without consuming an attempt or changing its retry
+        time, so it is picked up by the next sweep once the deferral is released.
+
         ``BaseException`` is deliberately not caught. Cancellation and interpreter exit
         are not delivery problems and must keep unwinding.
         """
@@ -298,6 +344,8 @@ class DeliveryWorker:
                 due = await self._notifications.due_deliveries(conn, now)
             attempts: list[DeliveryAttempt] = []
             for delivery in due:
+                if self._initial_empty_is_deferred(delivery):
+                    continue
                 try:
                     attempts.append(await self._attempt(delivery, now))
                 except Exception:
@@ -435,7 +483,10 @@ class DeliveryWorker:
     async def _render(self, delivery: NotificationDelivery) -> _Renderable | None:
         payload = delivery.payload
         if payload.kind == _RESULTS_KIND:
-            return await self._render_results(payload.snapshot_id)
+            return await self._render_results(
+                payload.snapshot_id,
+                initial_recurring_empty=payload.initial_recurring_empty,
+            )
         if payload.kind == _CONTRACT_ERROR_KIND:
             return _Renderable(
                 message=_plain(
@@ -465,7 +516,9 @@ class DeliveryWorker:
             return None
         return _title(watch.title)
 
-    async def _render_results(self, snapshot_id: UUID | None) -> _Renderable:
+    async def _render_results(
+        self, snapshot_id: UUID | None, *, initial_recurring_empty: bool = False
+    ) -> _Renderable:
         """Render the *referenced* snapshot, never the watch's latest.
 
         A page that silently upgraded itself to newer results would contradict the
@@ -493,7 +546,13 @@ class DeliveryWorker:
             key=lambda vector: vector.sort_key(),
             default=None,
         )
-        return _Renderable(render_result_page(page), keys, best)
+        use_initial_recurring_empty = initial_recurring_empty and not full.options
+        message = (
+            render_initial_recurring_empty_page(page)
+            if use_initial_recurring_empty
+            else render_result_page(page)
+        )
+        return _Renderable(message, keys, best)
 
 
 # ---------------------------------------------------------------------------
@@ -525,7 +584,11 @@ def _chat_id(update: Update) -> int | None:
 
 
 def _route(
-    handler: _Handler, deps: CommandDeps, *, answers_callback: bool = False
+    handler: _Handler,
+    deps: CommandDeps,
+    *,
+    answers_callback: bool = False,
+    defer_initial_recurring_empty: bool = False,
 ) -> Callable[[Update, _Context], Coroutine[Any, Any, None]]:
     """Adapt a pure handler into a PTB callback that sends whatever it returns.
 
@@ -546,7 +609,7 @@ def _route(
 
     async def callback(update: Update, context: _Context) -> None:
         try:
-            authorized_user_id(update, deps.allowed_user_ids)
+            user_id = authorized_user_id(update, deps.allowed_user_ids)
         except AuthorizationError:
             _LOGGER.warning("denied update %s", update.update_id)
             await _reply(update, context, DENIAL_TEXT)
@@ -555,19 +618,36 @@ def _route(
             # Stop the client's spinner before doing any work, so a slow handler does
             # not look like a broken button. Only ever for a caller already allowed in.
             await context.bot.answer_callback_query(update.callback_query.id)
-        try:
-            message = await handler(update, deps)
-        except AuthorizationError:  # pragma: no cover - the guard above already ran
-            _LOGGER.warning("denied update %s", update.update_id)
-            await _reply(update, context, DENIAL_TEXT)
+
+        async def invoke_and_send() -> bool:
+            try:
+                message = await handler(update, deps)
+            except AuthorizationError:  # pragma: no cover - the guard above already ran
+                _LOGGER.warning("denied update %s", update.update_id)
+                await _reply(update, context, DENIAL_TEXT)
+                return False
+            except InputError as error:
+                _LOGGER.warning(
+                    "unhandled input error on update %s: %s", update.update_id, error
+                )
+                await _reply(update, context, STALE_ACTION)
+                return False
+            if message is None:
+                return False
+            await _send(update, context, message)
+            return True
+
+        if defer_initial_recurring_empty:
+            watch_id = await prepare_confirmation_watch_id(user_id, deps.wizard)
+            if watch_id is None:
+                await invoke_and_send()
+                return
+            async with deps.deliveries.defer_initial_recurring_empty(user_id, watch_id):
+                sent = await invoke_and_send()
+            if sent:
+                await deps.deliveries.run_once()
             return
-        except InputError as error:
-            _LOGGER.warning("unhandled input error on update %s: %s", update.update_id, error)
-            await _reply(update, context, STALE_ACTION)
-            return
-        if message is None:
-            return
-        await _send(update, context, message)
+        await invoke_and_send()
 
     return callback
 
@@ -641,6 +721,17 @@ def build_telegram_application(
 
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, _route(handle_text, deps))
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            _route(
+                handle_wizard_button,
+                deps,
+                answers_callback=True,
+                defer_initial_recurring_empty=True,
+            ),
+            pattern="^wizard:confirm$",
+        )
     )
     application.add_handler(
         CallbackQueryHandler(

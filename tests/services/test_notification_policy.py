@@ -14,7 +14,7 @@ import pytest
 
 from cinema_friend.domain.bfi import Performance
 from cinema_friend.domain.results import CircuitState, HostCircuit, RankedOption, RankVector
-from cinema_friend.domain.state import CheckTrigger
+from cinema_friend.domain.state import CheckTrigger, WatchMode
 from cinema_friend.services.notification_policy import (
     circuit_records_incident,
     decide_contract_error_notification,
@@ -86,10 +86,16 @@ def test_manual_and_creation_triggers_always_require_a_snapshot_even_with_no_cha
     trigger: CheckTrigger,
 ) -> None:
     """Both an explicit ``/check`` and the immediate check a new watch schedules must
-    respond, even when nothing changed since the owner was last told."""
+    respond, even when nothing changed since the owner was last told.
+
+    This is the ordinary non-empty results path; the special recurring-empty kind is
+    covered by the separate zero-option test below.
+    """
+    options = (_GOOD_OPTION,)
     decision = decide_result_notification(
         trigger,
-        (_GOOD_OPTION,),
+        WatchMode.RECURRING,
+        options,
         known_keys=frozenset({_GOOD_OPTION.key}),
         last_best=_GOOD,
         recipient_user_id=11,
@@ -98,19 +104,49 @@ def test_manual_and_creation_triggers_always_require_a_snapshot_even_with_no_cha
     assert decision.requires_snapshot is True
     assert decision.kind == "results"
     assert decision.recipient_user_id == 11
+    assert decision.initial_recurring_empty is False
 
 
-@pytest.mark.parametrize("trigger", [CheckTrigger.MANUAL, CheckTrigger.CREATION])
-def test_manual_and_creation_triggers_require_a_snapshot_even_with_no_options(
-    trigger: CheckTrigger,
-) -> None:
+def test_empty_recurring_creation_uses_results_with_initial_empty_presentation() -> None:
     decision = decide_result_notification(
-        trigger, (), known_keys=frozenset(), last_best=None, recipient_user_id=11
+        CheckTrigger.CREATION,
+        WatchMode.RECURRING,
+        (),
+        known_keys=frozenset(),
+        last_best=None,
+        recipient_user_id=11,
     )
 
     assert decision.requires_snapshot is True
+    assert decision.kind == "results"
+    assert decision.initial_recurring_empty is True
     assert decision.all_option_keys == frozenset()
     assert decision.best_rank is None
+
+
+@pytest.mark.parametrize(
+    ("trigger", "mode"),
+    [
+        (CheckTrigger.CREATION, WatchMode.ONE_OFF),
+        (CheckTrigger.MANUAL, WatchMode.RECURRING),
+        (CheckTrigger.MANUAL, WatchMode.ONE_OFF),
+    ],
+)
+def test_other_owner_initiated_empty_checks_use_results_kind(
+    trigger: CheckTrigger, mode: WatchMode
+) -> None:
+    decision = decide_result_notification(
+        trigger,
+        mode,
+        (),
+        known_keys=frozenset(),
+        last_best=None,
+        recipient_user_id=11,
+    )
+
+    assert decision.requires_snapshot is True
+    assert decision.kind == "results"
+    assert decision.initial_recurring_empty is False
 
 
 @pytest.mark.parametrize("trigger", [CheckTrigger.SCHEDULED, CheckTrigger.RECOVERY])
@@ -122,6 +158,7 @@ def test_scheduled_and_recovery_triggers_produce_no_delivery_when_unchanged(
     when nothing new or better appeared."""
     decision = decide_result_notification(
         trigger,
+        WatchMode.RECURRING,
         (_GOOD_OPTION,),
         known_keys=frozenset({_GOOD_OPTION.key}),
         last_best=_GOOD,
@@ -130,6 +167,7 @@ def test_scheduled_and_recovery_triggers_produce_no_delivery_when_unchanged(
 
     assert decision.requires_snapshot is False
     assert decision.new_option_keys == frozenset()
+    assert decision.initial_recurring_empty is False
 
 
 @pytest.mark.parametrize("trigger", [CheckTrigger.SCHEDULED, CheckTrigger.RECOVERY])
@@ -139,6 +177,7 @@ def test_scheduled_and_recovery_triggers_notify_once_for_a_never_surfaced_option
     """A brand-new option is worth telling the owner about even if it ranks worst."""
     decision = decide_result_notification(
         trigger,
+        WatchMode.RECURRING,
         (_GOOD_OPTION, _WORSE_OPTION),
         known_keys=frozenset({_GOOD_OPTION.key}),
         last_best=_GOOD,
@@ -149,12 +188,14 @@ def test_scheduled_and_recovery_triggers_notify_once_for_a_never_surfaced_option
     assert decision.new_option_keys == frozenset({_WORSE_OPTION.key})
     assert decision.all_option_keys == frozenset({_GOOD_OPTION.key, _WORSE_OPTION.key})
     assert decision.best_rank == _GOOD
+    assert decision.initial_recurring_empty is False
 
 
 def test_scheduled_known_option_with_a_better_rank_notifies_once() -> None:
     """No new key appears, but the best available rank improved on what was last told."""
     decision = decide_result_notification(
         CheckTrigger.SCHEDULED,
+        WatchMode.RECURRING,
         (_BETTER_OPTION,),
         known_keys=frozenset({_BETTER_OPTION.key}),
         last_best=_GOOD,
@@ -164,12 +205,14 @@ def test_scheduled_known_option_with_a_better_rank_notifies_once() -> None:
     assert decision.requires_snapshot is True
     assert decision.new_option_keys == frozenset()
     assert decision.best_rank == _BETTER
+    assert decision.initial_recurring_empty is False
 
 
 def test_scheduled_disappearance_is_silent() -> None:
     """A previously known option vanishing, with no new or better option, is not news."""
     decision = decide_result_notification(
         CheckTrigger.SCHEDULED,
+        WatchMode.RECURRING,
         (_WORSE_OPTION,),
         known_keys=frozenset({_GOOD_OPTION.key, _WORSE_OPTION.key}),
         last_best=_GOOD,
@@ -177,12 +220,14 @@ def test_scheduled_disappearance_is_silent() -> None:
     )
 
     assert decision.requires_snapshot is False
+    assert decision.initial_recurring_empty is False
 
 
 def test_scheduled_worse_only_change_is_silent() -> None:
     """The known best option's rank got worse; nothing new or improved appeared."""
     decision = decide_result_notification(
         CheckTrigger.SCHEDULED,
+        WatchMode.RECURRING,
         (_WORSE_OPTION,),
         known_keys=frozenset({_WORSE_OPTION.key}),
         last_best=_GOOD,
@@ -191,6 +236,7 @@ def test_scheduled_worse_only_change_is_silent() -> None:
 
     assert decision.requires_snapshot is False
     assert decision.best_rank == _WORSE
+    assert decision.initial_recurring_empty is False
 
 
 def test_decision_carries_the_recipient_user_id_unchanged() -> None:
@@ -198,6 +244,7 @@ def test_decision_carries_the_recipient_user_id_unchanged() -> None:
     keyed on this recipient and cannot derive it from anything else in the decision."""
     decision = decide_result_notification(
         CheckTrigger.MANUAL,
+        WatchMode.RECURRING,
         (),
         known_keys=frozenset(),
         last_best=None,
@@ -205,6 +252,7 @@ def test_decision_carries_the_recipient_user_id_unchanged() -> None:
     )
 
     assert decision.recipient_user_id == 42
+    assert decision.initial_recurring_empty is False
 
 
 # ---------------------------------------------------------------------------
