@@ -86,11 +86,16 @@ def test_manual_and_creation_triggers_always_require_a_snapshot_even_with_no_cha
     trigger: CheckTrigger,
 ) -> None:
     """Both an explicit ``/check`` and the immediate check a new watch schedules must
-    respond, even when nothing changed since the owner was last told."""
+    respond, even when nothing changed since the owner was last told.
+
+    This is the ordinary non-empty results path; the special recurring-empty kind is
+    covered by the separate zero-option test below.
+    """
+    options = (_GOOD_OPTION,)
     decision = decide_result_notification(
         trigger,
         WatchMode.RECURRING,
-        (_GOOD_OPTION,),
+        options,
         known_keys=frozenset({_GOOD_OPTION.key}),
         last_best=_GOOD,
         recipient_user_id=11,
