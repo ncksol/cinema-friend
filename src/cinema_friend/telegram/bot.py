@@ -290,6 +290,13 @@ class DeliveryWorker:
     async def defer_initial_recurring_empty(
         self, recipient_user_id: int
     ) -> AsyncIterator[None]:
+        """Hold back a recipient's initial-empty delivery while confirmation is in flight.
+
+        A row deferred this way is intentionally skipped by :meth:`run_once` for as long
+        as the deferral is held: skipping does not consume a delivery attempt or push
+        back its retry time, so the row is exactly as due the next time a sweep sees it
+        as it was before being skipped.
+        """
         self._initial_empty_deferrals[recipient_user_id] = (
             self._initial_empty_deferrals.get(recipient_user_id, 0) + 1
         )
@@ -317,6 +324,10 @@ class DeliveryWorker:
         time: an exception that escaped this loop would abort the sweep at the oldest
         row and would abort every future sweep at exactly the same place, permanently
         blocking every message queued behind it.
+
+        A due row deferred through :meth:`defer_initial_recurring_empty` is skipped the
+        same way: intentionally, and without consuming an attempt or changing its retry
+        time, so it is picked up by the next sweep once the deferral is released.
 
         ``BaseException`` is deliberately not caught. Cancellation and interpreter exit
         are not delivery problems and must keep unwinding.
@@ -568,7 +579,10 @@ def _chat_id(update: Update) -> int | None:
 
 
 def _route(
-    handler: _Handler, deps: CommandDeps, *, answers_callback: bool = False,
+    handler: _Handler,
+    deps: CommandDeps,
+    *,
+    answers_callback: bool = False,
     defer_initial_recurring_empty: bool = False,
 ) -> Callable[[Update, _Context], Coroutine[Any, Any, None]]:
     """Adapt a pure handler into a PTB callback that sends whatever it returns.

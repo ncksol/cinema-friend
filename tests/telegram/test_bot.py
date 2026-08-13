@@ -1280,3 +1280,85 @@ async def test_confirm_route_defers_before_handler_and_releases_before_flush(
     )
 
     assert events == ["defer", "handler", "confirmation", "release", "follow-up"]
+
+
+async def test_confirm_route_skips_flush_when_handler_sends_nothing(
+    harness: Harness,
+) -> None:
+    events: list[str] = []
+    dispatcher = _OrderedDispatcher(events)
+    deps = CommandDeps(
+        wizard=WizardDeps(
+            database=harness.database,
+            drafts=DraftRepository(),
+            watches=harness.watches,
+            checks=_Checks(),
+            clock=harness.clock,
+        ),
+        results=harness.results,
+        deliveries=dispatcher,
+        allowed_user_ids=frozenset({USER_ID}),
+    )
+
+    async def handler(update: Update, command_deps: CommandDeps) -> RenderedMessage | None:
+        return None
+
+    bot = _Bot()
+    callback = _route(
+        handler,
+        deps,
+        answers_callback=True,
+        defer_initial_recurring_empty=True,
+    )
+
+    await callback(
+        _callback_update("wizard:confirm", user_id=USER_ID),
+        SimpleNamespace(bot=bot),
+    )
+
+    assert bot.sent == []
+    assert events == []
+
+
+async def test_confirm_route_skips_flush_when_confirmation_send_raises(
+    harness: Harness,
+) -> None:
+    events: list[str] = []
+    dispatcher = _OrderedDispatcher(events)
+    deps = CommandDeps(
+        wizard=WizardDeps(
+            database=harness.database,
+            drafts=DraftRepository(),
+            watches=harness.watches,
+            checks=_Checks(),
+            clock=harness.clock,
+        ),
+        results=harness.results,
+        deliveries=dispatcher,
+        allowed_user_ids=frozenset({USER_ID}),
+    )
+
+    async def confirm(update: Update, command_deps: CommandDeps) -> RenderedMessage:
+        return RenderedMessage(
+            text="Watch created",
+            parse_mode=ParseMode.HTML,
+            reply_markup=None,
+        )
+
+    bot = _Bot()
+    bot.errors.append(TimedOut())
+    callback = _route(
+        confirm,
+        deps,
+        answers_callback=True,
+        defer_initial_recurring_empty=True,
+    )
+
+    with pytest.raises(TimedOut):
+        await callback(
+            _callback_update("wizard:confirm", user_id=USER_ID),
+            SimpleNamespace(bot=bot),
+        )
+
+    assert bot.sent == []
+    assert events == []
