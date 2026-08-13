@@ -128,7 +128,7 @@ class DeliveryDispatcher(Protocol):
     async def run_once(self) -> DeliveryOutcome: ...
 
     def defer_initial_recurring_empty(
-        self, recipient_user_id: int
+        self, recipient_user_id: int, watch_id: UUID
     ) -> AbstractAsyncContextManager[None]: ...
 
 

@@ -51,6 +51,7 @@ from cinema_friend.telegram.wizard import (
     parse_interval,
     parse_seat_selectors,
     parse_time_range,
+    prepare_confirmation_watch_id,
     recover_confirmations,
     start_new,
 )
@@ -1376,3 +1377,65 @@ async def test_recovery_releases_a_claim_it_can_never_complete(
     assert released.state == WizardState.REVIEW.value
     assert not await deps.watches.list_for_owner(USER_ID)
     assert fake_checks.calls == []
+
+
+async def test_prepare_confirmation_adds_stable_identity_to_legacy_review_draft(
+    deps: WizardDeps,
+) -> None:
+    await _drive_to_review(deps)
+    before = await _draft(deps)
+    assert before is not None
+    assert "setup_id" not in before.payload
+
+    first = await prepare_confirmation_watch_id(USER_ID, deps)
+    second = await prepare_confirmation_watch_id(USER_ID, deps)
+    prepared = await _draft(deps)
+
+    assert first is not None
+    assert second == first
+    assert prepared is not None
+    assert prepared.payload["setup_id"]
+
+
+async def test_confirm_creates_the_prepared_watch_id(deps: WizardDeps) -> None:
+    await _drive_to_review(deps)
+    prepared = await prepare_confirmation_watch_id(USER_ID, deps)
+    assert prepared is not None
+
+    await handle_wizard_callback(_callback_update("wizard:confirm"), deps)
+
+    (watch,) = await deps.watches.list_for_owner(USER_ID)
+    assert watch.watch_id == prepared
+
+
+async def test_prepare_confirmation_does_not_rewrite_an_already_prepared_draft(
+    deps: WizardDeps,
+    fake_clock: FakeClock,
+) -> None:
+    await _drive_to_review(deps)
+    first = await prepare_confirmation_watch_id(USER_ID, deps)
+    before = await _draft(deps)
+    assert first is not None
+    assert before is not None
+    fake_clock.current += timedelta(minutes=5)
+
+    second = await prepare_confirmation_watch_id(USER_ID, deps)
+    after = await _draft(deps)
+
+    assert second == first
+    assert after == before
+
+
+async def test_prepare_confirmation_returns_none_without_a_draft(deps: WizardDeps) -> None:
+    assert await prepare_confirmation_watch_id(USER_ID, deps) is None
+
+
+@pytest.mark.parametrize(
+    "state",
+    [WizardState.AWAIT_TIME_RANGE],
+)
+async def test_prepare_confirmation_returns_none_for_a_non_confirmable_draft(
+    deps: WizardDeps, state: WizardState
+) -> None:
+    await _seed_state(deps, state, {})
+    assert await prepare_confirmation_watch_id(USER_ID, deps) is None

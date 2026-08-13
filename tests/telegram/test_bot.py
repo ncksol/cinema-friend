@@ -60,7 +60,7 @@ from cinema_friend.telegram.bot import (
 )
 from cinema_friend.telegram.commands import STALE_ACTION, CommandDeps
 from cinema_friend.telegram.rendering import MAX_MESSAGE_CHARS, RenderedMessage
-from cinema_friend.telegram.wizard import WizardDeps
+from cinema_friend.telegram.wizard import WizardDeps, WizardState, prepare_confirmation_watch_id
 from tests.fakes import FakeClock
 
 NOW = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
@@ -899,7 +899,7 @@ async def test_initial_empty_deferral_is_scoped_by_kind_and_recipient(
         key="ordinary",
     )
 
-    async with harness.worker.defer_initial_recurring_empty(USER_ID):
+    async with harness.worker.defer_initial_recurring_empty(USER_ID, watch.watch_id):
         run = await harness.worker.run_once()
 
     assert run.sent_ids == frozenset({ordinary_id})
@@ -907,35 +907,65 @@ async def test_initial_empty_deferral_is_scoped_by_kind_and_recipient(
     assert len(harness.bot.sent) == 1
 
 
-async def test_deferral_is_scoped_to_the_specified_recipient(
+async def test_initial_empty_deferral_is_scoped_to_one_watch(
     harness: Harness,
 ) -> None:
-    other_id = USER_ID + 1
-    watch_mine = await _seed_watch(harness, watch_id=UUID("00000000-0000-4000-8000-000000000001"))
-    watch_other = await _seed_watch(
+    target = await _seed_watch(
         harness,
-        user_id=other_id,
+        watch_id=UUID("00000000-0000-4000-8000-000000000001"),
+    )
+    unrelated = await _seed_watch(
+        harness,
         watch_id=UUID("00000000-0000-4000-8000-000000000002"),
     )
-    empty_mine, _ = await _seed_snapshot(harness, watch_mine.watch_id, 0)
-    empty_other, _ = await _seed_snapshot(harness, watch_other.watch_id, 0)
-    mine_id = await _queue(
+    target_snapshot, _ = await _seed_snapshot(harness, target.watch_id, 0)
+    unrelated_snapshot, _ = await _seed_snapshot(harness, unrelated.watch_id, 0)
+    target_id = await _queue(
         harness,
-        _results_payload(empty_mine, new=0, initial_recurring_empty=True),
-        key="mine",
+        _results_payload(
+            target_snapshot,
+            watch_id=target.watch_id,
+            new=0,
+            initial_recurring_empty=True,
+        ),
+        key="target",
     )
-    other_delivery_id = await _queue(
+    unrelated_id = await _queue(
         harness,
-        _results_payload(empty_other, user_id=other_id, new=0, initial_recurring_empty=True),
-        key="other",
+        _results_payload(
+            unrelated_snapshot,
+            watch_id=unrelated.watch_id,
+            new=0,
+            initial_recurring_empty=True,
+        ),
+        key="unrelated",
     )
 
-    async with harness.worker.defer_initial_recurring_empty(USER_ID):
+    async with harness.worker.defer_initial_recurring_empty(USER_ID, target.watch_id):
         run = await harness.worker.run_once()
 
-    assert run.sent_ids == frozenset({other_delivery_id})
-    assert (await _delivery_row(harness, mine_id))["status"] == "pending"
-    assert len(harness.bot.sent) == 1
+    assert run.sent_ids == frozenset({unrelated_id})
+    assert (await _delivery_row(harness, target_id))["status"] == "pending"
+
+
+async def test_nested_watch_deferrals_release_at_refcount_zero(harness: Harness) -> None:
+    watch = await _seed_watch(harness)
+    snapshot_id, _ = await _seed_snapshot(harness, watch.watch_id, 0)
+    delivery_id = await _queue(
+        harness,
+        _results_payload(
+            snapshot_id,
+            new=0,
+            initial_recurring_empty=True,
+        ),
+    )
+
+    async with harness.worker.defer_initial_recurring_empty(USER_ID, watch.watch_id):
+        async with harness.worker.defer_initial_recurring_empty(USER_ID, watch.watch_id):
+            assert (await harness.worker.run_once()).attempted == 0
+        assert (await harness.worker.run_once()).attempted == 0
+
+    assert (await harness.worker.run_once()).sent_ids == frozenset({delivery_id})
 
 
 # ---------------------------------------------------------------------------
@@ -1181,9 +1211,13 @@ async def test_an_operational_failure_gets_guidance_rather_than_silence(
 class _OrderedDispatcher:
     def __init__(self, events: list[str]) -> None:
         self.events = events
+        self.deferred: list[tuple[int, UUID]] = []
 
     @asynccontextmanager
-    async def defer_initial_recurring_empty(self, recipient_user_id: int) -> AsyncIterator[None]:
+    async def defer_initial_recurring_empty(
+        self, recipient_user_id: int, watch_id: UUID
+    ) -> AsyncIterator[None]:
+        self.deferred.append((recipient_user_id, watch_id))
         yield
 
     async def run_once(self) -> DeliveryRun:
@@ -1191,19 +1225,55 @@ class _OrderedDispatcher:
         return DeliveryRun()
 
 
+class _RecordingDispatcher:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+        self.deferred: list[tuple[int, UUID]] = []
+
+    @asynccontextmanager
+    async def defer_initial_recurring_empty(
+        self, recipient_user_id: int, watch_id: UUID
+    ) -> AsyncIterator[None]:
+        self.deferred.append((recipient_user_id, watch_id))
+        self.events.append("defer")
+        try:
+            yield
+        finally:
+            self.events.append("release")
+
+    async def run_once(self) -> DeliveryRun:
+        self.events.append("follow-up")
+        return DeliveryRun()
+
+
+async def _seed_review_draft(
+    harness: Harness, wizard_deps: WizardDeps, *, setup_id: str = "review-setup-id"
+) -> None:
+    async with harness.database.connection() as conn:
+        await wizard_deps.drafts.upsert(
+            conn,
+            USER_ID,
+            WizardState.REVIEW.value,
+            {"setup_id": setup_id},
+            harness.clock.now(),
+        )
+
+
 async def test_confirm_route_sends_confirmation_before_flushing_delivery(
     harness: Harness,
 ) -> None:
     events: list[str] = []
     dispatcher = _OrderedDispatcher(events)
+    wizard_deps = WizardDeps(
+        database=harness.database,
+        drafts=DraftRepository(),
+        watches=harness.watches,
+        checks=_Checks(),
+        clock=harness.clock,
+    )
+    await _seed_review_draft(harness, wizard_deps)
     deps = CommandDeps(
-        wizard=WizardDeps(
-            database=harness.database,
-            drafts=DraftRepository(),
-            watches=harness.watches,
-            checks=_Checks(),
-            clock=harness.clock,
-        ),
+        wizard=wizard_deps,
         results=harness.results,
         deliveries=dispatcher,
         allowed_user_ids=frozenset({USER_ID}),
@@ -1245,32 +1315,21 @@ async def test_confirm_route_defers_before_handler_and_releases_before_flush(
     harness: Harness,
 ) -> None:
     events: list[str] = []
-
-    class _RecordingDispatcher:
-        @asynccontextmanager
-        async def defer_initial_recurring_empty(
-            self, recipient_user_id: int
-        ) -> AsyncIterator[None]:
-            events.append("defer")
-            try:
-                yield
-            finally:
-                events.append("release")
-
-        async def run_once(self) -> DeliveryRun:
-            events.append("follow-up")
-            return DeliveryRun()
-
+    dispatcher = _RecordingDispatcher(events)
+    wizard_deps = WizardDeps(
+        database=harness.database,
+        drafts=DraftRepository(),
+        watches=harness.watches,
+        checks=_Checks(),
+        clock=harness.clock,
+    )
+    await _seed_review_draft(harness, wizard_deps)
+    prepared_watch_id = await prepare_confirmation_watch_id(USER_ID, wizard_deps)
+    assert prepared_watch_id is not None
     deps = CommandDeps(
-        wizard=WizardDeps(
-            database=harness.database,
-            drafts=DraftRepository(),
-            watches=harness.watches,
-            checks=_Checks(),
-            clock=harness.clock,
-        ),
+        wizard=wizard_deps,
         results=harness.results,
-        deliveries=_RecordingDispatcher(),
+        deliveries=dispatcher,
         allowed_user_ids=frozenset({USER_ID}),
     )
 
@@ -1303,6 +1362,7 @@ async def test_confirm_route_defers_before_handler_and_releases_before_flush(
     )
 
     assert events == ["defer", "handler", "confirmation", "release", "follow-up"]
+    assert dispatcher.deferred == [(USER_ID, prepared_watch_id)]
 
 
 async def test_confirm_route_skips_flush_when_handler_sends_nothing(
@@ -1341,6 +1401,7 @@ async def test_confirm_route_skips_flush_when_handler_sends_nothing(
 
     assert bot.sent == []
     assert events == []
+    assert dispatcher.deferred == []
 
 
 async def test_confirm_route_skips_flush_when_confirmation_send_raises(
@@ -1348,14 +1409,16 @@ async def test_confirm_route_skips_flush_when_confirmation_send_raises(
 ) -> None:
     events: list[str] = []
     dispatcher = _OrderedDispatcher(events)
+    wizard_deps = WizardDeps(
+        database=harness.database,
+        drafts=DraftRepository(),
+        watches=harness.watches,
+        checks=_Checks(),
+        clock=harness.clock,
+    )
+    await _seed_review_draft(harness, wizard_deps)
     deps = CommandDeps(
-        wizard=WizardDeps(
-            database=harness.database,
-            drafts=DraftRepository(),
-            watches=harness.watches,
-            checks=_Checks(),
-            clock=harness.clock,
-        ),
+        wizard=wizard_deps,
         results=harness.results,
         deliveries=dispatcher,
         allowed_user_ids=frozenset({USER_ID}),

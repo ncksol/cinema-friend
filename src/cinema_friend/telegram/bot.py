@@ -78,7 +78,7 @@ from cinema_friend.telegram.rendering import (
     render_initial_recurring_empty_page,
     render_result_page,
 )
-from cinema_friend.telegram.wizard import CheckRunner, WizardDeps
+from cinema_friend.telegram.wizard import CheckRunner, WizardDeps, prepare_confirmation_watch_id
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -283,36 +283,42 @@ class DeliveryWorker:
         self._watches = watches
         self._clock = clock
         self._lock = asyncio.Lock()
-        self._initial_empty_deferrals: dict[int, int] = {}
+        self._initial_empty_deferrals: dict[tuple[int, UUID], int] = {}
 
     @asynccontextmanager
     async def defer_initial_recurring_empty(
-        self, recipient_user_id: int
+        self, recipient_user_id: int, watch_id: UUID
     ) -> AsyncIterator[None]:
-        """Hold back a recipient's initial-empty delivery while confirmation is in flight.
+        """Hold back one watch's initial-empty delivery while confirmation is in flight.
 
         A row deferred this way is intentionally skipped by :meth:`run_once` for as long
         as the deferral is held: skipping does not consume a delivery attempt or push
         back its retry time, so the row is exactly as due the next time a sweep sees it
-        as it was before being skipped.
+        as it was before being skipped. Scoping the key to ``(recipient_user_id,
+        watch_id)`` rather than the recipient alone keeps a different watch's pending
+        initial-empty retry deliverable while this one's confirmation runs.
         """
-        self._initial_empty_deferrals[recipient_user_id] = (
-            self._initial_empty_deferrals.get(recipient_user_id, 0) + 1
-        )
+        key = (recipient_user_id, watch_id)
+        self._initial_empty_deferrals[key] = self._initial_empty_deferrals.get(key, 0) + 1
         try:
             yield
         finally:
-            remaining = self._initial_empty_deferrals[recipient_user_id] - 1
+            remaining = self._initial_empty_deferrals[key] - 1
             if remaining:
-                self._initial_empty_deferrals[recipient_user_id] = remaining
+                self._initial_empty_deferrals[key] = remaining
             else:
-                del self._initial_empty_deferrals[recipient_user_id]
+                del self._initial_empty_deferrals[key]
 
     def _initial_empty_is_deferred(self, delivery: NotificationDelivery) -> bool:
         return (
             delivery.payload.kind == _RESULTS_KIND
             and delivery.payload.initial_recurring_empty
-            and delivery.payload.recipient_user_id in self._initial_empty_deferrals
+            and delivery.payload.watch_id is not None
+            and (
+                delivery.payload.recipient_user_id,
+                delivery.payload.watch_id,
+            )
+            in self._initial_empty_deferrals
         )
 
     async def run_once(self) -> DeliveryRun:
@@ -632,7 +638,11 @@ def _route(
             return True
 
         if defer_initial_recurring_empty:
-            async with deps.deliveries.defer_initial_recurring_empty(user_id):
+            watch_id = await prepare_confirmation_watch_id(user_id, deps.wizard)
+            if watch_id is None:
+                await invoke_and_send()
+                return
+            async with deps.deliveries.defer_initial_recurring_empty(user_id, watch_id):
                 sent = await invoke_and_send()
             if sent:
                 await deps.deliveries.run_once()

@@ -923,6 +923,28 @@ def _watch_id_for(setup_id: str) -> UUID:
     return uuid5(_WATCH_NAMESPACE, setup_id)
 
 
+async def prepare_confirmation_watch_id(
+    user_id: int, deps: WizardDeps
+) -> UUID | None:
+    """Ensure a confirmable draft has the stable identity its saga will create."""
+    async with deps.database.connection() as conn, deps.database.transaction(conn):
+        draft = await deps.drafts.get(conn, user_id)
+        if draft is None:
+            return None
+        state = WizardState(draft.state)
+        if state not in (WizardState.REVIEW, WizardState.CONFIRMING):
+            return None
+        payload = dict(draft.payload)
+        setup_id = payload.get("setup_id")
+        if setup_id is None:
+            if state is not WizardState.REVIEW:
+                return None
+            setup_id = str(uuid4())
+            payload["setup_id"] = setup_id
+            await deps.drafts.upsert(conn, user_id, state.value, payload, deps.clock.now())
+    return _watch_id_for(setup_id)
+
+
 def _claim_is_live(draft: ConversationDraft, now: datetime) -> bool:
     return now - draft.updated_at < CLAIM_LEASE
 
