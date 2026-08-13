@@ -42,8 +42,8 @@ from cinema_friend.domain.results import (
 )
 from cinema_friend.domain.state import CheckOutcome, CheckTrigger, WatchMode, WatchStatus
 from cinema_friend.domain.watch import Watch, WatchCriteria
-from cinema_friend.services.watch_service import WatchService
 from cinema_friend.services.notification_policy import INITIAL_RECURRING_EMPTY_KIND
+from cinema_friend.services.watch_service import WatchService
 from cinema_friend.storage.database import Database
 from cinema_friend.storage.draft_repository import DraftRepository
 from cinema_friend.storage.notification_repository import NotificationRepository

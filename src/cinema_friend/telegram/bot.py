@@ -52,8 +52,8 @@ from cinema_friend.clock import Clock
 from cinema_friend.config import Settings
 from cinema_friend.domain.errors import AuthorizationError, InputError
 from cinema_friend.domain.results import NotificationDelivery, RankVector
-from cinema_friend.services.watch_service import WatchService
 from cinema_friend.services.notification_policy import INITIAL_RECURRING_EMPTY_KIND
+from cinema_friend.services.watch_service import WatchService
 from cinema_friend.storage.database import Database
 from cinema_friend.storage.draft_repository import DraftRepository
 from cinema_friend.storage.notification_repository import NotificationRepository
