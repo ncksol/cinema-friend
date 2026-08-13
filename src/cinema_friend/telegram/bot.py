@@ -20,7 +20,8 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
-from collections.abc import Awaitable, Callable, Coroutine, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
@@ -283,6 +284,29 @@ class DeliveryWorker:
         self._watches = watches
         self._clock = clock
         self._lock = asyncio.Lock()
+        self._initial_empty_deferrals: dict[int, int] = {}
+
+    @asynccontextmanager
+    async def defer_initial_recurring_empty(
+        self, recipient_user_id: int
+    ) -> AsyncIterator[None]:
+        self._initial_empty_deferrals[recipient_user_id] = (
+            self._initial_empty_deferrals.get(recipient_user_id, 0) + 1
+        )
+        try:
+            yield
+        finally:
+            remaining = self._initial_empty_deferrals[recipient_user_id] - 1
+            if remaining:
+                self._initial_empty_deferrals[recipient_user_id] = remaining
+            else:
+                del self._initial_empty_deferrals[recipient_user_id]
+
+    def _initial_empty_is_deferred(self, delivery: NotificationDelivery) -> bool:
+        return (
+            delivery.payload.kind == INITIAL_RECURRING_EMPTY_KIND
+            and delivery.payload.recipient_user_id in self._initial_empty_deferrals
+        )
 
     async def run_once(self) -> DeliveryRun:
         """Attempt every delivery that is due now and report what happened to each.
@@ -303,6 +327,8 @@ class DeliveryWorker:
                 due = await self._notifications.due_deliveries(conn, now)
             attempts: list[DeliveryAttempt] = []
             for delivery in due:
+                if self._initial_empty_is_deferred(delivery):
+                    continue
                 try:
                     attempts.append(await self._attempt(delivery, now))
                 except Exception:
@@ -542,7 +568,8 @@ def _chat_id(update: Update) -> int | None:
 
 
 def _route(
-    handler: _Handler, deps: CommandDeps, *, answers_callback: bool = False
+    handler: _Handler, deps: CommandDeps, *, answers_callback: bool = False,
+    defer_initial_recurring_empty: bool = False,
 ) -> Callable[[Update, _Context], Coroutine[Any, Any, None]]:
     """Adapt a pure handler into a PTB callback that sends whatever it returns.
 
@@ -563,7 +590,7 @@ def _route(
 
     async def callback(update: Update, context: _Context) -> None:
         try:
-            authorized_user_id(update, deps.allowed_user_ids)
+            user_id = authorized_user_id(update, deps.allowed_user_ids)
         except AuthorizationError:
             _LOGGER.warning("denied update %s", update.update_id)
             await _reply(update, context, DENIAL_TEXT)
@@ -572,19 +599,32 @@ def _route(
             # Stop the client's spinner before doing any work, so a slow handler does
             # not look like a broken button. Only ever for a caller already allowed in.
             await context.bot.answer_callback_query(update.callback_query.id)
-        try:
-            message = await handler(update, deps)
-        except AuthorizationError:  # pragma: no cover - the guard above already ran
-            _LOGGER.warning("denied update %s", update.update_id)
-            await _reply(update, context, DENIAL_TEXT)
+
+        async def invoke_and_send() -> bool:
+            try:
+                message = await handler(update, deps)
+            except AuthorizationError:  # pragma: no cover - the guard above already ran
+                _LOGGER.warning("denied update %s", update.update_id)
+                await _reply(update, context, DENIAL_TEXT)
+                return False
+            except InputError as error:
+                _LOGGER.warning(
+                    "unhandled input error on update %s: %s", update.update_id, error
+                )
+                await _reply(update, context, STALE_ACTION)
+                return False
+            if message is None:
+                return False
+            await _send(update, context, message)
+            return True
+
+        if defer_initial_recurring_empty:
+            async with deps.deliveries.defer_initial_recurring_empty(user_id):
+                sent = await invoke_and_send()
+            if sent:
+                await deps.deliveries.run_once()
             return
-        except InputError as error:
-            _LOGGER.warning("unhandled input error on update %s: %s", update.update_id, error)
-            await _reply(update, context, STALE_ACTION)
-            return
-        if message is None:
-            return
-        await _send(update, context, message)
+        await invoke_and_send()
 
     return callback
 
@@ -658,6 +698,17 @@ def build_telegram_application(
 
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, _route(handle_text, deps))
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            _route(
+                handle_wizard_button,
+                deps,
+                answers_callback=True,
+                defer_initial_recurring_empty=True,
+            ),
+            pattern="^wizard:confirm$",
+        )
     )
     application.add_handler(
         CallbackQueryHandler(

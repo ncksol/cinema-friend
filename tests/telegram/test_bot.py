@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
@@ -24,6 +26,7 @@ from uuid import UUID, uuid4
 
 import pytest
 from telegram import CallbackQuery, Chat, Message, Update, User
+from telegram.constants import ParseMode
 from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError, TimedOut
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler
 
@@ -50,11 +53,14 @@ from cinema_friend.telegram.auth import DENIAL_TEXT
 from cinema_friend.telegram.bot import (
     RETRY_DELAYS,
     BotDependencies,
+    DeliveryRun,
     DeliveryWorker,
+    _route,
     build_telegram_application,
 )
-from cinema_friend.telegram.commands import STALE_ACTION
-from cinema_friend.telegram.rendering import MAX_MESSAGE_CHARS
+from cinema_friend.telegram.commands import STALE_ACTION, CommandDeps
+from cinema_friend.telegram.rendering import MAX_MESSAGE_CHARS, RenderedMessage
+from cinema_friend.telegram.wizard import WizardDeps
 from tests.fakes import FakeClock
 
 NOW = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
@@ -164,13 +170,14 @@ def _criteria(**overrides: Any) -> WatchCriteria:
 async def _seed_watch(
     harness: Harness,
     *,
+    user_id: int = USER_ID,
     watch_id: UUID = WATCH_ID,
     status: WatchStatus = WatchStatus.ACTIVE,
     title: str | None = "Dog Stars",
 ) -> Watch:
     watch = Watch(
         watch_id=watch_id,
-        user_id=USER_ID,
+        user_id=user_id,
         criteria=_criteria(),
         status=status,
         created_at=NOW,
@@ -249,13 +256,14 @@ async def _queue(
 def _results_payload(
     snapshot_id: UUID,
     *,
+    user_id: int = USER_ID,
     watch_id: UUID = WATCH_ID,
     new: int = 3,
     kind: str = "results",
 ) -> NotificationPayload:
     return NotificationPayload(
         kind=kind,
-        recipient_user_id=USER_ID,
+        recipient_user_id=user_id,
         watch_id=watch_id,
         snapshot_id=snapshot_id,
         new_option_count=new,
@@ -843,6 +851,71 @@ async def test_a_run_only_claims_a_send_for_the_watch_that_got_one(harness: Harn
 
 
 # ---------------------------------------------------------------------------
+# Deferral
+# ---------------------------------------------------------------------------
+
+
+async def test_initial_empty_deferral_is_scoped_by_kind_and_recipient(
+    harness: Harness,
+) -> None:
+    watch = await _seed_watch(harness)
+    empty_snapshot, _ = await _seed_snapshot(harness, watch.watch_id, 0)
+    result_snapshot, _ = await _seed_snapshot(harness, watch.watch_id, 1)
+    special_id = await _queue(
+        harness,
+        _results_payload(
+            empty_snapshot,
+            new=0,
+            kind="initial_recurring_empty",
+        ),
+        key="special",
+    )
+    ordinary_id = await _queue(
+        harness,
+        _results_payload(result_snapshot),
+        key="ordinary",
+    )
+
+    async with harness.worker.defer_initial_recurring_empty(USER_ID):
+        run = await harness.worker.run_once()
+
+    assert run.sent_ids == frozenset({ordinary_id})
+    assert (await _delivery_row(harness, special_id))["status"] == "pending"
+    assert len(harness.bot.sent) == 1
+
+
+async def test_deferral_is_scoped_to_the_specified_recipient(
+    harness: Harness,
+) -> None:
+    other_id = USER_ID + 1
+    watch_mine = await _seed_watch(harness, watch_id=UUID("00000000-0000-4000-8000-000000000001"))
+    watch_other = await _seed_watch(
+        harness,
+        user_id=other_id,
+        watch_id=UUID("00000000-0000-4000-8000-000000000002"),
+    )
+    empty_mine, _ = await _seed_snapshot(harness, watch_mine.watch_id, 0)
+    empty_other, _ = await _seed_snapshot(harness, watch_other.watch_id, 0)
+    mine_id = await _queue(
+        harness,
+        _results_payload(empty_mine, new=0, kind="initial_recurring_empty"),
+        key="mine",
+    )
+    other_delivery_id = await _queue(
+        harness,
+        _results_payload(empty_other, user_id=other_id, new=0, kind="initial_recurring_empty"),
+        key="other",
+    )
+
+    async with harness.worker.defer_initial_recurring_empty(USER_ID):
+        run = await harness.worker.run_once()
+
+    assert run.sent_ids == frozenset({other_delivery_id})
+    assert (await _delivery_row(harness, mine_id))["status"] == "pending"
+    assert len(harness.bot.sent) == 1
+
+
+# ---------------------------------------------------------------------------
 # Application wiring
 # ---------------------------------------------------------------------------
 
@@ -913,6 +986,7 @@ async def test_wizard_callbacks_are_matched_before_watch_callbacks(
         for handler in _registered(application)
         if isinstance(handler, CallbackQueryHandler) and handler.pattern is not None
     ]
+    assert patterns.index("^wizard:confirm$") < patterns.index("^wizard:")
     assert patterns.index("^wizard:") < patterns.index("^v1:")
 
 
@@ -1011,12 +1085,15 @@ async def test_every_denial_is_the_same_single_response(harness: Harness, tmp_pa
     await _callback_handler(application, "^v1:").callback(
         _callback_update(f"v1:pause:{WATCH_ID}", user_id=999), context
     )
+    await _callback_handler(application, "^wizard:confirm$").callback(
+        _callback_update("wizard:confirm", user_id=999), context
+    )
     await _callback_handler(application, "^wizard:").callback(
         _callback_update("wizard:qty:2", user_id=999), context
     )
 
     assert {message["text"] for message in bot.sent} == {DENIAL_TEXT}
-    assert len(bot.sent) == 9
+    assert len(bot.sent) == 10
 
 
 async def test_a_routed_callback_denies_before_answering_the_query(
@@ -1071,3 +1148,135 @@ async def test_an_operational_failure_gets_guidance_rather_than_silence(
     assert len(bot.sent) == 1
     assert bot.sent[0]["text"] == STALE_ACTION
     assert "vanished" not in bot.sent[0]["text"]
+
+
+# ---------------------------------------------------------------------------
+# Confirmation-first ordering
+# ---------------------------------------------------------------------------
+
+
+class _OrderedDispatcher:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+
+    @asynccontextmanager
+    async def defer_initial_recurring_empty(self, recipient_user_id: int) -> AsyncIterator[None]:
+        yield
+
+    async def run_once(self) -> DeliveryRun:
+        self.events.append("follow-up")
+        return DeliveryRun()
+
+
+async def test_confirm_route_sends_confirmation_before_flushing_delivery(
+    harness: Harness,
+) -> None:
+    events: list[str] = []
+    dispatcher = _OrderedDispatcher(events)
+    deps = CommandDeps(
+        wizard=WizardDeps(
+            database=harness.database,
+            drafts=DraftRepository(),
+            watches=harness.watches,
+            checks=_Checks(),
+            clock=harness.clock,
+        ),
+        results=harness.results,
+        deliveries=dispatcher,
+        allowed_user_ids=frozenset({USER_ID}),
+    )
+
+    async def confirm(
+        update: Update, command_deps: CommandDeps
+    ) -> RenderedMessage:
+        return RenderedMessage(
+            text="Watch created",
+            parse_mode=ParseMode.HTML,
+            reply_markup=None,
+        )
+
+    bot = _Bot()
+    original_send = bot.send_message
+
+    async def record_send(**kwargs: Any) -> object:
+        events.append("confirmation")
+        return await original_send(**kwargs)
+
+    bot.send_message = record_send  # type: ignore[method-assign]
+    callback = _route(
+        confirm,
+        deps,
+        answers_callback=True,
+        defer_initial_recurring_empty=True,
+    )
+
+    await callback(
+        _callback_update("wizard:confirm", user_id=USER_ID),
+        SimpleNamespace(bot=bot),
+    )
+
+    assert events == ["confirmation", "follow-up"]
+
+
+async def test_confirm_route_defers_before_handler_and_releases_before_flush(
+    harness: Harness,
+) -> None:
+    events: list[str] = []
+
+    class _RecordingDispatcher:
+        @asynccontextmanager
+        async def defer_initial_recurring_empty(
+            self, recipient_user_id: int
+        ) -> AsyncIterator[None]:
+            events.append("defer")
+            try:
+                yield
+            finally:
+                events.append("release")
+
+        async def run_once(self) -> DeliveryRun:
+            events.append("follow-up")
+            return DeliveryRun()
+
+    deps = CommandDeps(
+        wizard=WizardDeps(
+            database=harness.database,
+            drafts=DraftRepository(),
+            watches=harness.watches,
+            checks=_Checks(),
+            clock=harness.clock,
+        ),
+        results=harness.results,
+        deliveries=_RecordingDispatcher(),
+        allowed_user_ids=frozenset({USER_ID}),
+    )
+
+    async def handler(update: Update, command_deps: CommandDeps) -> RenderedMessage:
+        events.append("handler")
+        return RenderedMessage(
+            text="Watch created",
+            parse_mode=ParseMode.HTML,
+            reply_markup=None,
+        )
+
+    bot = _Bot()
+    original_send = bot.send_message
+
+    async def record_send(**kwargs: Any) -> object:
+        events.append("confirmation")
+        return await original_send(**kwargs)
+
+    bot.send_message = record_send  # type: ignore[method-assign]
+    callback = _route(
+        handler,
+        deps,
+        answers_callback=True,
+        defer_initial_recurring_empty=True,
+    )
+
+    await callback(
+        _callback_update("wizard:confirm", user_id=USER_ID),
+        SimpleNamespace(bot=bot),
+    )
+
+    assert events == ["defer", "handler", "confirmation", "release", "follow-up"]
