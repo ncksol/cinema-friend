@@ -319,6 +319,27 @@ async def test_initial_recurring_empty_delivery_uses_keep_watching_copy(
     assert "No matching seats" not in text
 
 
+async def test_initial_recurring_empty_delivery_keeps_results_copy_for_non_empty_snapshots(
+    harness: Harness,
+) -> None:
+    watch = await _seed_watch(harness)
+    snapshot_id, _ = await _seed_snapshot(harness, watch.watch_id, 1)
+    await _queue(
+        harness,
+        _results_payload(
+            snapshot_id,
+            new=1,
+            kind=INITIAL_RECURRING_EMPTY_KIND,
+        ),
+    )
+
+    await harness.worker.run_once()
+
+    text = harness.bot.sent[0]["text"]
+    assert "L0-M0" in text
+    assert "I haven't found anything right now, but I'll keep watching." not in text
+
+
 async def test_successful_delivery_renders_the_referenced_snapshot(harness: Harness) -> None:
     watch = await _seed_watch(harness)
     older, _ = await _seed_snapshot(harness, watch.watch_id, 1)

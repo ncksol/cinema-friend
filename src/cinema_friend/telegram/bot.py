@@ -504,9 +504,10 @@ class DeliveryWorker:
             key=lambda vector: vector.sort_key(),
             default=None,
         )
+        use_initial_recurring_empty = initial_recurring_empty and not full.options
         message = (
             render_initial_recurring_empty_page(page)
-            if initial_recurring_empty
+            if use_initial_recurring_empty
             else render_result_page(page)
         )
         return _Renderable(message, keys, best)
