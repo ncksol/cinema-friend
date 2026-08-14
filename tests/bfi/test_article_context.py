@@ -207,6 +207,28 @@ def test_sold_out_sentinel_is_normalised_to_a_published_zero(
     assert performance.availability_num == 0
 
 
+@pytest.mark.parametrize(
+    ("availability_status", "availability_num"),
+    [
+        pytest.param("S**", "-4", id="malformed-sold-out-status"),
+        pytest.param("U**", "-1", id="malformed-unpublished-status"),
+        pytest.param("E", "-4", id="sold-out-sentinel-with-available-status"),
+        pytest.param("S", "-2", id="unknown-sentinel-with-sold-out-status"),
+    ],
+)
+def test_unrecognised_negative_availability_pairs_are_contract_errors(
+    availability_status: str,
+    availability_num: str,
+) -> None:
+    row = performance_mapping(
+        availability_status=availability_status,
+        availability_num=availability_num,
+    )
+
+    with pytest.raises(BfiContractError, match="availability_num"):
+        performance_from_row(row)
+
+
 def test_sentinel_with_any_other_status_is_a_contract_error() -> None:
     """Only ``U`` licenses the sentinel; anywhere else ``-1`` is unexplained drift."""
     row = performance_mapping(availability_status="E", availability_num="-1")

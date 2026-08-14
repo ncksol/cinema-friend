@@ -179,10 +179,10 @@ def _availability(row: Mapping[str, object], availability_status: str) -> tuple[
     """Return ``(effective_count, published)`` for a row's ``availability_num``.
 
     BFI sends the count as a decimal string, but uses paired status/count sentinels for
-    non-count states. ``-1`` with base status ``U`` means the count is withheld and
-    normalises to zero candidates with ``published=False``. ``-4`` with base status ``S``
-    means sold out and normalises to a known zero. Any unrecognised negative pair fails
-    closed.
+    non-count states. ``-1`` with status ``U`` or ``U*`` means the count is withheld and
+    normalises to zero candidates with ``published=False``. ``-4`` with status ``S`` or
+    ``S*`` means sold out and normalises to a known zero. Any unrecognised negative pair
+    fails closed.
     """
     raw = _require_str(row, "availability_num")
     try:
@@ -191,14 +191,14 @@ def _availability(row: Mapping[str, object], availability_status: str) -> tuple[
         raise BfiContractError(f"availability_num is not an integer: {raw!r}") from exc
     if value >= 0:
         return value, True
-    if (
-        value == UNPUBLISHED_AVAILABILITY_SENTINEL
-        and availability_status.rstrip("*") == UNPUBLISHED_AVAILABILITY_STATUS
+    if value == UNPUBLISHED_AVAILABILITY_SENTINEL and availability_status in (
+        UNPUBLISHED_AVAILABILITY_STATUS,
+        f"{UNPUBLISHED_AVAILABILITY_STATUS}*",
     ):
         return 0, False
-    if (
-        value == SOLD_OUT_AVAILABILITY_SENTINEL
-        and availability_status.rstrip("*") == SOLD_OUT_AVAILABILITY_STATUS
+    if value == SOLD_OUT_AVAILABILITY_SENTINEL and availability_status in (
+        SOLD_OUT_AVAILABILITY_STATUS,
+        f"{SOLD_OUT_AVAILABILITY_STATUS}*",
     ):
         return 0, True
     raise BfiContractError(
