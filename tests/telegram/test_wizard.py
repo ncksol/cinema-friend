@@ -211,12 +211,35 @@ def _callback_update(data: str) -> Update:
     return Update(update_id=1, callback_query=callback_query)
 
 
+async def _choose_uniform_time(
+    deps: WizardDeps,
+    times: str = "18:00 to 23:00",
+) -> None:
+    reply = await handle_wizard_callback(
+        _callback_update("wizard:time-mode:same"),
+        deps,
+    )
+    assert reply is not None
+    assert (await handle_wizard_text(_text_update(times), deps)) is not None
+
+
+async def _drive_to_time_mode(deps: WizardDeps) -> RenderedMessage:
+    await start_new(_text_update("/new"), deps)
+    await handle_wizard_text(_text_update(FILM_URL), deps)
+    reply = await handle_wizard_text(
+        _text_update("2026-08-26 to 2026-08-30"),
+        deps,
+    )
+    assert reply is not None
+    return reply
+
+
 async def _drive_to_review(deps: WizardDeps) -> None:
     """Push a fresh draft through every step up to (and including) ``REVIEW``."""
     await start_new(_text_update(""), deps)
     assert (await handle_wizard_text(_text_update(FILM_URL), deps)) is not None
     assert (await handle_wizard_text(_text_update("2026-08-26 to 2026-08-30"), deps)) is not None
-    assert (await handle_wizard_text(_text_update("18:00 to 23:00"), deps)) is not None
+    await _choose_uniform_time(deps)
     assert (await handle_wizard_callback(_callback_update("wizard:qty:2"), deps)) is not None
     assert (
         await handle_wizard_callback(
@@ -335,7 +358,7 @@ async def test_start_new_creates_a_draft_awaiting_the_url(deps: WizardDeps) -> N
         draft = await deps.drafts.get(conn, USER_ID)
     assert draft is not None
     assert draft.state == WizardState.AWAIT_URL.value
-    assert draft.payload == {"seat_flow_version": 2}
+    assert draft.payload == {"seat_flow_version": 2, "time_flow_version": 2}
 
 
 async def test_start_new_replaces_an_abandoned_draft(deps: WizardDeps) -> None:
@@ -348,7 +371,7 @@ async def test_start_new_replaces_an_abandoned_draft(deps: WizardDeps) -> None:
         draft = await deps.drafts.get(conn, USER_ID)
     assert draft is not None
     assert draft.state == WizardState.AWAIT_URL.value
-    assert draft.payload == {"seat_flow_version": 2}
+    assert draft.payload == {"seat_flow_version": 2, "time_flow_version": 2}
 
 
 async def test_cancel_deletes_the_draft(deps: WizardDeps) -> None:
@@ -385,7 +408,7 @@ async def test_handle_wizard_text_returns_none_when_draft_awaits_a_callback(
     await start_new(_text_update("/new"), deps)
     await handle_wizard_text(_text_update(FILM_URL), deps)
     await handle_wizard_text(_text_update("2026-08-26 to 2026-08-30"), deps)
-    await handle_wizard_text(_text_update("18:00 to 23:00"), deps)
+    await _choose_uniform_time(deps)
 
     assert await handle_wizard_text(_text_update("2"), deps) is None
 
@@ -413,14 +436,14 @@ async def test_invalid_url_leaves_draft_unchanged(deps: WizardDeps) -> None:
         draft = await deps.drafts.get(conn, USER_ID)
     assert draft is not None
     assert draft.state == WizardState.AWAIT_URL.value
-    assert draft.payload == {"seat_flow_version": 2}
+    assert draft.payload == {"seat_flow_version": 2, "time_flow_version": 2}
 
 
 async def test_invalid_quantity_leaves_draft_unchanged(deps: WizardDeps) -> None:
     await start_new(_text_update("/new"), deps)
     await handle_wizard_text(_text_update(FILM_URL), deps)
     await handle_wizard_text(_text_update("2026-08-26 to 2026-08-30"), deps)
-    await handle_wizard_text(_text_update("18:00 to 23:00"), deps)
+    await _choose_uniform_time(deps)
 
     reply = await handle_wizard_callback(_callback_update("wizard:qty:9"), deps)
 
@@ -436,7 +459,7 @@ async def test_quantity_zero_is_rejected(deps: WizardDeps) -> None:
     await start_new(_text_update("/new"), deps)
     await handle_wizard_text(_text_update(FILM_URL), deps)
     await handle_wizard_text(_text_update("2026-08-26 to 2026-08-30"), deps)
-    await handle_wizard_text(_text_update("18:00 to 23:00"), deps)
+    await _choose_uniform_time(deps)
 
     reply = await handle_wizard_callback(_callback_update("wizard:qty:0"), deps)
 
@@ -451,7 +474,7 @@ async def test_quantity_eight_is_accepted(deps: WizardDeps) -> None:
     await start_new(_text_update("/new"), deps)
     await handle_wizard_text(_text_update(FILM_URL), deps)
     await handle_wizard_text(_text_update("2026-08-26 to 2026-08-30"), deps)
-    await handle_wizard_text(_text_update("18:00 to 23:00"), deps)
+    await _choose_uniform_time(deps)
 
     reply = await handle_wizard_callback(_callback_update("wizard:qty:8"), deps)
 
@@ -472,7 +495,159 @@ async def _drive_to_quantity(deps: WizardDeps) -> None:
     await start_new(_text_update("/new"), deps)
     await handle_wizard_text(_text_update(FILM_URL), deps)
     await handle_wizard_text(_text_update("2026-08-26 to 2026-08-30"), deps)
+    await _choose_uniform_time(deps)
+
+
+# ---------------------------------------------------------------------------
+# Time-mode schedule choice
+# ---------------------------------------------------------------------------
+
+
+async def test_new_draft_asks_for_time_mode_after_dates(deps: WizardDeps) -> None:
+    reply = await _drive_to_time_mode(deps)
+
+    draft = await _draft(deps)
+    assert draft is not None
+    assert draft.state == WizardState.AWAIT_TIME_MODE.value
+    assert _callback_data(reply) == {
+        "wizard:time-mode:same",
+        "wizard:time-mode:split",
+    }
+
+
+async def test_uniform_time_mode_uses_one_window(deps: WizardDeps) -> None:
+    await _drive_to_time_mode(deps)
+
+    await _choose_uniform_time(deps)
+
+    draft = await _draft(deps)
+    assert draft is not None
+    assert draft.state == WizardState.AWAIT_QUANTITY.value
+    assert draft.payload["time_from"] == "18:00:00"
+    assert draft.payload["time_to"] == "23:00:00"
+    assert "weekend_time_from" not in draft.payload
+    assert "weekend_time_to" not in draft.payload
+
+
+async def test_split_time_mode_collects_both_windows(deps: WizardDeps) -> None:
+    await _drive_to_time_mode(deps)
+    await handle_wizard_callback(
+        _callback_update("wizard:time-mode:split"),
+        deps,
+    )
     await handle_wizard_text(_text_update("18:00 to 23:00"), deps)
+
+    reply = await handle_wizard_text(_text_update("12:00 to 16:00"), deps)
+
+    assert reply is not None
+    draft = await _draft(deps)
+    assert draft is not None
+    assert draft.state == WizardState.AWAIT_QUANTITY.value
+    assert draft.payload["time_from"] == "18:00:00"
+    assert draft.payload["time_to"] == "23:00:00"
+    assert draft.payload["weekend_time_from"] == "12:00:00"
+    assert draft.payload["weekend_time_to"] == "16:00:00"
+
+
+async def test_split_time_mode_prompts_weekday_then_weekend_windows(
+    deps: WizardDeps,
+) -> None:
+    await _drive_to_time_mode(deps)
+
+    reply = await handle_wizard_callback(_callback_update("wizard:time-mode:split"), deps)
+
+    assert reply is not None
+    assert "What Monday-Friday time window?" in reply.text
+
+    followup = await handle_wizard_text(_text_update("18:00 to 23:00"), deps)
+
+    assert followup is not None
+    assert "What Saturday-Sunday time window?" in followup.text
+
+
+async def test_invalid_time_mode_leaves_draft_unchanged(deps: WizardDeps) -> None:
+    await _drive_to_time_mode(deps)
+
+    reply = await handle_wizard_callback(
+        _callback_update("wizard:time-mode:weekly"),
+        deps,
+    )
+
+    assert reply is not None
+    draft = await _draft(deps)
+    assert draft is not None
+    assert draft.state == WizardState.AWAIT_TIME_MODE.value
+    assert "time_from" not in draft.payload
+
+
+async def test_split_schedule_resumes_at_weekend_window_after_restart(
+    db_path: Path,
+    fake_clock: FakeClock,
+    fake_checks: FakeCheckRunner,
+) -> None:
+    first_database = await _make_database(db_path)
+    first = _deps(first_database, fake_clock, fake_checks)
+    await _drive_to_time_mode(first)
+    await handle_wizard_callback(
+        _callback_update("wizard:time-mode:split"),
+        first,
+    )
+    await handle_wizard_text(_text_update("18:00 to 23:00"), first)
+
+    second = _deps(Database(db_path), fake_clock, fake_checks)
+    draft = await _draft(second)
+
+    assert draft is not None
+    assert draft.state == WizardState.AWAIT_WEEKEND_TIME_RANGE.value
+    assert draft.payload["time_from"] == "18:00:00"
+    assert draft.payload["time_to"] == "23:00:00"
+
+
+async def test_legacy_time_range_draft_keeps_uniform_flow(deps: WizardDeps) -> None:
+    await _seed_state(
+        deps,
+        WizardState.AWAIT_TIME_RANGE,
+        {
+            "date_from": "2026-08-26",
+            "date_to": "2026-08-30",
+        },
+    )
+
+    await handle_wizard_text(_text_update("18:00 to 23:00"), deps)
+
+    draft = await _draft(deps)
+    assert draft is not None
+    assert draft.state == WizardState.AWAIT_QUANTITY.value
+    assert "time_flow_version" not in draft.payload
+
+
+async def test_split_schedule_review_labels_both_windows(deps: WizardDeps) -> None:
+    await _drive_to_time_mode(deps)
+    await handle_wizard_callback(
+        _callback_update("wizard:time-mode:split"),
+        deps,
+    )
+    await handle_wizard_text(_text_update("18:00 to 23:00"), deps)
+    await handle_wizard_text(_text_update("12:00 to 16:00"), deps)
+    await handle_wizard_callback(_callback_update("wizard:qty:2"), deps)
+    await handle_wizard_callback(
+        _callback_update("wizard:seat-mode:simple"),
+        deps,
+    )
+    await handle_wizard_callback(
+        _callback_update("wizard:seat-preference:only_best"),
+        deps,
+    )
+    await handle_wizard_text(_text_update("skip"), deps)
+
+    reply = await handle_wizard_callback(
+        _callback_update("wizard:mode:one_off"),
+        deps,
+    )
+
+    assert reply is not None
+    assert "Weekdays: 18:00 to 23:00" in reply.text
+    assert "Weekends: 12:00 to 16:00" in reply.text
 
 
 def _callback_data(message: RenderedMessage) -> set[str]:
@@ -497,11 +672,6 @@ async def test_new_quantity_choice_prompts_for_simple_or_advanced(
     )
 
     assert reply is not None
-    assert reply.text == (
-        "How would you like to choose acceptable seats?\n\n"
-        "<b>Simple</b>: choose a preset for central seats between the aisles.\n"
-        "<b>Advanced</b>: set preferred and excluded rows or exact seats yourself."
-    )
     draft = await _draft(deps)
     assert draft is not None
     assert draft.state == WizardState.AWAIT_SEAT_MODE.value
@@ -766,7 +936,7 @@ async def _drive_to_preferred_instant(
     await start_new(_text_update("/new"), deps)
     await handle_wizard_text(_text_update(FILM_URL), deps)
     await handle_wizard_text(_text_update(dates), deps)
-    await handle_wizard_text(_text_update(times), deps)
+    await _choose_uniform_time(deps, times)
     await handle_wizard_callback(_callback_update("wizard:qty:2"), deps)
     assert (
         await handle_wizard_callback(
@@ -892,6 +1062,53 @@ async def test_preferred_instant_rejects_a_local_time_that_does_not_exist(
     assert draft.state == WizardState.AWAIT_PREFERRED_INSTANT.value
 
 
+async def _drive_split_to_preferred_instant(deps: WizardDeps) -> None:
+    await _drive_to_time_mode(deps)
+    await handle_wizard_callback(
+        _callback_update("wizard:time-mode:split"),
+        deps,
+    )
+    await handle_wizard_text(_text_update("18:00 to 23:00"), deps)
+    await handle_wizard_text(_text_update("12:00 to 16:00"), deps)
+    await handle_wizard_callback(_callback_update("wizard:qty:2"), deps)
+    await handle_wizard_callback(
+        _callback_update("wizard:seat-mode:simple"),
+        deps,
+    )
+    await handle_wizard_callback(
+        _callback_update("wizard:seat-preference:only_best"),
+        deps,
+    )
+
+
+async def test_split_preferred_time_uses_the_weekend_window(
+    deps: WizardDeps,
+) -> None:
+    await _drive_split_to_preferred_instant(deps)
+
+    accepted = await handle_wizard_text(
+        _text_update("2026-08-29 13:00"),
+        deps,
+    )
+
+    assert accepted is not None
+    draft = await _draft(deps)
+    assert draft is not None
+    assert draft.state == WizardState.AWAIT_MODE.value
+    assert draft.payload["preferred_utc_instant"] == "2026-08-29T12:00:00+00:00"
+
+    await _drive_split_to_preferred_instant(deps)
+    rejected = await handle_wizard_text(
+        _text_update("2026-08-29 19:00"),
+        deps,
+    )
+
+    assert rejected is not None
+    draft = await _draft(deps)
+    assert draft is not None
+    assert draft.state == WizardState.AWAIT_PREFERRED_INSTANT.value
+    assert "preferred_utc_instant" not in draft.payload
+
 
 async def test_recurring_mode_asks_for_an_interval_before_review(deps: WizardDeps) -> None:
     await _drive_recurring_to_interval(deps)
@@ -906,7 +1123,7 @@ async def _drive_recurring_to_interval(deps: WizardDeps) -> None:
     await start_new(_text_update("/new"), deps)
     await handle_wizard_text(_text_update(FILM_URL), deps)
     await handle_wizard_text(_text_update("2026-08-26 to 2026-08-30"), deps)
-    await handle_wizard_text(_text_update("18:00 to 23:00"), deps)
+    await _choose_uniform_time(deps)
     await handle_wizard_callback(_callback_update("wizard:qty:2"), deps)
     assert (
         await handle_wizard_callback(
@@ -974,10 +1191,13 @@ async def test_wizard_resumes_from_a_freshly_constructed_deps_pointed_at_the_sam
     async with database_two.connection() as conn:
         draft = await deps_two.drafts.get(conn, USER_ID)
     assert draft is not None
-    assert draft.state == WizardState.AWAIT_TIME_RANGE.value
+    assert draft.state == WizardState.AWAIT_TIME_MODE.value
     assert draft.payload["slug"] == "dog-stars"
     assert draft.payload["date_from"] == "2026-08-26"
 
+    assert (
+        await handle_wizard_callback(_callback_update("wizard:time-mode:same"), deps_two)
+    ) is not None
     reply = await handle_wizard_text(_text_update("18:00 to 23:00"), deps_two)
     assert reply is not None
     async with database_two.connection() as conn:

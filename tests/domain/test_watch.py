@@ -173,6 +173,40 @@ def test_preferred_instant_accepts_a_window_that_crosses_midnight():
         WatchCriteria(**window, preferred_utc_instant=datetime(2026, 8, 26, 13, 0, tzinfo=UTC))
 
 
+@pytest.mark.parametrize(
+    ("weekend_time_from", "weekend_time_to"),
+    [(time(12, 0), None), (None, time(16, 0))],
+)
+def test_weekend_window_requires_both_bounds(
+    weekend_time_from: time | None,
+    weekend_time_to: time | None,
+) -> None:
+    with pytest.raises(InputError, match="weekend"):
+        WatchCriteria(
+            **_BASE,
+            weekend_time_from=weekend_time_from,
+            weekend_time_to=weekend_time_to,
+        )
+
+
+def test_preferred_instant_uses_the_window_for_its_london_date() -> None:
+    split = {
+        **_BASE,
+        "weekend_time_from": time(12, 0),
+        "weekend_time_to": time(16, 0),
+    }
+
+    WatchCriteria(
+        **split,
+        preferred_utc_instant=datetime(2026, 8, 29, 12, 0, tzinfo=UTC),
+    )
+    with pytest.raises(InputError, match="time"):
+        WatchCriteria(
+            **split,
+            preferred_utc_instant=datetime(2026, 8, 29, 18, 0, tzinfo=UTC),
+        )
+
+
 def test_watch_identity_is_a_uuid():
     """Watch IDs are client-generated UUIDs so a watch can be referenced before insert."""
     watch_id = uuid4()

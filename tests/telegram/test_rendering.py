@@ -115,6 +115,8 @@ def _watch(
     interval: timedelta | None = None,
     next_check_at: datetime | None = datetime(2026, 8, 26, 8, 30, tzinfo=UTC),
     last_check_at: datetime | None = None,
+    weekend_time_from: time | None = None,
+    weekend_time_to: time | None = None,
 ) -> Watch:
     criteria = WatchCriteria(
         source_url="https://whatson.bfi.org.uk/imax/Online/article/dog-stars",
@@ -128,6 +130,8 @@ def _watch(
         interval=(
             (interval or timedelta(minutes=30)) if mode is WatchMode.RECURRING else None
         ),
+        weekend_time_from=weekend_time_from,
+        weekend_time_to=weekend_time_to,
     )
     now = datetime(2026, 1, 1, tzinfo=UTC)
     return Watch(
@@ -732,6 +736,20 @@ def test_render_watch_list_summarises_the_date_and_time_window() -> None:
     assert "30 Aug 2026" in rendered.text
     assert "18:00" in rendered.text
     assert "23:00" in rendered.text
+
+
+def test_render_watch_list_labels_split_time_windows() -> None:
+    rendered = render_watch_list(
+        (
+            _watch(
+                weekend_time_from=time(12, 0),
+                weekend_time_to=time(16, 0),
+            ),
+        )
+    )
+
+    assert "Mon-Fri 18:00-23:00" in rendered.text
+    assert "Sat-Sun 12:00-16:00" in rendered.text
 
 
 def test_render_watch_list_shows_the_requested_quantity() -> None:
