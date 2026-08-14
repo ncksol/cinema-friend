@@ -115,7 +115,7 @@ Fields the service consumes:
 |---|---|
 | `id` | performance GUID; the key for the seat map |
 | `object_type` | `P` performance, `A` article, `B` bundle, `M` misc item, `G` gift, `S` stored value. Only `P` rows are performances |
-| `availability_num` | exact count of seats remaining |
+| `availability_num` | exact count of seats remaining, or a status-paired sentinel: `-1` with `U` means the count is withheld; `-4` with `S` means sold out |
 | `availability_status` | `E` excellent, `G` good, `L` limited, `S` sold out, plus `U` and `N` in the client code |
 | `sales_status` | `S`, `O`, `R` on sale; `C` not yet on sale; `N` not on sale; `X` cancelled. A trailing `*` flags a promotion and does not change the base meaning |
 | `options` | array of option codes. `2` present means reserved seating, so `mapSelect.asp` is meaningful for that performance |
