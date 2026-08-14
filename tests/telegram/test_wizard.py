@@ -497,6 +497,11 @@ async def test_new_quantity_choice_prompts_for_simple_or_advanced(
     )
 
     assert reply is not None
+    assert reply.text == (
+        "How would you like to choose acceptable seats?\n\n"
+        "<b>Simple</b>: choose a preset for central seats between the aisles.\n"
+        "<b>Advanced</b>: set preferred and excluded rows or exact seats yourself."
+    )
     draft = await _draft(deps)
     assert draft is not None
     assert draft.state == WizardState.AWAIT_SEAT_MODE.value
