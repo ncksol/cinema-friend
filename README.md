@@ -249,18 +249,22 @@ Message your bot on Telegram and send `/help`.
 1. **Film URL**: the BFI page for the film, e.g.
    `https://whatson.bfi.org.uk/imax/Online/article/dog-stars`
 2. **Date range**: `2026-08-26 to 2026-08-30`
-3. **Time window**: `18:00 to 22:30`, applied to each day in the range
-4. **Seats**: `1` to `8`, chosen from buttons
-5. **Seat selection**: Simple or Advanced
-6. **Simple preference**: **Only the best** keeps the middle seating bank between the
+3. **Time schedule**: choose **Same every day** or **Weekday + weekend**.
+4. **Time window(s)**: enter one daily window, or separate Monday-Friday and
+   Saturday-Sunday windows, such as `18:00 to 22:30`. Times are interpreted in
+   Europe/London and may cross midnight, such as `22:00 to 01:00`; the showing's
+   local start day selects the weekday or weekend window.
+5. **Seats**: `1` to `8`, chosen from buttons
+6. **Seat selection**: Simple or Advanced
+7. **Simple preference**: **Only the best** keeps the middle seating bank between the
    aisles from row J back; **Best and good** keeps the same middle bank from row C back.
    Seats outside the chosen preset are excluded.
-7. **Advanced seat controls**: optional preferred and excluded rows and exact seats,
+8. **Advanced seat controls**: optional preferred and excluded rows and exact seats,
    using formats such as `L,M` and `L16-L22,M17`
-8. **Preferred time**: a specific showing you would rather have, or `skip`
-9. **One-off or recurring**: one-off checks until it finds something; recurring keeps
-   checking on an interval
-10. **Interval**: for recurring watches, at least 15 minutes
+9. **Preferred time**: a specific showing you would rather have, or `skip`
+10. **One-off or recurring**: one-off checks until it finds something; recurring keeps
+    checking on an interval
+11. **Interval**: for recurring watches, at least 15 minutes
 
 It shows you a summary and waits for you to confirm. Nothing is saved until you do, and a
 half-finished setup survives a restart of the service.

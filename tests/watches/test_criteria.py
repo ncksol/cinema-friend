@@ -20,6 +20,8 @@ def criteria_for(
     date_to: date = date(2026, 8, 27),
     time_from: time = time(0, 0),
     time_to: time = time(23, 59),
+    weekend_time_from: time | None = None,
+    weekend_time_to: time | None = None,
     quantity: int = 2,
 ) -> WatchCriteria:
     return WatchCriteria(
@@ -31,6 +33,8 @@ def criteria_for(
         time_to=time_to,
         quantity=quantity,
         mode=WatchMode.ONE_OFF,
+        weekend_time_from=weekend_time_from,
+        weekend_time_to=weekend_time_to,
     )
 
 
@@ -138,6 +142,35 @@ def test_preferred_utc_instant_does_not_affect_matching() -> None:
         preferred_utc_instant=datetime(2026, 8, 26, 17, 0, tzinfo=UTC),
     )
     assert performance_matches(criteria, performance_at("2026-08-26T18:00:00+01:00"))
+
+
+def test_split_schedule_matches_each_day_category() -> None:
+    criteria = criteria_for(
+        date_from=date(2026, 8, 28),
+        date_to=date(2026, 8, 30),
+        time_from=time(18, 0),
+        time_to=time(23, 0),
+        weekend_time_from=time(12, 0),
+        weekend_time_to=time(16, 0),
+    )
+
+    assert performance_matches(criteria, performance_at("2026-08-28T19:00:00+01:00"))
+    assert performance_matches(criteria, performance_at("2026-08-29T13:00:00+01:00"))
+    assert not performance_matches(criteria, performance_at("2026-08-29T19:00:00+01:00"))
+
+
+def test_split_wrapping_schedule_is_selected_by_performance_start_day() -> None:
+    criteria = criteria_for(
+        date_from=date(2026, 8, 28),
+        date_to=date(2026, 8, 29),
+        time_from=time(22, 0),
+        time_to=time(1, 0),
+        weekend_time_from=time(12, 0),
+        weekend_time_to=time(16, 0),
+    )
+
+    assert performance_matches(criteria, performance_at("2026-08-28T23:30:00+01:00"))
+    assert not performance_matches(criteria, performance_at("2026-08-29T00:30:00+01:00"))
 
 
 # ---------------------------------------------------------------------------

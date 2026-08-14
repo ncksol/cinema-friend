@@ -8,7 +8,12 @@ from uuid import UUID
 
 from cinema_friend.domain.errors import InputError
 from cinema_friend.domain.state import SeatPreferenceStrategy, WatchMode, WatchStatus
-from cinema_friend.domain.time_window import LONDON, within_daily_window
+from cinema_friend.domain.time_window import (
+    LONDON,
+    DailyTimeWindow,
+    window_for_local_date,
+    within_daily_window,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,10 +33,26 @@ class WatchCriteria:
     preferred_rows: frozenset[str] = field(default_factory=frozenset)
     excluded_rows: frozenset[str] = field(default_factory=frozenset)
     preferred_utc_instant: datetime | None = None
+    weekend_time_from: time | None = None
+    weekend_time_to: time | None = None
+
+    def time_window_for(self, local_date: date) -> DailyTimeWindow:
+        weekend_window = (
+            (self.weekend_time_from, self.weekend_time_to)
+            if self.weekend_time_from is not None and self.weekend_time_to is not None
+            else None
+        )
+        return window_for_local_date(
+            local_date,
+            default_window=(self.time_from, self.time_to),
+            weekend_window=weekend_window,
+        )
 
     def __post_init__(self) -> None:
         if not (1 <= self.quantity <= 8):
             raise InputError("quantity must be between 1 and 8")
+        if (self.weekend_time_from is None) != (self.weekend_time_to is None):
+            raise InputError("weekend time range requires both start and end")
         manual_seat_criteria = (
             self.preferred_seats or self.excluded_seats or self.preferred_rows or self.excluded_rows
         )
@@ -61,7 +82,8 @@ class WatchCriteria:
             local = inst.astimezone(LONDON)
             if not (self.date_from <= local.date() <= self.date_to):
                 raise InputError("preferred_utc_instant date is outside the watch date range")
-            if not within_daily_window(self.time_from, self.time_to, local.time()):
+            time_from, time_to = self.time_window_for(local.date())
+            if not within_daily_window(time_from, time_to, local.time()):
                 raise InputError("preferred_utc_instant time is outside the watch time range")
 
 

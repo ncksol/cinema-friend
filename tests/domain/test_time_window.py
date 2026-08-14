@@ -7,9 +7,9 @@ filtering, so a window can never be accepted by one and silently ignored by the 
 
 from __future__ import annotations
 
-from datetime import time
+from datetime import date, time
 
-from cinema_friend.domain.time_window import within_daily_window
+from cinema_friend.domain.time_window import window_for_local_date, within_daily_window
 
 
 def test_plain_window_includes_both_endpoints() -> None:
@@ -42,3 +42,35 @@ def test_window_of_a_single_instant_matches_only_that_instant() -> None:
 def test_midnight_to_midnight_matches_only_midnight() -> None:
     assert within_daily_window(time(0, 0), time(0, 0), time(0, 0))
     assert not within_daily_window(time(0, 0), time(0, 0), time(12, 0))
+
+
+def test_uniform_schedule_uses_default_window_every_day() -> None:
+    default = (time(18, 0), time(23, 0))
+
+    assert window_for_local_date(
+        date(2026, 8, 28),
+        default_window=default,
+        weekend_window=None,
+    ) == default
+    assert window_for_local_date(
+        date(2026, 8, 29),
+        default_window=default,
+        weekend_window=None,
+    ) == default
+
+
+def test_split_schedule_uses_weekend_override_on_saturday_and_sunday() -> None:
+    default = (time(18, 0), time(23, 0))
+    weekend = (time(12, 0), time(16, 0))
+
+    assert window_for_local_date(
+        date(2026, 8, 28),
+        default_window=default,
+        weekend_window=weekend,
+    ) == default
+    for local_date in (date(2026, 8, 29), date(2026, 8, 30)):
+        assert window_for_local_date(
+            local_date,
+            default_window=default,
+            weekend_window=weekend,
+        ) == weekend

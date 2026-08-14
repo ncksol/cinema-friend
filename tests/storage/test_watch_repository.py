@@ -12,6 +12,7 @@ from uuid import UUID
 import aiosqlite
 import pytest
 
+from cinema_friend.domain.errors import InputError
 from cinema_friend.domain.state import SeatPreferenceStrategy, WatchMode, WatchStatus
 from cinema_friend.domain.watch import Watch, WatchCriteria
 from cinema_friend.storage.database import Database
@@ -143,6 +144,92 @@ async def test_legacy_criteria_without_a_strategy_decode_as_advanced(
 
     assert fetched is not None
     assert fetched.criteria.seat_preference_strategy is SeatPreferenceStrategy.ADVANCED
+
+
+async def test_weekend_time_override_round_trips(
+    conn: aiosqlite.Connection,
+    repo: WatchRepository,
+) -> None:
+    watch = _watch(
+        criteria=_criteria(
+            weekend_time_from=time(12, 0),
+            weekend_time_to=time(16, 0),
+        )
+    )
+
+    await repo.create(conn, watch)
+
+    assert await repo.get(conn, watch.watch_id) == watch
+
+
+async def test_uniform_schedule_writes_null_weekend_bounds(
+    conn: aiosqlite.Connection,
+    repo: WatchRepository,
+) -> None:
+    watch = _watch()
+    await repo.create(conn, watch)
+
+    cursor = await conn.execute(
+        "SELECT criteria_json FROM watches WHERE id = ?",
+        (str(watch.watch_id),),
+    )
+    row = await cursor.fetchone()
+
+    assert row is not None
+    payload = json.loads(row["criteria_json"])
+    assert payload["weekend_time_from"] is None
+    assert payload["weekend_time_to"] is None
+
+
+async def test_legacy_criteria_without_weekend_bounds_keep_the_default_window(
+    conn: aiosqlite.Connection,
+    repo: WatchRepository,
+) -> None:
+    watch = _watch()
+    await repo.create(conn, watch)
+    cursor = await conn.execute(
+        "SELECT criteria_json FROM watches WHERE id = ?",
+        (str(watch.watch_id),),
+    )
+    row = await cursor.fetchone()
+    assert row is not None
+    payload = json.loads(row["criteria_json"])
+    payload.pop("weekend_time_from")
+    payload.pop("weekend_time_to")
+    await conn.execute(
+        "UPDATE watches SET criteria_json = ? WHERE id = ?",
+        (json.dumps(payload, sort_keys=True), str(watch.watch_id)),
+    )
+
+    fetched = await repo.get(conn, watch.watch_id)
+
+    assert fetched is not None
+    assert fetched.criteria.weekend_time_from is None
+    assert fetched.criteria.weekend_time_to is None
+
+
+async def test_partial_persisted_weekend_window_is_rejected(
+    conn: aiosqlite.Connection,
+    repo: WatchRepository,
+) -> None:
+    watch = _watch()
+    await repo.create(conn, watch)
+    cursor = await conn.execute(
+        "SELECT criteria_json FROM watches WHERE id = ?",
+        (str(watch.watch_id),),
+    )
+    row = await cursor.fetchone()
+    assert row is not None
+    payload = json.loads(row["criteria_json"])
+    payload["weekend_time_from"] = "12:00:00"
+    payload["weekend_time_to"] = None
+    await conn.execute(
+        "UPDATE watches SET criteria_json = ? WHERE id = ?",
+        (json.dumps(payload, sort_keys=True), str(watch.watch_id)),
+    )
+
+    with pytest.raises(InputError, match="weekend"):
+        await repo.get(conn, watch.watch_id)
 
 
 async def test_create_stores_the_canonical_uuid_string(

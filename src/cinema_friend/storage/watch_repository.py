@@ -43,6 +43,14 @@ def _encode_criteria(criteria: WatchCriteria) -> str:
             if criteria.preferred_utc_instant is not None
             else None
         ),
+        "weekend_time_from": (
+            criteria.weekend_time_from.isoformat()
+            if criteria.weekend_time_from is not None
+            else None
+        ),
+        "weekend_time_to": (
+            criteria.weekend_time_to.isoformat() if criteria.weekend_time_to is not None else None
+        ),
     }
     return json.dumps(payload, sort_keys=True)
 
@@ -51,6 +59,8 @@ def _decode_criteria(data: str) -> WatchCriteria:
     payload = json.loads(data)
     interval_seconds = payload["interval_seconds"]
     preferred_instant = payload["preferred_utc_instant"]
+    weekend_time_from = payload.get("weekend_time_from")
+    weekend_time_to = payload.get("weekend_time_to")
     return WatchCriteria(
         source_url=payload["source_url"],
         slug=payload["slug"],
@@ -70,6 +80,12 @@ def _decode_criteria(data: str) -> WatchCriteria:
         excluded_rows=frozenset(payload["excluded_rows"]),
         preferred_utc_instant=(
             decode_datetime(preferred_instant) if preferred_instant is not None else None
+        ),
+        weekend_time_from=(
+            time.fromisoformat(weekend_time_from) if weekend_time_from is not None else None
+        ),
+        weekend_time_to=(
+            time.fromisoformat(weekend_time_to) if weekend_time_to is not None else None
         ),
     )
 

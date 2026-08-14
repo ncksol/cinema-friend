@@ -9,10 +9,11 @@ accepted at construction and silently never matched, or the reverse.
 
 from __future__ import annotations
 
-from datetime import time
+from datetime import date, time
 from zoneinfo import ZoneInfo
 
 LONDON = ZoneInfo("Europe/London")
+DailyTimeWindow = tuple[time, time]
 
 
 def within_daily_window(time_from: time, time_to: time, value: time) -> bool:
@@ -24,3 +25,14 @@ def within_daily_window(time_from: time, time_to: time, value: time) -> bool:
     if time_from <= time_to:
         return time_from <= value <= time_to
     return value >= time_from or value <= time_to
+
+
+def window_for_local_date(
+    local_date: date,
+    *,
+    default_window: DailyTimeWindow,
+    weekend_window: DailyTimeWindow | None,
+) -> DailyTimeWindow:
+    if local_date.weekday() >= 5 and weekend_window is not None:
+        return weekend_window
+    return default_window

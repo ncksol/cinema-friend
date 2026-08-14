@@ -7,9 +7,9 @@ memory, so a restart between two messages loses nothing -- the next message just
 resumes from whatever was last persisted.
 
 Two state families exist. Free-text states (``AWAIT_URL`` through ``AWAIT_INTERVAL``)
-are advanced by :func:`handle_wizard_text`; button-driven states (``AWAIT_QUANTITY``,
-``AWAIT_SEAT_MODE``, ``AWAIT_SIMPLE_SEAT_PREFERENCE``, ``AWAIT_MODE``, and the
-confirm/cancel actions on ``REVIEW``) are advanced by :func:`handle_wizard_callback`.
+are advanced by :func:`handle_wizard_text`; button-driven states (``AWAIT_TIME_MODE``,
+``AWAIT_QUANTITY``, ``AWAIT_SEAT_MODE``, ``AWAIT_SIMPLE_SEAT_PREFERENCE``, ``AWAIT_MODE``,
+and the confirm/cancel actions on ``REVIEW``) are advanced by :func:`handle_wizard_callback`.
 Invalid input in either family leaves the persisted draft completely unchanged and
 replies with the same message the parser raised, which already names the accepted
 shape.
@@ -66,7 +66,12 @@ from cinema_friend.domain.errors import (
 )
 from cinema_friend.domain.results import CheckResult
 from cinema_friend.domain.state import CheckTrigger, SeatPreferenceStrategy, WatchMode
-from cinema_friend.domain.time_window import LONDON, within_daily_window
+from cinema_friend.domain.time_window import (
+    LONDON,
+    DailyTimeWindow,
+    window_for_local_date,
+    within_daily_window,
+)
 from cinema_friend.domain.watch import WatchCriteria
 from cinema_friend.services.watch_service import WatchService
 from cinema_friend.storage.database import Database
@@ -101,6 +106,16 @@ _SEAT_FLOW_VERSION = 2
 _SEAT_FLOW_VERSION_KEY = "seat_flow_version"
 _SEAT_PREFERENCE_KEY = "seat_preference_strategy"
 
+_TIME_FLOW_VERSION = 2
+_TIME_FLOW_VERSION_KEY = "time_flow_version"
+
+
+class TimeSetupMode(str, Enum):
+    """Which of the two time-window experiences the user asked for."""
+
+    SAME_EVERY_DAY = "same"
+    WEEKDAY_WEEKEND = "split"
+
 
 class SeatSetupMode(str, Enum):
     """Which of the two seat-selection experiences the user asked for."""
@@ -132,7 +147,10 @@ class WizardState(str, Enum):
 
     AWAIT_URL = "await_url"
     AWAIT_DATE_RANGE = "await_date_range"
+    AWAIT_TIME_MODE = "await_time_mode"
     AWAIT_TIME_RANGE = "await_time_range"
+    AWAIT_WEEKDAY_TIME_RANGE = "await_weekday_time_range"
+    AWAIT_WEEKEND_TIME_RANGE = "await_weekend_time_range"
     AWAIT_QUANTITY = "await_quantity"
     AWAIT_SEAT_MODE = "await_seat_mode"
     AWAIT_SIMPLE_SEAT_PREFERENCE = "await_simple_seat_preference"
@@ -310,6 +328,21 @@ def _is_skip(text: str) -> bool:
     return text.strip().lower() == _SKIP
 
 
+def _weekend_window(payload: Mapping[str, Any]) -> DailyTimeWindow | None:
+    """Extract the optional weekend window from a draft payload.
+
+    Returns ``None`` when neither bound is present (uniform schedule). Raises
+    :class:`InputError` when only one bound is present (invalid state).
+    """
+    time_from_raw = payload.get("weekend_time_from")
+    time_to_raw = payload.get("weekend_time_to")
+    if (time_from_raw is None) != (time_to_raw is None):
+        raise InputError("weekend time range requires both start and end")
+    if time_from_raw is None or time_to_raw is None:
+        return None
+    return time.fromisoformat(time_from_raw), time.fromisoformat(time_to_raw)
+
+
 def _parse_preferred_instant(text: str, payload: Mapping[str, Any]) -> datetime | None:
     """Parse the optional preferred instant, or ``None`` for an explicit skip.
 
@@ -335,10 +368,16 @@ def _parse_preferred_instant(text: str, payload: Mapping[str, Any]) -> datetime 
         raise InputError(_INSTANT_EXAMPLE)
     date_from = date.fromisoformat(payload["date_from"])
     date_to = date.fromisoformat(payload["date_to"])
-    time_from = time.fromisoformat(payload["time_from"])
-    time_to = time.fromisoformat(payload["time_to"])
     if not (date_from <= local.date() <= date_to):
         raise InputError(_INSTANT_EXAMPLE)
+    time_from, time_to = window_for_local_date(
+        local.date(),
+        default_window=(
+            time.fromisoformat(payload["time_from"]),
+            time.fromisoformat(payload["time_to"]),
+        ),
+        weekend_window=_weekend_window(payload),
+    )
     if not within_daily_window(time_from, time_to, local.time()):
         raise InputError(_INSTANT_EXAMPLE)
     return local.astimezone(UTC)
@@ -366,6 +405,8 @@ _URL_PROMPT = (
 )
 _DATE_RANGE_PROMPT = f"What date range should I watch? {_DATE_RANGE_EXAMPLE}."
 _TIME_RANGE_PROMPT = f"What daily time window? {_TIME_RANGE_EXAMPLE}."
+_WEEKDAY_TIME_RANGE_PROMPT = f"What Monday-Friday time window? {_TIME_RANGE_EXAMPLE}."
+_WEEKEND_TIME_RANGE_PROMPT = f"What Saturday-Sunday time window? {_TIME_RANGE_EXAMPLE}."
 _PREFERRED_ROWS_PROMPT = (
     f"Any preferred rows? {_ROW_EXAMPLE}, or send 'skip' for no preference."
 )
@@ -378,6 +419,7 @@ _PREFERRED_INSTANT_PROMPT = f"{_INSTANT_EXAMPLE.capitalize()}."
 _INTERVAL_PROMPT = f"{_INTERVAL_EXAMPLE.capitalize()}."
 
 _QTY_PREFIX = "wizard:qty:"
+_TIME_MODE_PREFIX = "wizard:time-mode:"
 _SEAT_MODE_PREFIX = "wizard:seat-mode:"
 _SEAT_PREFERENCE_PREFIX = "wizard:seat-preference:"
 _MODE_PREFIX = "wizard:mode:"
@@ -396,6 +438,28 @@ def _quantity_prompt() -> RenderedMessage:
     rows = [buttons[0:4], buttons[4:8]]
     return RenderedMessage(
         text="How many seats do you need? Choose 1-8.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+def _time_mode_prompt() -> RenderedMessage:
+    rows = [
+        [
+            InlineKeyboardButton(
+                text="Same every day",
+                callback_data=f"{_TIME_MODE_PREFIX}{TimeSetupMode.SAME_EVERY_DAY.value}",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="Weekday + weekend",
+                callback_data=f"{_TIME_MODE_PREFIX}{TimeSetupMode.WEEKDAY_WEEKEND.value}",
+            )
+        ],
+    ]
+    return RenderedMessage(
+        text="Use one viewing-time window every day, or separate weekday and weekend windows?",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(rows),
     )
@@ -505,6 +569,7 @@ def _build_criteria(payload: Mapping[str, Any]) -> WatchCriteria:
     """
     interval_minutes = payload.get("interval_minutes")
     preferred_instant_raw = payload.get("preferred_utc_instant")
+    weekend_w = _weekend_window(payload)
     return WatchCriteria(
         source_url=payload["source_url"],
         slug=payload["slug"],
@@ -523,6 +588,8 @@ def _build_criteria(payload: Mapping[str, Any]) -> WatchCriteria:
             datetime.fromisoformat(preferred_instant_raw) if preferred_instant_raw else None
         ),
         seat_preference_strategy=_seat_preference_strategy(payload),
+        weekend_time_from=weekend_w[0] if weekend_w is not None else None,
+        weekend_time_to=weekend_w[1] if weekend_w is not None else None,
     )
 
 
@@ -532,9 +599,26 @@ def _review_prompt(payload: Mapping[str, Any]) -> RenderedMessage:
         "<b>Review your watch</b>",
         f"Film: {html.escape(criteria.slug)}",
         f"Dates: {criteria.date_from.isoformat()} to {criteria.date_to.isoformat()}",
-        f"Times: {criteria.time_from.strftime('%H:%M')} to {criteria.time_to.strftime('%H:%M')}",
-        f"Seats: {criteria.quantity}",
     ]
+    if criteria.weekend_time_from is None or criteria.weekend_time_to is None:
+        lines.append(
+            f"Times: {criteria.time_from.strftime('%H:%M')} "
+            f"to {criteria.time_to.strftime('%H:%M')} daily"
+        )
+    else:
+        lines.extend(
+            [
+                (
+                    f"Weekdays: {criteria.time_from.strftime('%H:%M')} "
+                    f"to {criteria.time_to.strftime('%H:%M')}"
+                ),
+                (
+                    f"Weekends: {criteria.weekend_time_from.strftime('%H:%M')} "
+                    f"to {criteria.weekend_time_to.strftime('%H:%M')}"
+                ),
+            ]
+        )
+    lines.append(f"Seats: {criteria.quantity}")
     if criteria.seat_preference_strategy is SeatPreferenceStrategy.ONLY_BEST:
         lines.append("Seat preference: Only the best")
     elif criteria.seat_preference_strategy is SeatPreferenceStrategy.BEST_AND_GOOD:
@@ -572,8 +656,14 @@ def _prompt_for(state: WizardState, payload: Mapping[str, Any]) -> RenderedMessa
         return _text_prompt(_URL_PROMPT)
     if state is WizardState.AWAIT_DATE_RANGE:
         return _text_prompt(_DATE_RANGE_PROMPT)
+    if state is WizardState.AWAIT_TIME_MODE:
+        return _time_mode_prompt()
     if state is WizardState.AWAIT_TIME_RANGE:
         return _text_prompt(_TIME_RANGE_PROMPT)
+    if state is WizardState.AWAIT_WEEKDAY_TIME_RANGE:
+        return _text_prompt(_WEEKDAY_TIME_RANGE_PROMPT)
+    if state is WizardState.AWAIT_WEEKEND_TIME_RANGE:
+        return _text_prompt(_WEEKEND_TIME_RANGE_PROMPT)
     if state is WizardState.AWAIT_QUANTITY:
         return _quantity_prompt()
     if state is WizardState.AWAIT_SEAT_MODE:
@@ -610,6 +700,8 @@ _TEXT_STATES = frozenset(
         WizardState.AWAIT_URL,
         WizardState.AWAIT_DATE_RANGE,
         WizardState.AWAIT_TIME_RANGE,
+        WizardState.AWAIT_WEEKDAY_TIME_RANGE,
+        WizardState.AWAIT_WEEKEND_TIME_RANGE,
         WizardState.AWAIT_PREFERRED_ROWS,
         WizardState.AWAIT_PREFERRED_SEATS,
         WizardState.AWAIT_EXCLUDED_ROWS,
@@ -621,6 +713,7 @@ _TEXT_STATES = frozenset(
 
 _CALLBACK_STATES = frozenset(
     {
+        WizardState.AWAIT_TIME_MODE,
         WizardState.AWAIT_QUANTITY,
         WizardState.AWAIT_SEAT_MODE,
         WizardState.AWAIT_SIMPLE_SEAT_PREFERENCE,
@@ -641,11 +734,20 @@ def _apply_text(
         date_from, date_to = parse_date_range(text)
         payload["date_from"] = date_from.isoformat()
         payload["date_to"] = date_to.isoformat()
+        if payload.get(_TIME_FLOW_VERSION_KEY) == _TIME_FLOW_VERSION:
+            return WizardState.AWAIT_TIME_MODE, payload
         return WizardState.AWAIT_TIME_RANGE, payload
-    if state is WizardState.AWAIT_TIME_RANGE:
+    if state in (WizardState.AWAIT_TIME_RANGE, WizardState.AWAIT_WEEKDAY_TIME_RANGE):
         time_from, time_to = parse_time_range(text)
         payload["time_from"] = time_from.isoformat()
         payload["time_to"] = time_to.isoformat()
+        if state is WizardState.AWAIT_WEEKDAY_TIME_RANGE:
+            return WizardState.AWAIT_WEEKEND_TIME_RANGE, payload
+        return WizardState.AWAIT_QUANTITY, payload
+    if state is WizardState.AWAIT_WEEKEND_TIME_RANGE:
+        time_from, time_to = parse_time_range(text)
+        payload["weekend_time_from"] = time_from.isoformat()
+        payload["weekend_time_to"] = time_to.isoformat()
         return WizardState.AWAIT_QUANTITY, payload
     if state is WizardState.AWAIT_PREFERRED_ROWS:
         payload["preferred_rows"] = _parse_optional_selectors(text, kind="row")
@@ -672,6 +774,21 @@ def _apply_text(
 def _apply_callback(
     state: WizardState, payload: dict[str, Any], data: str
 ) -> tuple[WizardState, dict[str, Any]]:
+    if state is WizardState.AWAIT_TIME_MODE:
+        if not data.startswith(_TIME_MODE_PREFIX):
+            raise InputError("choose one daily window or separate weekday and weekend windows")
+        try:
+            time_mode = TimeSetupMode(data[len(_TIME_MODE_PREFIX) :])
+        except ValueError as exc:
+            raise InputError(
+                "choose one daily window or separate weekday and weekend windows"
+            ) from exc
+        if time_mode is TimeSetupMode.SAME_EVERY_DAY:
+            payload.pop("weekend_time_from", None)
+            payload.pop("weekend_time_to", None)
+            return WizardState.AWAIT_TIME_RANGE, payload
+        return WizardState.AWAIT_WEEKDAY_TIME_RANGE, payload
+
     if state is WizardState.AWAIT_QUANTITY:
         if not data.startswith(_QTY_PREFIX):
             raise InputError("choose a quantity using the buttons above")
@@ -775,7 +892,10 @@ async def start_new(update: Update, deps: WizardDeps) -> RenderedMessage:
     a clean restart regardless of what state a previous, abandoned attempt was in.
     """
     user_id = _require_user(update)
-    payload = {_SEAT_FLOW_VERSION_KEY: _SEAT_FLOW_VERSION}
+    payload = {
+        _SEAT_FLOW_VERSION_KEY: _SEAT_FLOW_VERSION,
+        _TIME_FLOW_VERSION_KEY: _TIME_FLOW_VERSION,
+    }
     async with deps.database.connection() as conn:
         await deps.drafts.upsert(
             conn,
@@ -855,9 +975,9 @@ async def handle_wizard_callback(update: Update, deps: WizardDeps) -> RenderedMe
     button pressed once the draft has already moved on to a typed prompt such as the
     date range).
 
-    Stale ``Simple``/``Advanced`` and seat-preference presses are the one exception: they
-    are answered with a recoverable retry prompt telling the user to use the current
-    prompt, because silently ignoring them looks like a dead button.
+    Stale schedule-choice (``time-mode``), seat-mode, and seat-preference presses are
+    answered with a recoverable retry prompt telling the user to use the current prompt,
+    because silently ignoring them looks like a dead button.
     """
     user_id = _require_user(update)
     query = update.callback_query
@@ -874,9 +994,9 @@ async def handle_wizard_callback(update: Update, deps: WizardDeps) -> RenderedMe
     if data == _CONFIRM:
         return await _confirm(user_id, deps)
     if state not in _CALLBACK_STATES:
-        if data.startswith((_SEAT_MODE_PREFIX, _SEAT_PREFERENCE_PREFIX)):
+        if data.startswith((_TIME_MODE_PREFIX, _SEAT_MODE_PREFIX, _SEAT_PREFERENCE_PREFIX)):
             return _retry_prompt(
-                "that seat choice is no longer active; use the current prompt"
+                "that choice is no longer active; use the current prompt"
             )
         return None
     try:

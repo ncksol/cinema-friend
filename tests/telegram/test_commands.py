@@ -926,6 +926,7 @@ async def test_wizard_button_advances_a_draft(harness: Harness) -> None:
     await handle_new(_text_update("/new"), harness.deps)
     await handle_text(_text_update(FILM_URL), harness.deps)
     await handle_text(_text_update("2026-08-26 to 2026-08-30"), harness.deps)
+    await handle_wizard_button(_callback_update("wizard:time-mode:same"), harness.deps)
     await handle_text(_text_update("18:00 to 23:00"), harness.deps)
     message = await handle_wizard_button(_callback_update("wizard:qty:2"), harness.deps)
     assert message is not None

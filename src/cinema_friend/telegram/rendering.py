@@ -265,12 +265,18 @@ def _criteria_summary(watch: Watch) -> str:
     dates = date_from if date_from == date_to else f"{date_from} to {date_to}"
     time_from = criteria.time_from.strftime(_CLOCK_FORMAT)
     time_to = criteria.time_to.strftime(_CLOCK_FORMAT)
+    if criteria.weekend_time_from is None or criteria.weekend_time_to is None:
+        times = f"{time_from}-{time_to}"
+    else:
+        weekend_from = criteria.weekend_time_from.strftime(_CLOCK_FORMAT)
+        weekend_to = criteria.weekend_time_to.strftime(_CLOCK_FORMAT)
+        times = f"Mon-Fri {time_from}-{time_to}; Sat-Sun {weekend_from}-{weekend_to}"
     cadence = (
         f"every {_interval_summary(criteria.interval)}"
         if criteria.mode is WatchMode.RECURRING and criteria.interval is not None
         else "one-off"
     )
-    return f"{dates}, {time_from}-{time_to}, {criteria.quantity} seats, {cadence}"
+    return f"{dates}, {times}, {criteria.quantity} seats, {cadence}"
 
 
 def _watch_block(index: int, watch: Watch) -> str:

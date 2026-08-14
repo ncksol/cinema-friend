@@ -40,6 +40,9 @@ def performance_matches(criteria: WatchCriteria, performance: Performance) -> bo
     if performance.availability_num < criteria.quantity:
         return False
     local_start = performance.start
+    time_from, time_to = criteria.time_window_for(local_start.date())
     return _matches_date_window(criteria, local_start.date()) and within_daily_window(
-        criteria.time_from, criteria.time_to, local_start.time()
+        time_from,
+        time_to,
+        local_start.time(),
     )
