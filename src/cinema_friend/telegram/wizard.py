@@ -479,7 +479,11 @@ def _seat_mode_prompt() -> RenderedMessage:
         ]
     ]
     return RenderedMessage(
-        text="How would you like to choose acceptable seats?",
+        text=(
+            "How would you like to choose acceptable seats?\n\n"
+            "<b>Simple</b>: choose a preset for central seats between the aisles.\n"
+            "<b>Advanced</b>: set preferred and excluded rows or exact seats yourself."
+        ),
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(rows),
     )
