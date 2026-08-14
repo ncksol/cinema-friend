@@ -12,6 +12,8 @@ from typing import Any
 
 from cinema_friend.bfi.urls import seat_map_url as _seat_map_url
 from cinema_friend.domain.bfi import (
+    SOLD_OUT_AVAILABILITY_SENTINEL,
+    SOLD_OUT_AVAILABILITY_STATUS,
     UNPUBLISHED_AVAILABILITY_SENTINEL,
     UNPUBLISHED_AVAILABILITY_STATUS,
     Performance,
@@ -176,10 +178,11 @@ def _row_title(row: Mapping[str, object]) -> str:
 def _availability(row: Mapping[str, object], availability_status: str) -> tuple[int, bool]:
     """Return ``(effective_count, published)`` for a row's ``availability_num``.
 
-    BFI sends the count as a decimal string. ``-1`` is not a count: paired with base
-    availability status ``U`` it is the site's way of saying the number is withheld, and
-    it is reported as zero candidate seats with ``published=False``. A ``-1`` under any
-    other status, or any other negative number, is unexplained and fails closed.
+    BFI sends the count as a decimal string, but uses paired status/count sentinels for
+    non-count states. ``-1`` with base status ``U`` means the count is withheld and
+    normalises to zero candidates with ``published=False``. ``-4`` with base status ``S``
+    means sold out and normalises to a known zero. Any unrecognised negative pair fails
+    closed.
     """
     raw = _require_str(row, "availability_num")
     try:
@@ -193,8 +196,13 @@ def _availability(row: Mapping[str, object], availability_status: str) -> tuple[
         and availability_status.rstrip("*") == UNPUBLISHED_AVAILABILITY_STATUS
     ):
         return 0, False
+    if (
+        value == SOLD_OUT_AVAILABILITY_SENTINEL
+        and availability_status.rstrip("*") == SOLD_OUT_AVAILABILITY_STATUS
+    ):
+        return 0, True
     raise BfiContractError(
-        f"availability_num {value} is not a count and is not the unpublished sentinel "
+        f"availability_num {value} is not a count and is not a recognised sentinel "
         f"for availability_status {availability_status!r}"
     )
 

@@ -191,6 +191,22 @@ def test_unpublished_sentinel_is_accepted_with_starred_status_u() -> None:
     assert performance.availability_num == 0
 
 
+@pytest.mark.parametrize("availability_status", ["S", "S*"])
+def test_sold_out_sentinel_is_normalised_to_a_published_zero(
+    availability_status: str,
+) -> None:
+    """BFI's ``-4`` value is the sold-out sentinel when status already says ``S``."""
+    row = performance_mapping(
+        availability_status=availability_status,
+        availability_num="-4",
+    )
+
+    performance = performance_from_row(row)
+
+    assert performance.availability_published is True
+    assert performance.availability_num == 0
+
+
 def test_sentinel_with_any_other_status_is_a_contract_error() -> None:
     """Only ``U`` licenses the sentinel; anywhere else ``-1`` is unexplained drift."""
     row = performance_mapping(availability_status="E", availability_num="-1")

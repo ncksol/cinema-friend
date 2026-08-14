@@ -23,6 +23,12 @@ UNPUBLISHED_AVAILABILITY_SENTINEL = -1
 UNPUBLISHED_AVAILABILITY_STATUS = "U"
 """The base ``availability_status`` that licenses the unpublished sentinel."""
 
+SOLD_OUT_AVAILABILITY_SENTINEL = -4
+"""The ``availability_num`` value BFI sends for some sold-out performances."""
+
+SOLD_OUT_AVAILABILITY_STATUS = "S"
+"""The base ``availability_status`` that licenses the sold-out sentinel."""
+
 
 class SeatStatus(Enum):
     AVAILABLE = "available"
@@ -104,12 +110,12 @@ class Performance:
     ``availability_status`` plus ``availability_num``.
 
     ``availability_num`` is the *effective* candidate count and is never negative. BFI
-    sends ``-1`` alongside availability status ``U`` to mean "the count is not
-    published", which is not a count of anything; that case is normalised to ``0`` here
-    and flagged by ``availability_published`` so a caller can tell "none free" from
-    "not saying". Every eligibility test in the service is a ``> 0`` / ``>= quantity``
-    comparison, so an unpublished count offers nothing rather than accidentally passing
-    an ``!= 0`` check.
+    sends negative sentinel values for non-count states: ``-1`` with status ``U`` means
+    "the count is not published", while ``-4`` with status ``S`` means sold out. Both
+    normalise to ``0``; only the withheld count is flagged by ``availability_published``
+    so a caller can tell "none free" from "not saying". Every eligibility test in the
+    service is a ``> 0`` / ``>= quantity`` comparison, so neither state can accidentally
+    pass an ``!= 0`` check.
     """
 
     performance_id: str
