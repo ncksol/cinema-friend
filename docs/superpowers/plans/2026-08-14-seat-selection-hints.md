@@ -53,7 +53,7 @@ Keep the existing draft-state and callback-data assertions in the same test.
 Run:
 
 ```bash
-pytest tests/telegram/test_wizard.py::test_new_quantity_choice_prompts_for_simple_or_advanced -q
+.venv/bin/python -m pytest tests/telegram/test_wizard.py::test_new_quantity_choice_prompts_for_simple_or_advanced -q
 ```
 
 Expected: FAIL because `reply.text` contains only
@@ -78,8 +78,8 @@ Do not alter the inline keyboard or callback data.
 Run:
 
 ```bash
-pytest tests/telegram/test_wizard.py -q
-ruff check src/cinema_friend/telegram/wizard.py tests/telegram/test_wizard.py
+.venv/bin/python -m pytest tests/telegram/test_wizard.py -q
+.venv/bin/python -m ruff check src/cinema_friend/telegram/wizard.py tests/telegram/test_wizard.py
 ```
 
 Expected: all wizard tests pass and Ruff reports no errors.
