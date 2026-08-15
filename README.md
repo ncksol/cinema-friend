@@ -51,6 +51,11 @@ the comma-separated allowed user IDs. It creates:
 - `~/Library/LaunchAgents/com.ncksol.cinema-friend.plist`;
 - `~/Library/Logs/cinema-friend/`.
 
+Mode `0600` is not optional. Both the installer and the service check the env file's
+ownership and permissions before reading it, and refuse to proceed if any other account on
+the machine can read it: that file holds your Telegram bot token. See `.env.example` for
+every setting the file can hold, what each one means, and its default.
+
 It loads the LaunchAgent and exits successfully only after `launchd` reports a running
 process. Rerun the same command after updating the checkout. It reuses `.venv` and the
 existing configuration, reinstalls the checkout's current code, and reloads the service.
@@ -305,6 +310,13 @@ python3.12 -m venv .venv
 .venv/bin/python -m pip install --upgrade pip
 .venv/bin/python -m pip install -e '.[dev]'
 ```
+
+`./install.sh` and this development setup share the same `.venv`. Running `./install.sh`
+replaces an editable development install with the non-editable runtime install (`pip
+install --upgrade .`), so `.venv` stops picking up further working-tree edits: it now runs
+whatever the checkout looked like at that install, not live source. If you exercise the
+production installer from a development checkout, rerun `pip install -e '.[dev]'`
+afterwards to get the editable install back.
 
 Then run:
 

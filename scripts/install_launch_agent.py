@@ -19,6 +19,10 @@ file:
 
 ``launchctl`` is always invoked with an argument array and an absolute binary path. No
 string is ever handed to a shell.
+
+``cinema_friend`` is imported lazily, inside the validation it authorizes, rather than at
+module scope: ``uninstall`` must keep working to remove a broken install, so it must not
+require importing the very package that install put in that state.
 """
 
 from __future__ import annotations
@@ -31,9 +35,6 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Final, Protocol
-
-from cinema_friend.app import load_settings
-from cinema_friend.domain.errors import InputError
 
 LABEL: Final = "com.ncksol.cinema-friend"
 EXECUTABLE_NAME: Final = "cinema-friend"
@@ -107,7 +108,17 @@ def resolve_executable(python_executable: Path | None = None) -> Path:
 
 
 def validate_env_file(env_file: Path) -> Path:
-    """Return *env_file* absolute after validating its security and settings."""
+    """Return *env_file* absolute after validating its security and settings.
+
+    ``cinema_friend`` is imported here, not at module scope, so that a damaged runtime
+    package or a missing third-party dependency only ever breaks ``install`` -- the one
+    command that actually needs application code. ``uninstall`` must keep working when the
+    installed package cannot be imported at all, since that is exactly the situation it
+    exists to recover from.
+    """
+    from cinema_friend.app import load_settings
+    from cinema_friend.domain.errors import InputError
+
     path = Path(env_file).expanduser().resolve()
     try:
         load_settings(path)

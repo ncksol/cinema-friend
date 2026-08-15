@@ -423,6 +423,65 @@ def test_uninstall_is_idempotent(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Lazy application imports
+# ---------------------------------------------------------------------------
+
+
+def test_module_import_does_not_pull_in_cinema_friend() -> None:
+    """``uninstall`` must be able to recover from a damaged runtime package, so importing
+    this module at all must not import ``cinema_friend``."""
+    assert not hasattr(agent, "load_settings")
+    assert not hasattr(agent, "InputError")
+
+
+def _block_cinema_friend(monkeypatch: pytest.MonkeyPatch) -> None:
+    import builtins
+
+    real_import = builtins.__import__
+
+    def _blocking_import(name: str, *args: Any, **kwargs: Any) -> ModuleType:
+        if name == "cinema_friend" or name.startswith("cinema_friend."):
+            raise ImportError(f"blocked for test: {name}")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _blocking_import)
+
+
+def test_module_loads_when_cinema_friend_is_unimportable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _block_cinema_friend(monkeypatch)
+
+    module = _load()  # must not raise despite cinema_friend being blocked
+
+    assert module.LABEL == agent.LABEL
+
+
+def test_uninstall_works_when_cinema_friend_is_unimportable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _block_cinema_friend(monkeypatch)
+    module = _load()
+    launchctl = RecordingLaunchctl(missing=True)
+
+    module.uninstall(agents_dir=tmp_path / "LaunchAgents", launchctl=launchctl)
+
+    assert all(allow_missing for _, allow_missing in launchctl.calls)
+
+
+def test_install_still_requires_cinema_friend_for_validation(
+    tmp_path: Path, env_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``load_settings`` remains the install-time authority: blocking ``cinema_friend``
+    must not silently skip validation, it must fail loudly the moment install needs it."""
+    _block_cinema_friend(monkeypatch)
+    module = _load()
+
+    with pytest.raises(ImportError, match="cinema_friend"):
+        module.validate_env_file(env_file)
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 

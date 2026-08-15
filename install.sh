@@ -161,13 +161,24 @@ service_is_running() {
 
 
 verify_service() {
+    # A single "state = running" sample can be caught mid-restart: launchd's KeepAlive can
+    # relaunch a crashing process fast enough that one probe a second apart still lands
+    # inside a brief live window. Two consecutive healthy samples, a second apart, is what
+    # tells "running" from "crash-looping but currently up", without changing the bound on
+    # how many probes this takes overall.
     local attempt=0
+    local consecutive=0
     local uid
     while [[ "$attempt" -lt 10 ]]; do
-        if service_is_running; then
-            return
-        fi
         attempt=$((attempt + 1))
+        if service_is_running; then
+            consecutive=$((consecutive + 1))
+            if [[ "$consecutive" -ge 2 ]]; then
+                return
+            fi
+        else
+            consecutive=0
+        fi
         if [[ "$attempt" -lt 10 ]]; then
             "$SLEEP_BIN" 1
         fi

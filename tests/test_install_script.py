@@ -74,6 +74,15 @@ def installer(tmp_path: Path) -> InstallerHarness:
             printf '%s\n' "$CINEMA_FRIEND_TEST_LAUNCHCTL_OUTPUT"
             exit 0
         fi
+        if [[ -n "${CINEMA_FRIEND_TEST_LAUNCHCTL_RUNNING_ONCE:-}" ]]; then
+            marker="$CINEMA_FRIEND_TEST_LAUNCHCTL_RUNNING_ONCE"
+            if [[ ! -e "$marker" ]]; then
+                : > "$marker"
+                printf 'state = running\npid = 4242\n'
+                exit 0
+            fi
+            exit 3
+        fi
         if [[ "${CINEMA_FRIEND_TEST_LAUNCHCTL_RUNNING:-1}" == "1" ]]; then
             printf 'state = running\npid = 4242\n'
             exit 0
@@ -327,7 +336,8 @@ def test_complete_install_is_idempotent(installer: InstallerHarness) -> None:
         f"install --env-file {installer.env_file}"
     )
     assert calls.count(install_call) == 2
-    assert calls.count(f"launchctl:print gui/501/{LABEL}") == 2
+    assert calls.count(f"launchctl:print gui/501/{LABEL}") == 4
+    assert calls.count("sleep:1") == 2
 
 
 def test_fails_after_bounded_service_verification(
@@ -349,6 +359,43 @@ def test_fails_after_bounded_service_verification(
     calls = _calls(installer)
     assert calls.count(f"launchctl:print gui/501/{LABEL}") == 10
     assert calls.count("sleep:1") == 9
+
+
+def test_verify_service_rejects_a_one_sample_transient_running_state(
+    installer: InstallerHarness,
+) -> None:
+    """A single healthy probe must not be enough: launchd can relaunch a crash-looping
+    process fast enough that one sample lands inside a brief live window. The fake
+    launchctl here reports running exactly once and never again, so success would mean
+    the bounded ten-probe loop returned early on that one sample instead of requiring a
+    second, one second later."""
+    installer.env_file.parent.mkdir(parents=True)
+    installer.env_file.write_text(
+        _valid_env_text(installer.env_file),
+        encoding="utf-8",
+    )
+    installer.env_file.chmod(0o600)
+    marker = installer.root / "launchctl-running-once"
+    env = {**installer.env, "CINEMA_FRIEND_TEST_LAUNCHCTL_RUNNING_ONCE": str(marker)}
+
+    result = _run_installer(installer, env=env)
+
+    assert result.returncode == 1
+    assert f'launchctl print "gui/501/{LABEL}"' in result.stderr
+    calls = _calls(installer)
+    assert calls.count(f"launchctl:print gui/501/{LABEL}") == 10
+    assert calls.count("sleep:1") == 9
+
+
+def test_verify_service_succeeds_on_two_consecutive_healthy_samples(
+    installer: InstallerHarness,
+) -> None:
+    result = _run_function(installer, "verify_service")
+
+    assert result.returncode == 0, result.stderr
+    calls = _calls(installer)
+    assert calls.count(f"launchctl:print gui/501/{LABEL}") == 2
+    assert calls.count("sleep:1") == 1
 
 
 @pytest.mark.parametrize(

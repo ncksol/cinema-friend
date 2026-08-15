@@ -177,10 +177,13 @@ Run:
 
 ```bash
 .venv/bin/python -m ruff check scripts/install_launch_agent.py tests/test_launch_agent.py
-.venv/bin/python -m mypy scripts/install_launch_agent.py
+.venv/bin/python -m mypy src scripts
 ```
 
-Expected: both commands exit 0.
+Expected: both commands exit 0. Use the repository's canonical `mypy src scripts`, not a
+standalone `mypy scripts/install_launch_agent.py`: the installed package carries no
+`py.typed` marker, so checking the script in isolation reports `cinema_friend` as
+untyped even though the package itself is clean.
 
 - [ ] **Step 7: Commit the validation boundary**
 
