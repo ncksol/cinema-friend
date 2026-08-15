@@ -12,80 +12,59 @@ It runs as a single-user background service on macOS under `launchd`.
 
 ## Requirements
 
-- macOS with `launchd` (the deployment script targets user agents in `~/Library/LaunchAgents`)
+- macOS with `launchd`
 - Python 3.12 or newer
 - A Telegram account
+
+The installer checks these prerequisites but does not install system software.
+
+---
+
+## Before you install
+
+### 1. Create a bot
+
+Message [@BotFather](https://t.me/BotFather), send `/newbot`, and follow the prompts. It
+replies with a token that looks like `123456789:AA...`. Anyone holding that token can act
+as your bot.
+
+### 2. Find your user ID
+
+Message [@userinfobot](https://t.me/userinfobot). It replies with your numeric ID. Gather
+the IDs of everyone who should be allowed to see and edit watches.
 
 ---
 
 ## Install
 
-```sh
-git clone https://github.com/ncksol/cinema-friend.git cinema-friend
-cd cinema-friend
+From an existing checkout:
 
-python3.12 -m venv .venv
-.venv/bin/python -m pip install --upgrade pip
-.venv/bin/python -m pip install -e '.[dev]'
+```sh
+./install.sh
 ```
 
-The editable install puts two commands in `.venv/bin`:
+On the first run, the installer asks for the bot token without echoing it and then asks for
+the comma-separated allowed user IDs. It creates:
 
-| Command | Purpose |
-| --- | --- |
-| `cinema-friend` | the service itself |
-| `cinema-friend-smoke` | the one-off BFI contract check described below |
+- `.venv` in the checkout, containing the runtime installation;
+- `~/.config/cinema-friend/cinema-friend.env`, mode `0600`;
+- `~/Library/LaunchAgents/com.ncksol.cinema-friend.plist`;
+- `~/Library/Logs/cinema-friend/`.
 
-Everything else in this guide assumes you are in the checkout and calling those commands
-by their full path (`.venv/bin/cinema-friend`), so nothing depends on an activated shell.
+It loads the LaunchAgent and exits successfully only after `launchd` reports a running
+process. Rerun the same command after updating the checkout. It reuses `.venv` and the
+existing configuration, reinstalls the checkout's current code, and reloads the service.
+
+The installer never replaces an existing configuration. If that file is invalid, it stops
+before changing the LaunchAgent and reports the validation error.
 
 ---
 
-## Configure
+## Check the BFI contract
 
-### 1. Create a bot
-
-Message [@BotFather](https://t.me/BotFather) on Telegram, send `/newbot`, and follow the
-prompts. It replies with a token that looks like `123456789:AA...`. That token is a
-credential: anyone who has it can act as your bot.
-
-### 2. Find your user ID
-
-Message [@userinfobot](https://t.me/userinfobot). It replies with your numeric ID. The bot
-ignores every message from anyone not on this list, so add the IDs of everyone who should
-be able to see and edit your watches, and nobody else.
-
-### 3. Write the env file
-
-```sh
-mkdir -p ~/.config/cinema-friend
-cp .env.example ~/.config/cinema-friend/cinema-friend.env
-chmod 600 ~/.config/cinema-friend/cinema-friend.env
-$EDITOR ~/.config/cinema-friend/cinema-friend.env
-```
-
-`chmod 600` is not optional. The service checks the file's ownership and permissions
-before reading a byte of it, and refuses to start if any other account on the machine can
-read it.
-
-| Setting | Meaning |
-| --- | --- |
-| `TELEGRAM_BOT_TOKEN` | the token from BotFather |
-| `TELEGRAM_ALLOWED_USER_IDS` | comma-separated numeric IDs allowed to use the bot |
-| `DATABASE_PATH` | SQLite file for watches, results and notification history; created on first run |
-| `LOG_LEVEL` | `DEBUG`, `INFO`, `WARNING`, `ERROR` or `CRITICAL` |
-| `BFI_IMPERSONATE_PROFILE` | `curl_cffi` browser profile; leave as `chrome` |
-
-There is no `User-Agent` setting. The impersonation profile supplies a complete, coherent
-browser header set, and overriding one header inside it would break the fingerprint it
-exists to present.
-
----
-
-## Check the BFI contract before you deploy
-
-Cinema Friend reads a public page that BFI never promised to keep stable. Before you leave
-it running unattended, confirm that the page still looks the way the parsers expect:
+Cinema Friend reads a public page that BFI never promised to keep stable. After installation
+and whenever BFI behavior is in doubt, confirm that the page still looks the way the parsers
+expect:
 
 ```sh
 .venv/bin/cinema-friend-smoke \
@@ -138,32 +117,19 @@ usable and no amount of retrying will change that.
 
 ---
 
-## Deploy
+## Installation details
 
-Install the LaunchAgent using the same virtual environment you installed the project into.
-The script reads the interpreter you invoke it with and wires the agent to that
-environment's `cinema-friend`, so run it with `.venv/bin/python`:
+`install.sh` invokes the existing LaunchAgent installer with the checkout's virtual
+environment:
 
 ```sh
 .venv/bin/python scripts/install_launch_agent.py install \
   --env-file ~/.config/cinema-friend/cinema-friend.env
 ```
 
-That writes `~/Library/LaunchAgents/com.ncksol.cinema-friend.plist`, creates
-`~/Library/Logs/cinema-friend/`, and loads the agent. The service starts immediately, starts
-again at every login, and is restarted if it exits. Re-run the same command after upgrading
-or moving the checkout; it replaces the existing agent rather than failing.
-
-Options:
-
-| Flag | Default |
-| --- | --- |
-| `--env-file` | required |
-| `--working-directory` | your home directory |
-| `--log-dir` | `~/Library/Logs/cinema-friend` |
-
-The env file is validated before anything is written, so an installation that refuses
-leaves nothing behind to clean up.
+That lower-level command remains available for service-only reinstalls. It validates the
+complete configuration before writing the plist, creates the log directory, and replaces a
+previously loaded copy rather than failing.
 
 ### Confirm it is running
 
@@ -330,6 +296,17 @@ To remove Cinema Friend completely, uninstall the agent and then delete the data
 ---
 
 ## Development
+
+Production installation intentionally excludes development tools. For a development
+checkout:
+
+```sh
+python3.12 -m venv .venv
+.venv/bin/python -m pip install --upgrade pip
+.venv/bin/python -m pip install -e '.[dev]'
+```
+
+Then run:
 
 ```sh
 .venv/bin/python -m pytest          # full suite; makes no network requests
