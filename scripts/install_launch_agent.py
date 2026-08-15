@@ -26,12 +26,14 @@ from __future__ import annotations
 import argparse
 import os
 import plistlib
-import stat
 import subprocess
 import sys
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Final, Protocol
+
+from cinema_friend.app import load_settings
+from cinema_friend.domain.errors import InputError
 
 LABEL: Final = "com.ncksol.cinema-friend"
 EXECUTABLE_NAME: Final = "cinema-friend"
@@ -99,30 +101,18 @@ def resolve_executable(python_executable: Path | None = None) -> Path:
     if not executable.is_file():
         raise InstallError(
             f"no {EXECUTABLE_NAME} executable beside {interpreter}; "
-            "install the project into this environment first (pip install -e .)"
+            "install the project into this environment first (pip install .)"
         )
     return executable.resolve()
 
 
 def validate_env_file(env_file: Path) -> Path:
-    """Return *env_file* absolute, after proving it is a private, user-owned regular file.
-
-    The same checks the service itself makes at startup, made here so a misconfigured
-    deployment is refused at install time rather than at the next login.
-    """
+    """Return *env_file* absolute after validating its security and settings."""
     path = Path(env_file).expanduser().resolve()
     try:
-        info = os.stat(path)
-    except OSError as error:
-        raise InstallError(f"env file does not exist or cannot be read: {path}") from error
-    if not stat.S_ISREG(info.st_mode):
-        raise InstallError(f"env file is not a regular file: {path}")
-    if info.st_uid != os.getuid():
-        raise InstallError(f"env file must be owned by the installing user: {path}")
-    if info.st_mode & 0o077:
-        raise InstallError(
-            f"env file must not be readable by group or others (mode 0600): {path}"
-        )
+        load_settings(path)
+    except InputError as error:
+        raise InstallError(str(error)) from error
     return path
 
 
