@@ -41,8 +41,10 @@ This path filter deliberately excludes docs, tests, and workflow files. A commit
 both an eligible path and an excluded path remains release-eligible.
 
 The workflow uses the fixed concurrency group `release-main` with
-`cancel-in-progress: false`. Runs therefore serialize without cancelling a validation or
-release already in progress.
+`cancel-in-progress: false` and `queue: max`. Runs therefore serialize without replacing
+an older pending run when another eligible push arrives. GitHub processes up to 100 pending
+runs in first-in-first-out order based on when they enter the concurrency queue; that
+platform limit is the only queue bound.
 
 ## Jobs and Permissions
 
@@ -149,4 +151,4 @@ Review should verify:
 - UTC CalVer construction;
 - correct handling of absent, matching, partial, and conflicting GitHub state;
 - generated release notes with no uploaded assets;
-- serialized, non-cancelling execution.
+- serialized, non-cancelling execution with the multi-run queue enabled.

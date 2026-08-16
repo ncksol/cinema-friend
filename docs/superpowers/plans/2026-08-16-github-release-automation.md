@@ -17,7 +17,9 @@
 - Run `python -m pytest -q`, `python -m ruff check src tests scripts`, and `python -m mypy src scripts`.
 - Keep workflow-level permissions at `contents: read`; only the dependent release job gets `contents: write` plus read-only `actions: read` for stable run metadata.
 - Use only `actions/checkout`, `actions/setup-python`, and the runner's authenticated `gh` CLI.
-- Serialize with concurrency group `release-main` and `cancel-in-progress: false`.
+- Serialize with concurrency group `release-main`, `cancel-in-progress: false`, and
+  `queue: max` so up to 100 pending eligible runs remain queued instead of replacing one
+  another.
 - Publish a normal release with generated notes and no uploaded assets.
 - Format tags exactly as `v<UTC YYYY.MM.DD>.<github.run_number>`.
 - Treat matching reruns as success and partial or conflicting GitHub state as explicit failure.
@@ -66,6 +68,7 @@ on:
 concurrency:
   group: release-main
   cancel-in-progress: false
+  queue: max
 
 permissions:
   contents: read
@@ -266,9 +269,10 @@ git --no-pager diff -- .github/workflows/release.yml
 ```
 
 Expected: no whitespace errors. Confirm the diff contains only the approved path filters,
-exact-SHA checkout in both jobs, read-only workflow permissions, the release-job write
-override with read-only run metadata access, validation dependency, stable UTC CalVer tag,
-generated notes, and explicit matching/partial/conflicting-state branches.
+exact-SHA checkout in both jobs, the multi-run concurrency queue, read-only workflow
+permissions, the release-job write override with read-only run metadata access, validation
+dependency, stable UTC CalVer tag, generated notes, and explicit
+matching/partial/conflicting-state branches.
 
 - [ ] **Step 4: Run the repository's full local validation**
 
