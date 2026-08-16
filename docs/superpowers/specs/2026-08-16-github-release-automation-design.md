@@ -53,9 +53,10 @@ The workflow has two jobs:
 2. `release` depends on `validate`, receives `contents: write`, checks out the same commit,
    calculates the tag, verifies existing GitHub state, and creates the release when needed.
 
-Workflow-level permissions are `contents: read`. The `release` job overrides only that
-permission with `contents: write`. The validation job has no write permission, and the
-release job cannot start unless validation succeeds.
+Workflow-level permissions are `contents: read`. The `release` job receives
+`contents: write` plus read-only `actions: read` so it can obtain the workflow run's stable
+creation timestamp. The validation job has no write permission, and the release job cannot
+start unless validation succeeds.
 
 Both checkout steps explicitly use the push event's commit SHA. Release creation therefore
 cannot drift to a newer `main` commit while a serialized run waits.
@@ -77,15 +78,17 @@ permissions from being exercised.
 
 ## Tag and Release Creation
 
-The release job derives the tag in UTC using this exact format:
+The release job reads the workflow run's original `created_at` value through the GitHub API
+and derives the tag in UTC using this exact format:
 
 ```text
 v<YYYY.MM.DD>.<github.run_number>
 ```
 
-For example, run 42 on 16 August 2026 produces `v2026.08.16.42`. The run number makes the
-tag unique even when multiple eligible commits land on the same UTC date. A rerun keeps the
-same run number and therefore computes the same tag.
+For example, run 42 created on 16 August 2026 produces `v2026.08.16.42`. The run number
+makes the tag unique even when multiple eligible commits land on the same UTC date. Both
+the run ID and its creation timestamp remain stable across rerun attempts, so a rerun on a
+later date still computes the same tag.
 
 The release is a normal, non-draft, non-prerelease GitHub release. The authenticated
 runner `gh` CLI creates it with generated notes and `--target` set to the exact pushed
@@ -142,7 +145,7 @@ Review should verify:
 
 - trigger paths and `main` scoping;
 - exact-SHA checkout in both jobs;
-- dependency and permission boundaries;
+- dependency and permission boundaries, including read-only run metadata access;
 - UTC CalVer construction;
 - correct handling of absent, matching, partial, and conflicting GitHub state;
 - generated release notes with no uploaded assets;
