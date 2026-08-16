@@ -6,6 +6,7 @@ import os
 import stat
 import subprocess
 import textwrap
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -284,6 +285,84 @@ def test_reuses_existing_configuration_without_prompting(
 
     assert result.returncode == 0, result.stderr
     assert installer.env_file.read_text(encoding="utf-8") == original
+
+
+def test_concurrent_first_run_preserves_the_first_published_configuration(
+    installer: InstallerHarness,
+) -> None:
+    command = [
+        "/bin/bash",
+        "-c",
+        'source "$1"\ntrap cleanup_temp_config EXIT\nensure_config',
+        "installer-test",
+        str(SCRIPT),
+    ]
+    processes = [
+        subprocess.Popen(
+            command,
+            cwd=installer.root,
+            env=installer.env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for _ in range(2)
+    ]
+
+    try:
+        deadline = time.monotonic() + 5
+        while len(list(installer.env_file.parent.glob(".cinema-friend.env.*"))) != 2:
+            assert all(process.poll() is None for process in processes)
+            if time.monotonic() >= deadline:
+                pytest.fail("concurrent installers did not both reach the configuration prompt")
+            time.sleep(0.01)
+
+        winner_stdout, winner_stderr = processes[0].communicate(
+            "111:winning-token\n111\n",
+            timeout=5,
+        )
+        loser_stdout, loser_stderr = processes[1].communicate(
+            "222:losing-token\n222\n",
+            timeout=5,
+        )
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.terminate()
+                process.communicate(timeout=5)
+
+    assert processes[0].returncode == 0, winner_stderr
+    assert processes[1].returncode == 0, loser_stderr
+    assert f"Created {installer.env_file}" in winner_stdout
+    assert f"Reusing {installer.env_file}" in loser_stdout
+    assert installer.env_file.read_text(encoding="utf-8") == (
+        "TELEGRAM_BOT_TOKEN=111:winning-token\n"
+        "TELEGRAM_ALLOWED_USER_IDS=111\n"
+        "DATABASE_PATH=~/.local/state/cinema-friend/cinema-friend.db\n"
+        "LOG_LEVEL=INFO\n"
+        "BFI_IMPERSONATE_PROFILE=chrome\n"
+    )
+    assert stat.S_IMODE(installer.env_file.stat().st_mode) == 0o600
+    assert list(installer.env_file.parent.glob(".cinema-friend.env.*")) == []
+
+
+def test_reports_configuration_publish_failure_without_a_winner(
+    installer: InstallerHarness,
+) -> None:
+    bin_dir = Path(installer.env["CINEMA_FRIEND_UNAME"]).parent
+    _write_executable(bin_dir / "ln", "exit 1\n")
+
+    result = _run_function(
+        installer,
+        "trap cleanup_temp_config EXIT\nensure_config",
+        stdin="111:token\n111\n",
+    )
+
+    assert result.returncode == 1
+    assert f"could not publish configuration to {installer.env_file}" in result.stderr
+    assert not installer.env_file.exists()
+    assert list(installer.env_file.parent.glob(".cinema-friend.env.*")) == []
 
 
 @pytest.mark.parametrize(

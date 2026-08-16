@@ -136,9 +136,21 @@ ensure_config() {
         printf 'BFI_IMPERSONATE_PROFILE=chrome\n'
     } > "$TEMP_ENV_FILE"
     chmod 600 "$TEMP_ENV_FILE"
-    mv "$TEMP_ENV_FILE" "$ENV_FILE"
-    TEMP_ENV_FILE=""
-    stage "Created $ENV_FILE"
+    if ln "$TEMP_ENV_FILE" "$ENV_FILE" 2>/dev/null; then
+        cleanup_temp_config
+        TEMP_ENV_FILE=""
+        stage "Created $ENV_FILE"
+        return
+    fi
+
+    if [[ -e "$ENV_FILE" || -L "$ENV_FILE" ]]; then
+        cleanup_temp_config
+        TEMP_ENV_FILE=""
+        stage "Reusing $ENV_FILE"
+        return
+    fi
+
+    die "could not publish configuration to $ENV_FILE"
 }
 
 
