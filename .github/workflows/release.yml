@@ -1,0 +1,186 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "src/**"
+      - "scripts/**"
+      - "install.sh"
+      - "pyproject.toml"
+
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+  queue: max
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out release commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install development dependencies
+        run: python -m pip install ".[dev]"
+
+      - name: Run tests
+        run: python -m pytest -q
+
+      - name: Run Ruff
+        run: python -m ruff check src tests scripts
+
+      - name: Run mypy
+        run: python -m mypy src scripts
+
+  release:
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out release commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Create release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          repository_api="repos/${GITHUB_REPOSITORY}"
+          run_created_at="$(
+            gh api "${repository_api}/actions/runs/${GITHUB_RUN_ID}" \
+              --jq '.created_at'
+          )"
+          tag="v$(date -u -d "${run_created_at}" +%Y.%m.%d).${GITHUB_RUN_NUMBER}"
+          ref_json="${RUNNER_TEMP}/release-ref.json"
+          release_json="${RUNNER_TEMP}/release.json"
+
+          api_get() {
+            local endpoint="$1"
+            local output_file="$2"
+            local response_file
+            local status
+
+            response_file="$(mktemp "${RUNNER_TEMP}/gh-api.XXXXXX")"
+            if gh api --include "${endpoint}" >"${response_file}" 2>&1; then
+              awk 'body { print } /^\r?$/ { body = 1 }' \
+                "${response_file}" >"${output_file}"
+              rm -f "${response_file}"
+              return 0
+            else
+              status=$?
+            fi
+
+            if head -n 1 "${response_file}" | grep -Eq '^HTTP/[0-9.]+ 404 '; then
+              rm -f "${response_file}"
+              return 44
+            fi
+
+            cat "${response_file}" >&2
+            rm -f "${response_file}"
+            return "${status}"
+          }
+
+          resolve_object_to_commit() {
+            local object_type="$1"
+            local object_sha="$2"
+            local tag_object_json
+            local depth=0
+
+            while [[ "${object_type}" == "tag" ]]; do
+              if (( depth >= 10 )); then
+                echo "annotated tag chain exceeds 10 objects for ${tag}" >&2
+                return 1
+              fi
+              tag_object_json="$(
+                gh api "${repository_api}/git/tags/${object_sha}"
+              )"
+              object_type="$(jq -r '.object.type' <<<"${tag_object_json}")"
+              object_sha="$(jq -r '.object.sha' <<<"${tag_object_json}")"
+              depth=$((depth + 1))
+            done
+
+            if [[ "${object_type}" != "commit" ]]; then
+              echo "tag ${tag} resolves to ${object_type}, not a commit" >&2
+              return 1
+            fi
+
+            printf '%s\n' "${object_sha}"
+          }
+
+          if api_get "${repository_api}/git/ref/tags/${tag}" "${ref_json}"; then
+            ref_status=0
+          else
+            ref_status=$?
+          fi
+          if api_get "${repository_api}/releases/tags/${tag}" "${release_json}"; then
+            release_status=0
+          else
+            release_status=$?
+          fi
+
+          if [[ ${ref_status} -eq 44 && ${release_status} -eq 44 ]]; then
+            gh release create "${tag}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --target "${GITHUB_SHA}" \
+              --generate-notes \
+              --title "${tag}"
+            exit 0
+          fi
+
+          if [[ ${ref_status} -ne 0 && ${ref_status} -ne 44 ]]; then
+            echo "failed to inspect tag ${tag}" >&2
+            exit "${ref_status}"
+          fi
+          if [[ ${release_status} -ne 0 && ${release_status} -ne 44 ]]; then
+            echo "failed to inspect release ${tag}" >&2
+            exit "${release_status}"
+          fi
+          if [[ ${ref_status} -eq 44 || ${release_status} -eq 44 ]]; then
+            echo "tag and release state is incomplete for ${tag}" >&2
+            exit 1
+          fi
+
+          ref_type="$(jq -r '.object.type' "${ref_json}")"
+          ref_sha="$(jq -r '.object.sha' "${ref_json}")"
+          tag_commit="$(
+            resolve_object_to_commit "${ref_type}" "${ref_sha}"
+          )"
+          release_target="$(jq -r '.target_commitish' "${release_json}")"
+          release_target_encoded="$(
+            jq -rn --arg value "${release_target}" '$value | @uri'
+          )"
+          release_commit="$(
+            gh api "${repository_api}/commits/${release_target_encoded}" --jq '.sha'
+          )"
+
+          if [[ "${tag_commit}" != "${GITHUB_SHA}" ]]; then
+            echo "tag ${tag} targets ${tag_commit}, expected ${GITHUB_SHA}" >&2
+            exit 1
+          fi
+          if [[ "${release_commit}" != "${GITHUB_SHA}" ]]; then
+            echo \
+              "release ${tag} targets ${release_commit}, expected ${GITHUB_SHA}" \
+              >&2
+            exit 1
+          fi
+
+          echo "release ${tag} already exists for ${GITHUB_SHA}"
