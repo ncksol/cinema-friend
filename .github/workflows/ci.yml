@@ -1,0 +1,136 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - main
+
+# Cancelling superseded pull request runs is safe: nothing here publishes or mutates
+# anything, so a half-finished run leaves no state behind.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Read-only by default, and no job raises it. Nothing in this workflow needs a token
+# beyond checkout, and no step consumes a secret, so runs from forked pull requests
+# have nothing to leak.
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  lint:
+    name: Ruff
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the pull request merge commit
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install development dependencies
+        run: python -m pip install -e ".[dev]"
+
+      - name: Run Ruff
+        run: python -m ruff check src tests scripts
+
+  types:
+    name: mypy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the pull request merge commit
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install development dependencies
+        run: python -m pip install -e ".[dev]"
+
+      - name: Run mypy
+        run: python -m mypy src scripts
+
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the pull request merge commit
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install development dependencies
+        run: python -m pip install -e ".[dev]"
+
+      - name: Run the test suite
+        run: python -m pytest -q
+
+  package:
+    name: Distribution
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the pull request merge commit
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Build the wheel
+        run: |
+          set -euo pipefail
+          python -m pip install build
+          python -m build --wheel --outdir dist
+
+      # ./install.sh installs the built distribution, not the source tree, so anything
+      # missing from the wheel is missing at runtime. The suite can only assert this
+      # against an editable install, where the source tree hides the omission.
+      - name: Install the wheel into a clean environment
+        run: |
+          set -euo pipefail
+          python -m venv "${RUNNER_TEMP}/runtime"
+          "${RUNNER_TEMP}/runtime/bin/python" -m pip install --upgrade pip
+          "${RUNNER_TEMP}/runtime/bin/python" -m pip install dist/*.whl
+
+      - name: Verify the installed distribution
+        run: |
+          set -euo pipefail
+          "${RUNNER_TEMP}/runtime/bin/python" scripts/verify_distribution.py
+
+      - name: Verify the console scripts
+        run: |
+          set -euo pipefail
+          "${RUNNER_TEMP}/runtime/bin/cinema-friend" --help > /dev/null
+          "${RUNNER_TEMP}/runtime/bin/cinema-friend-smoke" --help > /dev/null
+
+  shell:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the pull request merge commit
+        uses: actions/checkout@v4
+
+      - name: Run ShellCheck
+        run: |
+          set -euo pipefail
+          shellcheck --version
+          git ls-files '*.sh' | xargs -r shellcheck

@@ -324,10 +324,29 @@ Then run:
 .venv/bin/python -m pytest          # full suite; makes no network requests
 .venv/bin/python -m ruff check src tests scripts
 .venv/bin/python -m mypy src scripts
+shellcheck install.sh
 ```
 
 Tests use synthetic HTML and SVG fixtures. `cinema-friend-smoke` is the only thing in the
 repository that talks to BFI, and it is never run automatically.
+
+Every pull request runs those checks, and one more that a development checkout cannot
+perform on itself: the wheel is built, installed into an empty environment, and asked
+whether the migrations came with it. An editable install resolves `importlib.resources`
+to `src/`, so it finds the migrations whether or not a build would have carried them;
+only a real install can tell. To reproduce that check locally:
+
+```sh
+.venv/bin/python -m pip install build
+.venv/bin/python -m build --wheel --outdir dist
+python3.12 -m venv --clear /tmp/cinema-friend-runtime
+/tmp/cinema-friend-runtime/bin/python -m pip install dist/*.whl
+/tmp/cinema-friend-runtime/bin/python scripts/verify_distribution.py
+```
+
+`--clear` is what makes a second run mean anything. The version never changes during
+development, so pip finds `0.1.0` already installed in a reused environment, skips the
+wheel it was just handed, and the verification passes against the previous install.
 
 ---
 
