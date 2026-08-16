@@ -19,6 +19,10 @@ file:
 
 ``launchctl`` is always invoked with an argument array and an absolute binary path. No
 string is ever handed to a shell.
+
+``cinema_friend`` is imported lazily, inside the validation it authorizes, rather than at
+module scope: ``uninstall`` must keep working to remove a broken install, so it must not
+require importing the very package that install put in that state.
 """
 
 from __future__ import annotations
@@ -26,7 +30,6 @@ from __future__ import annotations
 import argparse
 import os
 import plistlib
-import stat
 import subprocess
 import sys
 from collections.abc import Sequence
@@ -99,30 +102,28 @@ def resolve_executable(python_executable: Path | None = None) -> Path:
     if not executable.is_file():
         raise InstallError(
             f"no {EXECUTABLE_NAME} executable beside {interpreter}; "
-            "install the project into this environment first (pip install -e .)"
+            "install the project into this environment first (pip install .)"
         )
     return executable.resolve()
 
 
 def validate_env_file(env_file: Path) -> Path:
-    """Return *env_file* absolute, after proving it is a private, user-owned regular file.
+    """Return *env_file* absolute after validating its security and settings.
 
-    The same checks the service itself makes at startup, made here so a misconfigured
-    deployment is refused at install time rather than at the next login.
+    ``cinema_friend`` is imported here, not at module scope, so that a damaged runtime
+    package or a missing third-party dependency only ever breaks ``install`` -- the one
+    command that actually needs application code. ``uninstall`` must keep working when the
+    installed package cannot be imported at all, since that is exactly the situation it
+    exists to recover from.
     """
+    from cinema_friend.app import load_settings
+    from cinema_friend.domain.errors import InputError
+
     path = Path(env_file).expanduser().resolve()
     try:
-        info = os.stat(path)
-    except OSError as error:
-        raise InstallError(f"env file does not exist or cannot be read: {path}") from error
-    if not stat.S_ISREG(info.st_mode):
-        raise InstallError(f"env file is not a regular file: {path}")
-    if info.st_uid != os.getuid():
-        raise InstallError(f"env file must be owned by the installing user: {path}")
-    if info.st_mode & 0o077:
-        raise InstallError(
-            f"env file must not be readable by group or others (mode 0600): {path}"
-        )
+        load_settings(path)
+    except InputError as error:
+        raise InstallError(str(error)) from error
     return path
 
 

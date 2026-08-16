@@ -74,11 +74,25 @@ class RecordingLaunchctl:
         return [list(argv) for argv, _ in self.calls]
 
 
+def _write_valid_env(path: Path, *, token: str = "123:abc") -> None:
+    path.write_text(
+        "\n".join([
+            f"TELEGRAM_BOT_TOKEN={token}",
+            "TELEGRAM_ALLOWED_USER_IDS=11,12",
+            f"DATABASE_PATH={path.parent / 'cinema-friend.db'}",
+            "LOG_LEVEL=INFO",
+            "BFI_IMPERSONATE_PROFILE=chrome",
+        ])
+        + "\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o600)
+
+
 @pytest.fixture
 def env_file(tmp_path: Path) -> Path:
     path = tmp_path / "cinema-friend.env"
-    path.write_text("TELEGRAM_BOT_TOKEN=123:abc\n", encoding="utf-8")
-    path.chmod(0o600)
+    _write_valid_env(path)
     return path
 
 
@@ -329,8 +343,7 @@ def test_installed_plist_is_not_group_or_world_writable(
 def test_install_does_not_copy_the_env_file_contents_into_the_plist(
     tmp_path: Path, env_file: Path, venv_bin: Path
 ) -> None:
-    env_file.write_text("TELEGRAM_BOT_TOKEN=8012345678:AAF-secret-value\n", encoding="utf-8")
-    env_file.chmod(0o600)
+    _write_valid_env(env_file, token="8012345678:AAF-secret-value")
 
     plist_path = agent.install(
         env_file=env_file,
@@ -342,6 +355,35 @@ def test_install_does_not_copy_the_env_file_contents_into_the_plist(
     )
 
     assert "AAF-secret-value" not in plist_path.read_text(encoding="utf-8")
+
+
+def test_install_rejects_invalid_settings_before_writing_or_loading(
+    tmp_path: Path, venv_bin: Path
+) -> None:
+    env_file = tmp_path / "incomplete.env"
+    env_file.write_text(
+        "\n".join([
+            "TELEGRAM_ALLOWED_USER_IDS=11",
+            f"DATABASE_PATH={tmp_path / 'cinema-friend.db'}",
+        ])
+        + "\n",
+        encoding="utf-8",
+    )
+    env_file.chmod(0o600)
+    agents_dir = tmp_path / "LaunchAgents"
+    launchctl = RecordingLaunchctl()
+
+    with pytest.raises(agent.InstallError, match="TELEGRAM_BOT_TOKEN"):
+        agent.install(
+            env_file=env_file,
+            python_executable=venv_bin / "python",
+            agents_dir=agents_dir,
+            log_dir=tmp_path / "Logs",
+            launchctl=launchctl,
+        )
+
+    assert not agents_dir.exists()
+    assert launchctl.calls == []
 
 
 # ---------------------------------------------------------------------------
@@ -378,6 +420,65 @@ def test_uninstall_is_idempotent(tmp_path: Path) -> None:
     agent.uninstall(agents_dir=agents_dir, launchctl=launchctl)
 
     assert all(allow_missing for _, allow_missing in launchctl.calls)
+
+
+# ---------------------------------------------------------------------------
+# Lazy application imports
+# ---------------------------------------------------------------------------
+
+
+def test_module_import_does_not_pull_in_cinema_friend() -> None:
+    """``uninstall`` must be able to recover from a damaged runtime package, so importing
+    this module at all must not import ``cinema_friend``."""
+    assert not hasattr(agent, "load_settings")
+    assert not hasattr(agent, "InputError")
+
+
+def _block_cinema_friend(monkeypatch: pytest.MonkeyPatch) -> None:
+    import builtins
+
+    real_import = builtins.__import__
+
+    def _blocking_import(name: str, *args: Any, **kwargs: Any) -> ModuleType:
+        if name == "cinema_friend" or name.startswith("cinema_friend."):
+            raise ImportError(f"blocked for test: {name}")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _blocking_import)
+
+
+def test_module_loads_when_cinema_friend_is_unimportable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _block_cinema_friend(monkeypatch)
+
+    module = _load()  # must not raise despite cinema_friend being blocked
+
+    assert module.LABEL == agent.LABEL
+
+
+def test_uninstall_works_when_cinema_friend_is_unimportable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _block_cinema_friend(monkeypatch)
+    module = _load()
+    launchctl = RecordingLaunchctl(missing=True)
+
+    module.uninstall(agents_dir=tmp_path / "LaunchAgents", launchctl=launchctl)
+
+    assert all(allow_missing for _, allow_missing in launchctl.calls)
+
+
+def test_install_still_requires_cinema_friend_for_validation(
+    tmp_path: Path, env_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``load_settings`` remains the install-time authority: blocking ``cinema_friend``
+    must not silently skip validation, it must fail loudly the moment install needs it."""
+    _block_cinema_friend(monkeypatch)
+    module = _load()
+
+    with pytest.raises(ImportError, match="cinema_friend"):
+        module.validate_env_file(env_file)
 
 
 # ---------------------------------------------------------------------------
