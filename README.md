@@ -339,10 +339,14 @@ only a real install can tell. To reproduce that check locally:
 ```sh
 .venv/bin/python -m pip install build
 .venv/bin/python -m build --wheel --outdir dist
-python3.12 -m venv /tmp/cinema-friend-runtime
+python3.12 -m venv --clear /tmp/cinema-friend-runtime
 /tmp/cinema-friend-runtime/bin/python -m pip install dist/*.whl
 /tmp/cinema-friend-runtime/bin/python scripts/verify_distribution.py
 ```
+
+`--clear` is what makes a second run mean anything. The version never changes during
+development, so pip finds `0.1.0` already installed in a reused environment, skips the
+wheel it was just handed, and the verification passes against the previous install.
 
 ---
 
